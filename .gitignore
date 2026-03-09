@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+**/target/
+*.crate
+
+# Local VCS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local backup / archive files
+/src-1.zip
+/src-2.zip
+/src-2/
+
+# Generated outputs
+/frinZ/
+/summary.md
+/uv_track.csv
+*.log
+
+# Observation data and generated analysis outputs
+/data/
+/cor/
+
+# Optional local references and caches
+/reference/friendlyVRI-master/Imports/__pycache__/
+
+# Keep source docs, but ignore old scratch notes
+/multiside_band_analysis.md
+/multiside_band_analysis_weighting.md
+/frmap.py

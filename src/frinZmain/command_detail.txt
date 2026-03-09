@@ -1,0 +1,97 @@
+============================================================
+ frinZ 詳細オプションガイド（--detail）
+============================================================
+
+[基本モード]
+  --in-beam                          in-beam VLBI 用の標準 delay-rate 解析フローで実行（出力先: frinZ/inbeamVLBI/ 直下）
+                                     --plot 時は全面 delay-rate ヒートマップ表示
+  --search [peak|deep|rate|acel]     デフォルト peak（delay-rate 平面のピーク探索）
+  --iter N                           peak/deep の反復回数（deep は未指定時 4）
+  --frequency                        周波数ドメイン処理（未指定は時間ドメイン）
+  --plot                             グラフ出力（--frequency 併用で周波数グラフ）
+  --output                           frinZ/fringe_output/... に保存
+
+[入力・基本]
+  --in <FILE>                        入力 .cor
+  --len <SEC>                        積分長 (0=全区間)
+  --skip <SEC>                       冒頭スキップ
+  --loop <N>                         ループ回数
+  --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
+  --bandpass <BP.bin>                バンドパス適用 (--bptable で補正スペクトル保存)
+
+[補正・フラグ]
+  --delay / --rate / --acel          事前補正値
+  --drange MIN MAX                   遅延探索範囲
+  --rrange MIN MAX                   レート探索範囲
+  --frange MIN MAX                   周波数探索/表示範囲（--frequency 用）
+  --scan-correct <CSV>               start,integ,delay[samp],rate[Hz]
+  --flagging time START END ...      時間スキップ
+  --flagging pp START END ...        セクターをゼロ詰め
+
+[解析バリエーション]
+  --closure-phase f1 f2 f3 [refant:NAME]
+       3 基線のクロージャー位相。デフォルト refant=YAMAGU32。
+  --phase-reference CAL TARGET [fit_spec cal_len tgt_len loop]
+       fit_spec: <deg>, sin, <deg>+sin, <deg>+sin:<period_sec>
+  --maser key:val...（メーザー解析）
+       off:<path>           OFF ソース .cor
+       off:linear           OFF無し時、band/subt 範囲でロバスト直線ベースライン推定
+       off:quad             OFF無し時、band/subt 範囲でロバスト2次ベースライン推定
+       rest:<MHz>           基準周波数（既定 6668.5192）
+       band:<start-end>     観測周波数からの相対範囲 (MHz)
+       subt:<start-end>     絶対周波数範囲 (MHz) ※指定時は band より優先
+       gauss:amp,Vlsr,fwhm,[amp,Vlsr,fwhm,...]  ガウス初期値列挙
+       onoff:0|1            0=(ON-OFF)/OFF（既定）、1=(ON-OFF)
+       Vlst:<km/s>          LSR 速度補正の上書き
+       corrfreq:<x>         サンプリング周波数への倍率
+       *_maser_data.tsv には baseline_mask 列 (1=ベースラインfit採用点, 0=除外点) を出力。
+       他に、出力グラフ/TSV は frinZ/maser/ 配下へ保存。
+  --folding key:val...（可視光度fold）
+       period:<sec>         折り畳み周期（必須）
+       pdot:<s/s>           周期微分（任意）
+       epoch:<UTC>          スピン位相基準時刻（任意）
+       bins:<N>             位相ビン数（既定64）
+       on-duty:<0-1>        on-pulse と見なすビン割合（既定0.1）
+       phase0:<cycle>       位相原点オフセット（既定0.0）
+       bary:0|1             barycentric 時刻補正（既定0）
+       orbit:0|1            連星軌道遅延補正（既定0、軌道要素指定時は自動1）
+       pb:<sec>             軌道周期
+       a1:<lt-sec>          射影半長径 a1/c
+       tasc:<UTC>|tasc_mjd:<MJD>  円軌道の昇交点通過時刻
+       tp:<UTC>|tp_mjd:<MJD>       楕円軌道の近点通過時刻
+       ecc:<0..1), omega_deg:<deg> 楕円軌道パラメータ
+       eph:<FILE>           上記キーを key=value or KEY VALUE で書いたエフェメリスファイル
+       --delay/--rate/--acel を適用した複素ビジビリティで fold を実行。
+       出力は frinZ/folding/*_folding_profile.png, *_folding_profile.tsv, *_folding_summary.txt。
+  --multi-sideband C_COR C_BP C_DELAY X_COR X_BP X_DELAY
+       BP に -1 を入れると当該バンド BP 無効化。
+  --fringe-rate-map key[:val]...
+       win_delay:min,max / win_rate:min,max / grid:<n> / peak:<n> / plot:0|1 等。
+  --imaging key[:val]...
+       size:<px>(既定 256), cell:<arcsec>, clean:0|1, gain:<f>,
+       threshold:<Jy>, iter:<n>。
+  --dynamic-spectrum, --raw-visibility, --uv [0|1], --uptimeplot
+
+[出力・グラフ補助]
+  --add-plot                         Amp/SNR/位相/雑音の時系列
+  --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）
+  --bandpass-table                   補正後スペクトルをバイナリ保存
+  --spectrum                         クロススペクトルをバイナリ保存
+  --cor2bin                          生可視光度をバイナリ保存
+
+[その他]
+  --fft-rebin <PTS>                  FFT チャンネルを平均化して縮小
+  --cpu <N>                          deep 探索の並列数 (0=自動)
+
+[サブコマンド用バイナリ]
+  gfrinZ          低レベルフリンジ処理/JSONL 出力（--help 参照）
+  cormerge        複数 cor の結合
+  corshow         cor の可視化/エクスポート
+  bandscythe      バンドスライス処理
+  pulsar_gating   パルサーゲーティング
+
+[使い方例]
+  frinZ --in data.cor --len 60 --plot
+  frinZ --in data.cor --search deep --rfi 100,120
+  frinZ --closure-phase b12.cor b23.cor b13.cor refant:ANT1
+  frinZ --phase-reference cal.cor tgt.cor 1+sin:3600 30 30 1 --plot --output

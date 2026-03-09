@@ -1,13 +1,13 @@
 <img src="./src/frinZmain/logo1.png" width=45%>  <img src="./src/frinZmain/logo2.png" width=45%>
 
-# frinZrs
+# frinZ
 
 Rust version of frinZ.py - A high-performance fringe-fitting tool for VLBI data analysis.  
 Original Python version: https://github.com/M-AKIMOTOO/frinZ.py
 
 ## Overview
 
-frinZrs is a Rust implementation of the frinZ fringe-fitting tool for processing Very Long Baseline Interferometry (VLBI) correlation data. It provides accurate delay and rate measurements with enhanced performance compared to the original Python version.
+frinZ is a Rust implementation of the frinZ fringe-fitting tool for processing Very Long Baseline Interferometry (VLBI) correlation data. It provides accurate delay and rate measurements with enhanced performance compared to the original Python version.
 
 ## Features
 
@@ -27,13 +27,11 @@ frinZrs is a Rust implementation of the frinZ fringe-fitting tool for processing
 
 ```bash
 # Clone the repository
-git clone https://github.com/M-AKIMOTOO/frinZrs.git
-cd frinZrs
+git clone https://github.com/M-AKIMOTOO/frinZ.git
+cd frinZ
 
 # Install to ~/.cargo/bin
-cargo install --bin frinZ --path .
-# OR
-cargo install --bin frinZrs --path .
+cargo install --path . --bin frinZ
 ```
 
 ### Development Build
@@ -44,11 +42,17 @@ cargo check -p frinZ --all-targets
 
 # Build the frinZ binary
 cargo build -p frinZ --bin frinZ --release
+
+# Build everything in this repository
+cargo build --workspace --release
 ```
 
 ### Local Tools In This Workspace
 
-`gfrinZ`, `pulsar_gating`, `cormerge`, `corshow`, and `bandscythe` are built from the local-only `frinZ-tools` package in this workspace.
+This repository is split into:
+
+- `frinZ`: publishable crate and main binary
+- `frinZ-tools`: local-only package for `gfrinZ`, `pulsar_gating`, `cormerge`, `corshow`, and `bandscythe`
 
 ```bash
 # Check all local tools
@@ -63,6 +67,16 @@ cargo build -p frinZ-tools --bin pulsar_gating --release
 cargo build -p frinZ-tools --bin cormerge --release
 cargo build -p frinZ-tools --bin corshow --release
 cargo build -p frinZ-tools --bin bandscythe --release
+```
+
+Run examples:
+
+```bash
+cargo run -p frinZ-tools --bin gfrinZ --release -- --help
+cargo run -p frinZ-tools --bin pulsar_gating --release -- --help
+cargo run -p frinZ-tools --bin cormerge --release -- --help
+cargo run -p frinZ-tools --bin corshow --release -- --help
+cargo run -p frinZ-tools --bin bandscythe --release -- --help
 ```
 
 **Note:** crates.io publish target is `frinZ` only. On Windows, antivirus software may flag the compiled binary.
@@ -197,6 +211,14 @@ pulsar_gating --input data.cor \
 pulsar_gating --input data.cor --bins 128 --amp-threshold 0.015
 ```
 
+Build or run `pulsar_gating` from the local-only tools package:
+
+```bash
+cargo build -p frinZ-tools --bin pulsar_gating --release
+# or
+cargo run -p frinZ-tools --bin pulsar_gating --release -- --help
+```
+
 `pulsar_gating` creates outputs under `frinZ/pulsar_gating/` next to the input `.cor`.
 
 #### Modes
@@ -295,7 +317,7 @@ In stdout and `*_summary.txt`, these appear as:
 
 ## Output Files
 
-frinZrs creates organized output directories:
+frinZ creates organized output directories:
 
 ```
 frinZ/
@@ -361,7 +383,7 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 
 ## Performance Notes
 
-frinZrs provides significant performance improvements over the Python version:
+frinZ provides significant performance improvements over the Python version:
 - **Faster FFT processing** using rustfft
 - **Optimized memory usage** for large datasets
 - **Parallel processing** capabilities

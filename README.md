@@ -39,13 +39,33 @@ cargo install --bin frinZrs --path .
 ### Development Build
 
 ```bash
-# Run directly
-cargo run --bin frinZ --release -- [OPTIONS]
-# OR
-cargo run --bin frinZ-rs --release -- [OPTIONS]
+# Check only the publishable frinZ crate
+cargo check -p frinZ --all-targets
+
+# Build the frinZ binary
+cargo build -p frinZ --bin frinZ --release
 ```
 
-**Note:** Both `frinZ` and `frinZ-rs` are identical programs. On Windows, antivirus software may flag the compiled binary.
+### Local Tools In This Workspace
+
+`gfrinZ`, `pulsar_gating`, `cormerge`, `corshow`, and `bandscythe` are built from the local-only `frinZ-tools` package in this workspace.
+
+```bash
+# Check all local tools
+cargo check -p frinZ-tools --all-targets
+
+# Build all local tools
+cargo build -p frinZ-tools
+
+# Build each tool separately
+cargo build -p frinZ-tools --bin gfrinZ --release
+cargo build -p frinZ-tools --bin pulsar_gating --release
+cargo build -p frinZ-tools --bin cormerge --release
+cargo build -p frinZ-tools --bin corshow --release
+cargo build -p frinZ-tools --bin bandscythe --release
+```
+
+**Note:** crates.io publish target is `frinZ` only. On Windows, antivirus software may flag the compiled binary.
 
 ## Usage
 

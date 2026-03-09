@@ -5,10 +5,11 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::Parser;
 use std::error::Error;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // --- Header Structures and Parsing (from frinZmain/header.rs) ---
 #[derive(Debug, Default)]
@@ -191,13 +192,6 @@ struct Cli {
     cor: Vec<PathBuf>,
 }
 
-struct FileScanResult {
-    path: PathBuf,
-    value: u32,
-    signature_data: [u8; SIGNATURE_BUFFER_LEN],
-    header_buffer: Option<[u8; HEADER_LEN]>,
-}
-
 fn copy_prefix<const N: usize>(source: &[u8]) -> Option<[u8; N]> {
     if source.len() < N {
         return None;
@@ -263,40 +257,12 @@ fn read_signature_from_header(header_bytes: &[u8]) -> [u8; SIGNATURE_BUFFER_LEN]
     copy_prefix::<SIGNATURE_BUFFER_LEN>(&header_bytes[start..end]).unwrap()
 }
 
-fn scan_file(filename: &Path, required_source: &str) -> Result<Option<FileScanResult>, io::Error> {
-    let mut file = match File::open(filename) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "警告: ファイル \"{:?}\" を開けませんでした. ({})",
-                filename, e
-            );
-            return Ok(None);
-        }
-    };
-
-    let mut header_bytes = [0u8; HEADER_LEN];
-    let bytes_read = read_file_prefix(&mut file, &mut header_bytes)?;
-    let header_slice = &header_bytes[..bytes_read];
-
-    if !source_name_matches(header_slice, required_source) {
-        return Ok(None);
-    }
-
-    if has_cormerge_signature(header_slice) {
-        println!(
-            "情報: ファイル \"{:?}\" は期待されるシグネチャを持つためスキップします.",
-            filename
-        );
-        return Ok(None);
-    }
-
-    Ok(Some(FileScanResult {
-        path: filename.to_path_buf(),
-        value: read_value_from_header(header_slice),
-        signature_data: read_signature_from_header(header_slice),
-        header_buffer: copy_prefix::<HEADER_LEN>(header_slice),
-    }))
+fn generate_temp_stem() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(".cormerge-{}-{}", std::process::id(), nanos)
 }
 
 /// ファイル名から拡張子を除き、アンダースコアで分割して指定番目の要素を取得する
@@ -348,25 +314,18 @@ fn generate_output_filename(input_files: &[PathBuf]) -> Result<PathBuf, Box<dyn 
     Ok(PathBuf::from(output_filename_str))
 }
 
-/// ファイルの内容を別のファイルにコピーする
-fn append_file_content<W: Write>(
-    outfile: &mut W,
-    infilename: &Path,
-    offset_src: u64,
-) -> Result<(), io::Error> {
-    let mut infile = File::open(infilename)?;
-    let infile_size = infile.metadata()?.len();
-
-    if offset_src > 0 {
-        if offset_src >= infile_size {
-            println!("情報: ファイル \"{:?}\" (サイズ {} バイト) はオフセット {} バイト適用後は空のためスキップします.", infilename, infile_size, offset_src);
-            return Ok(());
+fn cleanup_temp_files(paths: &[&Path]) {
+    for path in paths {
+        if let Err(e) = fs::remove_file(path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "警告: 一時ファイル \"{}\" を削除できませんでした. ({})",
+                    path.display(),
+                    e
+                );
+            }
         }
-        infile.seek(SeekFrom::Start(offset_src))?;
     }
-
-    io::copy(&mut infile, outfile)?;
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -376,41 +335,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut input_files = cli.cor;
     input_files.sort();
 
-    // フィルタリング処理
     println!(
-        "\n入力ファイルのフィルタリング (source: \"{}\")",
+        "\n入力ファイルを走査しながら結合します... (source: \"{}\")",
         &cli.source
     );
-    let mut files_to_process = Vec::new();
-    for file_path in &input_files {
-        if let Some(scan_result) = scan_file(file_path, &cli.source)? {
-            files_to_process.push(scan_result);
-        }
-    }
 
-    if files_to_process.is_empty() {
-        return Err("フィルタリングの結果, 処理対象のファイルがありません.".into());
-    }
-    if files_to_process.len() < 2 {
-        return Err(format!("フィルタリングの結果, 結合対象となるファイルが {} 個のみです. 処理を続行するには少なくとも2つのファイルが必要です.", files_to_process.len()).into());
-    }
+    let temp_stem = generate_temp_stem();
+    let temp_output_filename = PathBuf::from(format!("{}.cor.tmp", temp_stem));
+    let temp_info_txt_filename = PathBuf::from(format!("{}.cor.txt.tmp", temp_stem));
+    let temp_headers_csv_filename = PathBuf::from(format!("{}.cor.headers.csv.tmp", temp_stem));
 
-    println!("{}個のファイルが処理対象です.", files_to_process.len());
+    let mut outfile = BufWriter::new(File::create(&temp_output_filename)?);
+    let mut info_txt_fp = BufWriter::new(File::create(&temp_info_txt_filename)?);
+    let mut headers_csv_fp = BufWriter::new(File::create(&temp_headers_csv_filename)?);
 
-    // 出力ファイル名生成
-    let file_paths: Vec<PathBuf> = files_to_process
-        .iter()
-        .map(|file| file.path.clone())
-        .collect();
-    let output_filename = generate_output_filename(&file_paths)?;
-    let info_txt_filename = output_filename.with_extension("cor.txt");
-    let headers_csv_filename = output_filename.with_extension("cor.headers.csv");
-
-    // --- 情報ファイルの準備 ---
-    let mut info_txt_fp = BufWriter::new(File::create(&info_txt_filename)?);
-    let mut headers_csv_fp = BufWriter::new(File::create(&headers_csv_filename)?);
-    println!("情報テキストファイル: {:?}", info_txt_filename);
-    println!("ヘッダー情報ファイル: {:?}", headers_csv_filename);
     writeln!(
         info_txt_fp,
         "処理対象ファイルとヘッダー情報 (入力ファイル名ソート順):"
@@ -425,21 +363,47 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     writeln!(headers_csv_fp, "{}", get_csv_header())?;
 
-    // --- 値の合計と情報ファイルへの書き込み ---
     let mut total_sum: u32 = 0;
-    println!(
-        "\n処理対象ファイルの情報を読み取り, テキストファイル \"{:?}\", \"{:?}\" に記録します:",
-        info_txt_filename, headers_csv_filename
-    );
-    for file_info in &files_to_process {
-        total_sum = total_sum.saturating_add(file_info.value);
-        println!(
-            "  ファイル \"{:?}\": 値 = {} (0x{:x})",
-            file_info.path, file_info.value, file_info.value
-        );
+    let mut matched_count = 0usize;
+    let mut first_matched_file: Option<PathBuf> = None;
+    let mut last_matched_file: Option<PathBuf> = None;
 
-        let signature_display_str: String = file_info
-            .signature_data
+    for file_path in &input_files {
+        let mut infile = match File::open(file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!(
+                    "警告: ファイル \"{:?}\" を開けませんでした. ({})",
+                    file_path, e
+                );
+                continue;
+            }
+        };
+
+        let mut header_bytes = [0u8; HEADER_LEN];
+        let bytes_read = read_file_prefix(&mut infile, &mut header_bytes)?;
+        let header_slice = &header_bytes[..bytes_read];
+
+        if !source_name_matches(header_slice, &cli.source) {
+            continue;
+        }
+
+        if has_cormerge_signature(header_slice) {
+            println!(
+                "情報: ファイル \"{:?}\" は期待されるシグネチャを持つためスキップします.",
+                file_path
+            );
+            continue;
+        }
+
+        matched_count += 1;
+        total_sum = total_sum.saturating_add(read_value_from_header(header_slice));
+        if first_matched_file.is_none() {
+            first_matched_file = Some(file_path.clone());
+        }
+        last_matched_file = Some(file_path.clone());
+
+        let signature_display_str: String = read_signature_from_header(header_slice)
             .iter()
             .map(|&b| {
                 if (b as char).is_ascii_graphic() {
@@ -453,23 +417,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         writeln!(
             info_txt_fp,
             "{:<45} | 0x{:<18x} | {}",
-            file_info.path.display(),
-            file_info.value,
+            file_path.display(),
+            read_value_from_header(header_slice),
             signature_display_str
         )?;
 
-        // 先頭 256 バイトだけでヘッダーCSVを生成する
-        if let Some(header_buffer) = file_info.header_buffer.as_ref() {
+        println!(
+            "処理中: \"{:?}\" (値 = {} / マッチ {} 件目)",
+            file_path,
+            read_value_from_header(header_slice),
+            matched_count
+        );
+
+        if let Some(header_buffer) = copy_prefix::<HEADER_LEN>(header_slice) {
             let mut cursor = Cursor::new(header_buffer.as_slice());
             let header = parse_header(&mut cursor)?;
-            let csv_row = format_header_as_csv_row(&header, &file_info.path);
+            let csv_row = format_header_as_csv_row(&header, file_path);
             writeln!(headers_csv_fp, "{}", csv_row)?;
         } else {
-            let basename = file_info
-                .path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let basename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let empty_cols = ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"; // 31 commas
             writeln!(
                 headers_csv_fp,
@@ -477,49 +443,79 @@ fn main() -> Result<(), Box<dyn Error>> {
                 basename, empty_cols
             )?;
         }
+
+        if matched_count == 1 {
+            outfile.write_all(header_slice)?;
+            io::copy(&mut infile, &mut outfile)?;
+        } else if bytes_read >= OFFSET_FOR_SUBSEQUENT_FILES as usize {
+            io::copy(&mut infile, &mut outfile)?;
+        }
     }
+
+    if matched_count == 0 {
+        outfile.flush()?;
+        info_txt_fp.flush()?;
+        headers_csv_fp.flush()?;
+        drop(outfile);
+        drop(info_txt_fp);
+        drop(headers_csv_fp);
+        cleanup_temp_files(&[
+            &temp_output_filename,
+            &temp_info_txt_filename,
+            &temp_headers_csv_filename,
+        ]);
+        return Err("フィルタリングの結果, 処理対象のファイルがありません.".into());
+    }
+    if matched_count < 2 {
+        outfile.flush()?;
+        info_txt_fp.flush()?;
+        headers_csv_fp.flush()?;
+        drop(outfile);
+        drop(info_txt_fp);
+        drop(headers_csv_fp);
+        cleanup_temp_files(&[
+            &temp_output_filename,
+            &temp_info_txt_filename,
+            &temp_headers_csv_filename,
+        ]);
+        return Err(format!("フィルタリングの結果, 結合対象となるファイルが {} 個のみです. 処理を続行するには少なくとも2つのファイルが必要です.", matched_count).into());
+    }
+
+    println!("{}個のファイルが処理対象です.", matched_count);
     println!("読み取った値の合計: {} (0x{:x})", total_sum, total_sum);
 
-    writeln!(info_txt_fp, "----------------------------------------------|----------------------|------------------------------------")?;
+    writeln!(
+        info_txt_fp,
+        "----------------------------------------------|----------------------|------------------------------------"
+    )?;
     writeln!(
         info_txt_fp,
         "合計 (全処理対象ファイル)                                       | 0x{:<18x} |",
         total_sum
     )?;
-    writeln!(info_txt_fp, "=================================================================================================\n")?;
-
-    // --- ファイルの結合処理 ---
-    println!("\nファイルの結合処理を開始します...");
-    let mut outfile = BufWriter::new(File::create(&output_filename)?);
-    println!("出力ファイル: {:?}", output_filename);
-
-    // 1つ目のファイル
-    println!(
-        "処理中: \"{:?}\" (全体をコピー中)",
-        files_to_process[0].path
-    );
-    append_file_content(&mut outfile, &files_to_process[0].path, 0)?;
-
-    // 2つ目以降
-    for file_info in files_to_process.iter().skip(1) {
-        println!(
-            "処理中: \"{:?}\" (先頭 {} バイトをスキップして結合中)",
-            file_info.path, OFFSET_FOR_SUBSEQUENT_FILES
-        );
-        append_file_content(&mut outfile, &file_info.path, OFFSET_FOR_SUBSEQUENT_FILES)?;
-    }
+    writeln!(
+        info_txt_fp,
+        "=================================================================================================\n"
+    )?;
 
     // --- 合計値とシグネチャの書き込み ---
+    let output_filename = generate_output_filename(&[
+        first_matched_file.clone().unwrap(),
+        last_matched_file.clone().unwrap(),
+    ])?;
+    let info_txt_filename = output_filename.with_extension("cor.txt");
+    let headers_csv_filename = output_filename.with_extension("cor.headers.csv");
+
     println!(
-        "\n計算された合計値 {} (0x{:x}) を \"{:?}\" のオフセット {} に書き込みます...",
-        total_sum, total_sum, output_filename, VALUE_OFFSET
+        "\n計算された合計値 {} (0x{:x}) を一時出力に書き込みます...",
+        total_sum, total_sum
     );
     outfile.seek(SeekFrom::Start(VALUE_OFFSET))?;
     outfile.write_all(&total_sum.to_le_bytes())?;
 
     println!(
-        "'{}' シグネチャを \"{:?}\" のオフセット {} ({} バイト) に書き込みます...",
-        SIGNATURE_STRING, output_filename, SIGNATURE_OFFSET, SIGNATURE_BUFFER_LEN
+        "'{}' シグネチャを一時出力のオフセット {} ({} バイト) に書き込みます...",
+        SIGNATURE_STRING, SIGNATURE_OFFSET, SIGNATURE_BUFFER_LEN
     );
     outfile.seek(SeekFrom::Start(SIGNATURE_OFFSET))?;
     let mut signature_buffer_to_write = [0u8; SIGNATURE_BUFFER_LEN];
@@ -528,6 +524,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     outfile.flush()?;
     info_txt_fp.flush()?;
     headers_csv_fp.flush()?;
+    drop(outfile);
+    drop(info_txt_fp);
+    drop(headers_csv_fp);
+
+    fs::rename(&temp_output_filename, &output_filename)?;
+    fs::rename(&temp_info_txt_filename, &info_txt_filename)?;
+    fs::rename(&temp_headers_csv_filename, &headers_csv_filename)?;
+
+    println!("情報テキストファイル: {:?}", info_txt_filename);
+    println!("ヘッダー情報ファイル: {:?}", headers_csv_filename);
 
     println!(
         "\n全ての処理が完了し、結果は \"{:?}\" に保存されました.",

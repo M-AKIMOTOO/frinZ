@@ -741,7 +741,6 @@ dependencies = [
  "image 0.25.9",
  "imageproc",
  "imagequant",
- "levenberg-marquardt",
  "memmap2",
  "nalgebra 0.33.2",
  "nav-types",
@@ -758,6 +757,26 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "zstd",
+]
+
+[[package]]
+name = "frinZ-tools"
+version = "4.2.0"
+dependencies = [
+ "anyhow",
+ "astro",
+ "byteorder",
+ "chrono",
+ "clap",
+ "csv",
+ "frinZ",
+ "memmap2",
+ "nalgebra 0.33.2",
+ "ndarray",
+ "num-complex",
+ "plotters",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1071,18 +1090,6 @@ name = "lebe"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
-
-[[package]]
-name = "levenberg-marquardt"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "384ced02a6ac2eb8879d8bd86b46b88e133fa09ffe60d8307263b013ee3ceff2"
-dependencies = [
- "cfg-if",
- "nalgebra 0.33.2",
- "num-traits",
- "rustc_version",
-]
 
 [[package]]
 name = "libc"

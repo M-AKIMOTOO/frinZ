@@ -8,7 +8,11 @@ description = "fringe search for Yamaguchi Interferometer and Japanese VLBI Netw
 repository = "https://github.com/M-AKIMOTOO/frinZrs"
 documentation = "https://docs.rs/frinZ"
 readme = "README.md"    
-include = ["src/frinZmain/", "src/pulsar_gating/"]
+include = ["src/frinZmain/", "README.md", "LICENSE"]
+
+[workspace]
+members = ["tools"]
+default-members = [".", "tools"]
 
 [lib]
 path = "src/frinZmain/lib.rs"
@@ -16,26 +20,6 @@ path = "src/frinZmain/lib.rs"
 [[bin]]
 name = "frinZ"
 path = "src/frinZmain/main.rs"
-
-[[bin]]
-name = "cormerge"
-path = "src/cormerge/main.rs"
-
-[[bin]]
-name = "gfrinZ"
-path = "src/gfrinZmain/main.rs"
-
-[[bin]]
-name = "corshow"
-path = "src/corshow/main.rs"
-
-[[bin]]
-name = "bandscythe"
-path = "src/bandscythe/main.rs"
-
-[[bin]]
-name = "pulsar_gating"
-path = "src/pulsar_gating/main.rs"
 
 [features]
 default = []
@@ -63,7 +47,6 @@ rayon = "1.10"
 sys-info      = "0.9"
 memmap2 = "0.9"
 csv = "1.3.1"
-levenberg-marquardt = "0.14"
 zstd = "0.13"
 tempfile = "3.13"
 npyz = { version = "0.8.4", features = ["derive"] }

@@ -20,12 +20,19 @@ use astro::planet::{self, earth, Planet};
 use astro::time::{self, Date};
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
-use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt, TerminationReason};
-use nalgebra::{storage::Owned, DMatrix, DVector, Dyn, Matrix3, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
 
 const C_KM_S: f64 = 299792.458; // Speed of light in km/s
 const FWHM_TO_SIGMA: f64 = 0.42466090014400953; // 1 / (2 * sqrt(2 ln 2))
 const MIN_FWHM_KMS: f64 = 1.0e-3; // clamp to avoid zero-width components
+const LM_MAX_ITERATIONS: usize = 100;
+const LM_MAX_INNER_TRIALS: usize = 12;
+const LM_INITIAL_LAMBDA: f64 = 1.0e-3;
+const LM_MIN_LAMBDA: f64 = 1.0e-12;
+const LM_MAX_LAMBDA: f64 = 1.0e12;
+const LM_GRADIENT_TOL: f64 = 1.0e-8;
+const LM_STEP_TOL: f64 = 1.0e-8;
+const LM_OBJECTIVE_REL_TOL: f64 = 1.0e-8;
 
 macro_rules! maser_logln {
     ($log:expr, $($arg:tt)*) => {{
@@ -156,10 +163,19 @@ enum OffSpec {
 struct GaussianFitResult {
     components: Vec<(f64, f64, f64)>,
     residual_norm: f64,
-    termination: TerminationReason,
+    termination: GaussianFitTermination,
     evaluations: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GaussianFitTermination {
+    GradientTolerance,
+    StepTolerance,
+    ObjectiveTolerance,
+    MaxIterations,
+}
+
+#[derive(Clone)]
 struct GaussianMixtureProblem<'a> {
     velocities: &'a [f64],
     values: &'a [f64],
@@ -216,12 +232,6 @@ impl<'a> GaussianMixtureProblem<'a> {
         }
         total
     }
-}
-
-impl<'a> LeastSquaresProblem<f64, Dyn, Dyn> for GaussianMixtureProblem<'a> {
-    type ResidualStorage = Owned<f64, Dyn>;
-    type JacobianStorage = Owned<f64, Dyn, Dyn>;
-    type ParameterStorage = Owned<f64, Dyn>;
 
     fn set_params(&mut self, x: &DVector<f64>) {
         self.params.copy_from(x);
@@ -317,17 +327,100 @@ fn fit_gaussian_mixture(
     }
 
     let initial_flat = flatten_gaussian_components(initial_components);
-    let problem = GaussianMixtureProblem::new(velocities, values, &initial_flat);
-    let (problem, report) = LevenbergMarquardt::new().minimize(problem);
-
-    let residual_vec = problem
+    let mut problem = GaussianMixtureProblem::new(velocities, values, &initial_flat);
+    let mut residual_vec = problem
         .residuals()
-        .unwrap_or_else(|| DVector::zeros(velocities.len()));
+        .ok_or("Gaussian fit residual computation failed.")?;
+    let mut objective = 0.5 * residual_vec.dot(&residual_vec);
+    let mut lambda = LM_INITIAL_LAMBDA;
+    let mut evaluations = 1;
+    let mut termination = GaussianFitTermination::MaxIterations;
+
+    for _ in 0..LM_MAX_ITERATIONS {
+        let jacobian = problem
+            .jacobian()
+            .ok_or("Gaussian fit Jacobian computation failed.")?;
+        let jt = jacobian.transpose();
+        let gradient = &jt * &residual_vec;
+        let gradient_inf_norm = gradient.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        if gradient_inf_norm <= LM_GRADIENT_TOL {
+            termination = GaussianFitTermination::GradientTolerance;
+            break;
+        }
+
+        let normal = &jt * &jacobian;
+        let diag_scale: Vec<f64> = (0..normal.nrows())
+            .map(|idx| normal[(idx, idx)].abs().max(1.0))
+            .collect();
+        let current_params = problem.params();
+        let current_param_norm = current_params.norm();
+        let step_tolerance = LM_STEP_TOL * (current_param_norm + LM_STEP_TOL);
+        let mut accepted_step: Option<(GaussianMixtureProblem<'_>, DVector<f64>, f64, f64)> = None;
+        let mut saw_small_step = false;
+
+        for _ in 0..LM_MAX_INNER_TRIALS {
+            let mut damped = normal.clone();
+            for idx in 0..damped.nrows() {
+                damped[(idx, idx)] += lambda * diag_scale[idx];
+            }
+
+            let rhs = -&gradient;
+            let Some(step) = damped.lu().solve(&rhs) else {
+                lambda = (lambda * 10.0).min(LM_MAX_LAMBDA);
+                continue;
+            };
+
+            let step_norm = step.norm();
+            if step_norm <= step_tolerance {
+                saw_small_step = true;
+            }
+
+            let candidate_params = &current_params + step;
+            let mut candidate = problem.clone();
+            candidate.set_params(&candidate_params);
+            let candidate_residual = candidate
+                .residuals()
+                .ok_or("Gaussian fit candidate residual computation failed.")?;
+            evaluations += 1;
+            let candidate_objective = 0.5 * candidate_residual.dot(&candidate_residual);
+
+            if candidate_objective < objective {
+                accepted_step = Some((candidate, candidate_residual, candidate_objective, step_norm));
+                break;
+            }
+
+            lambda = (lambda * 10.0).min(LM_MAX_LAMBDA);
+        }
+
+        if let Some((candidate, candidate_residual, candidate_objective, step_norm)) = accepted_step
+        {
+            let objective_improvement = objective - candidate_objective;
+            problem = candidate;
+            residual_vec = candidate_residual;
+            objective = candidate_objective;
+            lambda = (lambda * 0.3).max(LM_MIN_LAMBDA);
+
+            if objective_improvement <= LM_OBJECTIVE_REL_TOL * objective.max(1.0) {
+                termination = GaussianFitTermination::ObjectiveTolerance;
+                break;
+            }
+            if step_norm <= step_tolerance {
+                termination = GaussianFitTermination::StepTolerance;
+                break;
+            }
+        } else if saw_small_step {
+            termination = GaussianFitTermination::StepTolerance;
+            break;
+        } else {
+            return Err("Gaussian fit failed to find a descent step.".into());
+        }
+    }
+
     let result = GaussianFitResult {
         components: problem.components(),
         residual_norm: residual_vec.norm(),
-        termination: report.termination,
-        evaluations: report.number_of_evaluations,
+        termination,
+        evaluations,
     };
     Ok(result)
 }

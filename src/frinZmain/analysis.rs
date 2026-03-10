@@ -213,7 +213,10 @@ pub fn analyze_results(
         let (delay_win_low, delay_win_high) = if !args.drange.is_empty() {
             (args.drange[0], args.drange[1])
         } else {
-            (delay_range[0], *delay_range.last().unwrap_or(&delay_range[0]))
+            (
+                delay_range[0],
+                *delay_range.last().unwrap_or(&delay_range[0]),
+            )
         };
         let (rate_win_low, rate_win_high) = if !args.rrange.is_empty() {
             (args.rrange[0], args.rrange[1])
@@ -454,8 +457,7 @@ pub fn analyze_results(
                     freq_range[right_idx] as f64,
                 ];
                 let y_values = vec![y_left, y_mid, y_right];
-                if let Ok(fit_result) = fitting::fit_quadratic_least_squares(&x_coords, &y_values)
-                {
+                if let Ok(fit_result) = fitting::fit_quadratic_least_squares(&x_coords, &y_values) {
                     let x_min = x_coords[0].min(x_coords[2]);
                     let x_max = x_coords[0].max(x_coords[2]);
                     if fit_result.peak_x >= x_min && fit_result.peak_x <= x_max {

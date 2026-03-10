@@ -164,11 +164,7 @@ fn parse_f64(value: &str, key: &str) -> Result<f64, Box<dyn Error>> {
         .map_err(|_| format!("Error: invalid value '{}' for {}.", value, key).into())
 }
 
-fn parse_datetime_or_mjd(
-    value: &str,
-    allow_mjd: bool,
-    key: &str,
-) -> Result<f64, Box<dyn Error>> {
+fn parse_datetime_or_mjd(value: &str, allow_mjd: bool, key: &str) -> Result<f64, Box<dyn Error>> {
     if let Some(unix) = parse_datetime_to_unix_sec(value) {
         return Ok(unix);
     }
@@ -324,18 +320,15 @@ fn apply_key_value(
             state.source_dec_override_rad = Some(v);
         }
         _ => {
-            return Err(format!(
-                "Error: unknown --folding key '{}'.",
-                key
-            )
-            .into());
+            return Err(format!("Error: unknown --folding key '{}'.", key).into());
         }
     }
     Ok(())
 }
 
 fn parse_ephemeris_file(path: &Path, state: &mut FoldingParseState) -> Result<(), Box<dyn Error>> {
-    let file = File::open(path).map_err(|e| format!("Error opening ephemeris file {:?}: {}", path, e))?;
+    let file =
+        File::open(path).map_err(|e| format!("Error opening ephemeris file {:?}: {}", path, e))?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
         let line = line?;
@@ -684,7 +677,11 @@ fn ecef_to_equatorial_km(ecef_km: &Vector3<f64>, jd: f64) -> Vector3<f64> {
     rot * ecef_km
 }
 
-fn barycentric_delay_sec(obs_unix_sec: f64, observer_ecef_m: [f64; 3], src_hat: &Vector3<f64>) -> f64 {
+fn barycentric_delay_sec(
+    obs_unix_sec: f64,
+    observer_ecef_m: [f64; 3],
+    src_hat: &Vector3<f64>,
+) -> f64 {
     let jd = unix_to_julian_day(obs_unix_sec);
     let earth_helio_eq = earth_heliocentric_equatorial_km(jd);
     let observer_ecef_km = Vector3::new(
@@ -726,8 +723,7 @@ fn orbital_delay_sec(obs_unix_sec: f64, orbital: &OrbitalEphemeris) -> f64 {
         let sin_w = orbital.omega_rad.sin();
         let cos_w = orbital.omega_rad.cos();
         let fac = (1.0 - orbital.ecc * orbital.ecc).sqrt();
-        return orbital.a1_sec
-            * (sin_w * (e.cos() - orbital.ecc) + fac * cos_w * e.sin());
+        return orbital.a1_sec * (sin_w * (e.cos() - orbital.ecc) + fac * cos_w * e.sin());
     }
 
     0.0
@@ -932,11 +928,13 @@ pub fn run_folding_analysis(
         let vis = coherent_sum / coherent_count as f32;
         // Use sector index + effective integration to preserve sub-second timing.
         // .cor sector headers typically store integer seconds, which is too coarse for pulsar folding.
-        let mut corrected_time_unix =
-            first_sector_unix + sector_idx as f64 * effective_integ_time as f64 + 0.5 * effective_integ_time as f64;
+        let mut corrected_time_unix = first_sector_unix
+            + sector_idx as f64 * effective_integ_time as f64
+            + 0.5 * effective_integ_time as f64;
 
         if cfg.spin.use_barycentric {
-            let bary_delay = barycentric_delay_sec(corrected_time_unix, observer_mid_ecef_m, &src_hat);
+            let bary_delay =
+                barycentric_delay_sec(corrected_time_unix, observer_mid_ecef_m, &src_hat);
             corrected_time_unix += bary_delay;
             update_minmax(&mut bary_delay_minmax, bary_delay);
         }
@@ -953,8 +951,8 @@ pub fn run_folding_analysis(
             phase_epoch_unix_sec = Some(corrected_time_unix);
         }
         let phase_epoch = phase_epoch_unix_sec.unwrap_or(corrected_time_unix);
-        let phase =
-            (spin_phase_cycles(corrected_time_unix, &cfg.spin, phase_epoch) + cfg.phase0).rem_euclid(1.0);
+        let phase = (spin_phase_cycles(corrected_time_unix, &cfg.spin, phase_epoch) + cfg.phase0)
+            .rem_euclid(1.0);
         let bin_idx = ((phase * cfg.bins as f64).floor() as usize).min(cfg.bins - 1);
 
         bin_sum[bin_idx] += Complex::<f64>::new(vis.re as f64, vis.im as f64);
@@ -1010,9 +1008,11 @@ pub fn run_folding_analysis(
         off_amps.iter().sum::<f64>() / off_amps.len() as f64
     };
     let off_std = if off_amps.len() > 1 {
-        let var =
-            off_amps.iter().map(|v| (v - off_mean) * (v - off_mean)).sum::<f64>()
-                / (off_amps.len() - 1) as f64;
+        let var = off_amps
+            .iter()
+            .map(|v| (v - off_mean) * (v - off_mean))
+            .sum::<f64>()
+            / (off_amps.len() - 1) as f64;
         var.sqrt()
     } else {
         0.0
@@ -1064,8 +1064,16 @@ pub fn run_folding_analysis(
 
     let summary_path = output_dir.join(format!("{stem}_folding_summary.txt"));
     let mut summary_file = File::create(&summary_path)?;
-    writeln!(summary_file, "input                 : {}", input_path.display())?;
-    writeln!(summary_file, "source                : {}", header.source_name.trim())?;
+    writeln!(
+        summary_file,
+        "input                 : {}",
+        input_path.display()
+    )?;
+    writeln!(
+        summary_file,
+        "source                : {}",
+        header.source_name.trim()
+    )?;
     writeln!(
         summary_file,
         "station pair          : {}-{}",
@@ -1077,7 +1085,11 @@ pub fn run_folding_analysis(
         "obs frequency [MHz]   : {:.6}",
         header.observing_frequency / 1e6
     )?;
-    writeln!(summary_file, "period [s]            : {:.9}", cfg.spin.period_sec)?;
+    writeln!(
+        summary_file,
+        "period [s]            : {:.9}",
+        cfg.spin.period_sec
+    )?;
     writeln!(
         summary_file,
         "period dot [s/s]      : {:.6e}",
@@ -1089,7 +1101,11 @@ pub fn run_folding_analysis(
     writeln!(
         summary_file,
         "barycentric correction: {}",
-        if cfg.spin.use_barycentric { "on" } else { "off" }
+        if cfg.spin.use_barycentric {
+            "on"
+        } else {
+            "off"
+        }
     )?;
     writeln!(
         summary_file,
@@ -1100,10 +1116,18 @@ pub fn run_folding_analysis(
         writeln!(summary_file, "ephemeris file        : {}", path.display())?;
     }
     if let Some((mn, mx)) = bary_delay_minmax {
-        writeln!(summary_file, "bary delay [s] min/max: {:+.9} / {:+.9}", mn, mx)?;
+        writeln!(
+            summary_file,
+            "bary delay [s] min/max: {:+.9} / {:+.9}",
+            mn, mx
+        )?;
     }
     if let Some((mn, mx)) = orbital_delay_minmax {
-        writeln!(summary_file, "orb delay [s] min/max : {:+.9} / {:+.9}", mn, mx)?;
+        writeln!(
+            summary_file,
+            "orb delay [s] min/max : {:+.9} / {:+.9}",
+            mn, mx
+        )?;
     }
     if let Some(orb) = &cfg.spin.orbital {
         writeln!(summary_file, "orb pb [s]            : {:.9}", orb.pb_sec)?;
@@ -1133,7 +1157,11 @@ pub fn run_folding_analysis(
         end_sector.saturating_sub(start_sector)
     )?;
     writeln!(summary_file, "used samples          : {}", used_samples)?;
-    writeln!(summary_file, "skipped by time flag  : {}", skipped_time_flag)?;
+    writeln!(
+        summary_file,
+        "skipped by time flag  : {}",
+        skipped_time_flag
+    )?;
     writeln!(summary_file, "skipped empty/invalid : {}", skipped_empty)?;
     if let Some(t) = first_obs_time {
         writeln!(summary_file, "first epoch (UTC)     : {}", t)?;
@@ -1168,7 +1196,11 @@ pub fn run_folding_analysis(
     writeln!(summary_file, "off mean              : {:.9}", off_mean)?;
     writeln!(summary_file, "off std               : {:.9}", off_std)?;
     writeln!(summary_file, "fold SNR              : {:.6}", snr)?;
-    writeln!(summary_file, "profile png           : {}", profile_png_path.display())?;
+    writeln!(
+        summary_file,
+        "profile png           : {}",
+        profile_png_path.display()
+    )?;
 
     println!("Running folding analysis...");
     println!("  Input: {}", input_path.display());
@@ -1177,7 +1209,11 @@ pub fn run_folding_analysis(
     println!("  Bins: {}", cfg.bins);
     println!(
         "  Barycentric correction: {}",
-        if cfg.spin.use_barycentric { "on" } else { "off" }
+        if cfg.spin.use_barycentric {
+            "on"
+        } else {
+            "off"
+        }
     );
     println!(
         "  Orbital correction: {}",

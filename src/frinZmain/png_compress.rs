@@ -64,15 +64,12 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
     let _ = base_attr.set_min_posterization(0);
 
     let color_targets = [
-        256u32, 224, 192, 160, 144, 
-        128, 112, 96, 80, 72, 
-        64, 56, 48, 40, 32, 28, 24, 20, 16, 12, 10, 8,
+        256u32, 224, 192, 160, 144, 128, 112, 96, 80, 72, 64, 56, 48, 40, 32, 28, 24, 20, 16, 12,
+        10, 8,
     ];
     let mut best_png: Option<Vec<u8>> = None;
     for &colors in &color_targets {
-        if let Some(candidate) =
-            quantize_with_colors(&base_attr, &pixels, width, height, colors)
-        {
+        if let Some(candidate) = quantize_with_colors(&base_attr, &pixels, width, height, colors) {
             let take = best_png
                 .as_ref()
                 .map(|current| candidate.len() < current.len())

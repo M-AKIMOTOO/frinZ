@@ -117,7 +117,10 @@ fn rate_to_ss(rate_hz: f64, obs_freq_hz: f64) -> f64 {
     }
 }
 
-fn write_json_pretty<W: Write + ?Sized, T: Serialize>(out: &mut W, value: &T) -> anyhow::Result<()> {
+fn write_json_pretty<W: Write + ?Sized, T: Serialize>(
+    out: &mut W,
+    value: &T,
+) -> anyhow::Result<()> {
     let s = serde_json::to_string_pretty(value)?;
     out.write_all(s.as_bytes())?;
     out.write_all(b"\n")?;
@@ -960,7 +963,11 @@ fn main() -> anyhow::Result<()> {
         if !missing.is_empty() || pair_set.len() != 3 {
             anyhow::bail!(
                 "--cor で三角形が未成立です。欠損基線: {}",
-                if missing.is_empty() { "(unknown)".to_string() } else { missing.join(", ") }
+                if missing.is_empty() {
+                    "(unknown)".to_string()
+                } else {
+                    missing.join(", ")
+                }
             );
         }
     }
@@ -3037,11 +3044,8 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 for w in &smoothed {
-                    let rate_ss: Vec<f64> = w
-                        .rate
-                        .iter()
-                        .map(|v| rate_to_ss(*v, obs_freq_hz))
-                        .collect();
+                    let rate_ss: Vec<f64> =
+                        w.rate.iter().map(|v| rate_to_ss(*v, obs_freq_hz)).collect();
                     let antennas_json: Vec<serde_json::Value> = w
                         .tau
                         .iter()

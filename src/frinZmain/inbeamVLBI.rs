@@ -18,7 +18,10 @@ pub fn run_inbeam_vlbi_analysis(
     pp_flag_ranges: &[(u32, u32)],
 ) -> Result<(), Box<dyn Error>> {
     let input_path = args.input.as_ref().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "--in-beam requires an --input file")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--in-beam requires an --input file",
+        )
     })?;
 
     println!("#INFO: Running in-beam VLBI workflow (standard delay-rate fringe search).");

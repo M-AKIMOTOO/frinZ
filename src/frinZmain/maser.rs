@@ -1,6 +1,6 @@
+use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use ndarray::{Array1, Axis};
 use plotters::prelude::*;
-use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
@@ -342,7 +342,9 @@ fn fit_gaussian_mixture(
             .ok_or("Gaussian fit Jacobian computation failed.")?;
         let jt = jacobian.transpose();
         let gradient = &jt * &residual_vec;
-        let gradient_inf_norm = gradient.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let gradient_inf_norm = gradient
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
         if gradient_inf_norm <= LM_GRADIENT_TOL {
             termination = GaussianFitTermination::GradientTolerance;
             break;
@@ -385,7 +387,12 @@ fn fit_gaussian_mixture(
             let candidate_objective = 0.5 * candidate_residual.dot(&candidate_residual);
 
             if candidate_objective < objective {
-                accepted_step = Some((candidate, candidate_residual, candidate_objective, step_norm));
+                accepted_step = Some((
+                    candidate,
+                    candidate_residual,
+                    candidate_objective,
+                    step_norm,
+                ));
                 break;
             }
 
@@ -1387,24 +1394,27 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let chunk_length = if args.length > 0 {
-        let off_note = match &off_spec {
-            OffSpec::File(_) => "OFF source uses full span".to_string(),
-            OffSpec::Baseline(kind) => format!("OFF is {} baseline fit in analysis window", kind.as_str()),
-        };
-        maser_logln!(
+    let chunk_length =
+        if args.length > 0 {
+            let off_note = match &off_spec {
+                OffSpec::File(_) => "OFF source uses full span".to_string(),
+                OffSpec::Baseline(kind) => {
+                    format!("OFF is {} baseline fit in analysis window", kind.as_str())
+                }
+            };
+            maser_logln!(
             log_lines,
             "  Maser processing will segment the ON source with --length={} and --loop={} ({}).",
             args.length, args.loop_, off_note
         );
-        args.length
-    } else {
-        maser_logln!(
-            log_lines,
-            "  Maser processing will use the full data span (single segment)."
-        );
-        0
-    };
+            args.length
+        } else {
+            maser_logln!(
+                log_lines,
+                "  Maser processing will use the full data span (single segment)."
+            );
+            0
+        };
     let mut on_segments: Vec<SpectrumData> = Vec::new();
     let mut loop_index: usize = 0;
     let loop_limit: usize = if chunk_length > 0 {
@@ -2031,9 +2041,7 @@ fn analyze_segment(
         } else if fit.coeff_shifted.len() >= 2 {
             format!(
                 "{:.6e} + {:.6e}*(f-{:.6})",
-                fit.coeff_shifted[0],
-                fit.coeff_shifted[1],
-                fit.x_center_mhz
+                fit.coeff_shifted[0], fit.coeff_shifted[1], fit.x_center_mhz
             )
         } else {
             format!("{:.6e}", fit.coeff_shifted[0])

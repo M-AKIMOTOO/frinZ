@@ -21,7 +21,9 @@ type C32 = Complex<f32>;
 
 #[derive(Debug, Clone)]
 enum PhaseFitSpec {
-    Polynomial { degree: usize },
+    Polynomial {
+        degree: usize,
+    },
     PolynomialPlusSin {
         degree: usize,
         period_sec: Option<f64>,
@@ -414,7 +416,11 @@ pub fn run_phase_reference_analysis(
                 }
             }
             Err(e) => {
-                eprintln!("Warning: Phase fitting failed ({}): {}", fit_spec.describe(), e);
+                eprintln!(
+                    "Warning: Phase fitting failed ({}): {}",
+                    fit_spec.describe(),
+                    e
+                );
             }
         }
     }

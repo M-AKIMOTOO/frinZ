@@ -18,6 +18,7 @@
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
   --bandpass <BP.bin>                バンドパス適用 (--bptable で補正スペクトル保存)
+  --norm-acf                         同ディレクトリの自己相関 .cor で相互相関振幅を規格化
 
 [補正・フラグ]
   --delay / --rate / --acel          事前補正値

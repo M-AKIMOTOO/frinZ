@@ -3,7 +3,6 @@
 // then derives closure phase and related statistics/plots.
 use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
-use crate::search;
 use crate::fft;
 use crate::header::{parse_header, CorHeader};
 use crate::output::write_phase_corrected_spectrum_binary;
@@ -11,6 +10,7 @@ use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::run_analysis_pipeline;
 use crate::read::{read_sector_header, read_visibility_data};
 use crate::rfi::parse_rfi_ranges;
+use crate::search;
 use chrono::{DateTime, Utc};
 use num_complex::Complex;
 use plotters::coord::ranged1d::{KeyPointHint, NoDefaultFormatting, Ranged, ValueFormatter};
@@ -573,7 +573,7 @@ fn collect_baseline_visibility(
                 let mut total_delay = args.delay_correct;
                 let mut total_rate = args.rate_correct;
                 for _ in 0..args.iter {
-                    let (iter_results, _, _) = run_analysis_pipeline(
+                    let (iter_results, _, _, _) = run_analysis_pipeline(
                         &complex_vec,
                         &header,
                         args,
@@ -696,7 +696,11 @@ fn collect_baseline_visibility(
         info,
         file_header_raw,
         loops,
-        baseline_label: format!("{}-{}", header.station1_name.trim(), header.station2_name.trim()),
+        baseline_label: format!(
+            "{}-{}",
+            header.station1_name.trim(),
+            header.station2_name.trim()
+        ),
     })
 }
 
@@ -850,7 +854,11 @@ fn build_closure_products(
         let closure_phase_deg = wrap_phase_deg(bispectrum.arg().to_degrees());
 
         let bis_amp = bispectrum.norm();
-        let bis_amp_cuberoot = if bis_amp > 0.0 { bis_amp.powf(1.0 / 3.0) } else { 0.0 };
+        let bis_amp_cuberoot = if bis_amp > 0.0 {
+            bis_amp.powf(1.0 / 3.0)
+        } else {
+            0.0
+        };
 
         let mut sector_header = lp1.sector_header.clone();
         if sector_header.len() >= SECTOR_HEADER_SIZE {
@@ -1020,10 +1028,12 @@ fn compute_bispectrum_stats(values: &[C32], closure_phase_deg: &[f32]) -> Bispec
     let amp_mean = amps.iter().sum::<f64>() / n;
     let amp_std = stddev(&amps, amp_mean);
 
-    let unit_sum = closure_phase_deg.iter().fold(C32::new(0.0, 0.0), |acc, deg| {
-        let rad = deg.to_radians();
-        acc + C32::from_polar(1.0, rad)
-    });
+    let unit_sum = closure_phase_deg
+        .iter()
+        .fold(C32::new(0.0, 0.0), |acc, deg| {
+            let rad = deg.to_radians();
+            acc + C32::from_polar(1.0, rad)
+        });
     let mut rbar = unit_sum.norm() as f64 / n;
     if !rbar.is_finite() {
         rbar = 0.0;
@@ -1268,7 +1278,11 @@ fn plot_closure_phase(
         chart
             .draw_series(rows.iter().map(|sample| {
                 let x = (sample.timestamp - first_time).num_milliseconds() as f64 / 1000.0;
-                Circle::new((x, sample.baseline_phase_deg[idx] as f64), 4, color.filled())
+                Circle::new(
+                    (x, sample.baseline_phase_deg[idx] as f64),
+                    4,
+                    color.filled(),
+                )
             }))?
             .label(label.clone())
             .legend(move |(x, y)| Circle::new((x + 10, y), 5, color.filled()));
@@ -1278,7 +1292,11 @@ fn plot_closure_phase(
     chart
         .draw_series(rows.iter().map(|sample| {
             let x = (sample.timestamp - first_time).num_milliseconds() as f64 / 1000.0;
-            Circle::new((x, sample.closure_phase_deg as f64), 4, closure_color.filled())
+            Circle::new(
+                (x, sample.closure_phase_deg as f64),
+                4,
+                closure_color.filled(),
+            )
         }))?
         .label("closure arg(B)")
         .legend(move |(x, y)| Circle::new((x + 10, y), 5, closure_color.filled()));
@@ -1304,7 +1322,11 @@ fn plot_closure_phase(
     let mut draw_legend_entry = |text: &str, color: RGBColor| -> Result<(), Box<dyn Error>> {
         legend_area.draw(&Circle::new((x_pos, y_pos), 6, color.filled()))?;
         x_pos += 10;
-        legend_area.draw(&Text::new(text.to_string(), (x_pos + 10, y_pos), font.clone()))?;
+        legend_area.draw(&Text::new(
+            text.to_string(),
+            (x_pos + 10, y_pos),
+            font.clone(),
+        ))?;
         x_pos += text.chars().count() as i32 * 11;
         Ok(())
     };
@@ -1500,15 +1522,22 @@ pub fn run_closure_phase_analysis(
         return Err("refant must not be empty.".into());
     }
 
-    let loaded1 = collect_baseline_visibility(&cor_paths[0], args, time_flag_ranges, pp_flag_ranges)?;
-    let loaded2 = collect_baseline_visibility(&cor_paths[1], args, time_flag_ranges, pp_flag_ranges)?;
-    let loaded3 = collect_baseline_visibility(&cor_paths[2], args, time_flag_ranges, pp_flag_ranges)?;
+    let loaded1 =
+        collect_baseline_visibility(&cor_paths[0], args, time_flag_ranges, pp_flag_ranges)?;
+    let loaded2 =
+        collect_baseline_visibility(&cor_paths[1], args, time_flag_ranges, pp_flag_ranges)?;
+    let loaded3 =
+        collect_baseline_visibility(&cor_paths[2], args, time_flag_ranges, pp_flag_ranges)?;
 
     let fft1 = loaded1.info.header.fft_point;
     let fft2 = loaded2.info.header.fft_point;
     let fft3 = loaded3.info.header.fft_point;
     if fft1 != fft2 || fft1 != fft3 {
-        return Err(format!("FFT mismatch across baselines: {}, {}, {}", fft1, fft2, fft3).into());
+        return Err(format!(
+            "FFT mismatch across baselines: {}, {}, {}",
+            fft1, fft2, fft3
+        )
+        .into());
     }
 
     let base1_st1 = normalize_name(&loaded1.info.header.station1_name);

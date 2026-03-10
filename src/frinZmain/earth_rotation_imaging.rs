@@ -4,12 +4,12 @@
 
 use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
-use crate::search;
 use crate::fft::apply_phase_correction;
 use crate::header::{parse_header, CorHeader};
 use crate::processing::run_analysis_pipeline;
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
+use crate::search;
 use crate::utils;
 use chrono::{DateTime, Utc};
 use memmap2::Mmap;
@@ -1256,7 +1256,7 @@ fn determine_segment_correction(
             let mut total_rate = args.rate_correct;
 
             for _ in 0..iterations {
-                let (results, _, _) = run_analysis_pipeline(
+                let (results, _, _, _) = run_analysis_pipeline(
                     complex_vec,
                     header,
                     args,
@@ -1277,7 +1277,7 @@ fn determine_segment_correction(
                 total_rate += results.rate_offset;
             }
 
-            let (final_results, _, _) = run_analysis_pipeline(
+            let (final_results, _, _, _) = run_analysis_pipeline(
                 complex_vec,
                 header,
                 args,
@@ -1306,7 +1306,7 @@ fn determine_segment_correction(
             })
         }
         _ => {
-            let (results, _, _) = run_analysis_pipeline(
+            let (results, _, _, _) = run_analysis_pipeline(
                 complex_vec,
                 header,
                 args,

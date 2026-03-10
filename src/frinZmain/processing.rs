@@ -14,9 +14,9 @@ use crate::args::Args;
 use crate::bandpass::{
     apply_bandpass_correction, read_bandpass_file, write_complex_spectrum_binary,
 };
-use crate::search;
 use crate::fft::{self, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
+use crate::norm_acf::NormAcfContext;
 use crate::output::{
     format_delay_output, format_freq_output, generate_output_names, output_header_info,
 };
@@ -25,6 +25,7 @@ use crate::plot::{
 };
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
+use crate::search;
 use crate::utils::{parse_flag_time, safe_arg};
 use memmap2::Mmap;
 
@@ -113,7 +114,10 @@ fn parse_scan_correct_file(path: &Path) -> Result<Vec<ScanCorrection>, Box<dyn E
     Ok(corrections)
 }
 
-fn find_correction_for_time(corrections: &[ScanCorrection], time: &DateTime<Utc>) -> Option<(f32, f32)> {
+fn find_correction_for_time(
+    corrections: &[ScanCorrection],
+    time: &DateTime<Utc>,
+) -> Option<(f32, f32)> {
     for corr in corrections {
         if *time >= corr.start_time && *time < corr.end_time {
             return Some((corr.delay, corr.rate));
@@ -372,12 +376,26 @@ pub fn process_cor_file(
         }
     }
 
-    let bandpass_active = bandpass_data
-        .as_ref()
-        .map_or(false, |bp| !bp.is_empty());
+    let bandpass_active = bandpass_data.as_ref().map_or(false, |bp| !bp.is_empty());
     if args.bandpass.is_some() {
-        println!("#Bandpass applied: {}", if bandpass_active { "True" } else { "False" });
+        println!(
+            "#Bandpass applied: {}",
+            if bandpass_active { "True" } else { "False" }
+        );
     }
+
+    let norm_acf_context = if args.norm_acf {
+        let context = NormAcfContext::load(input_path, &header)?;
+        let (left_path, right_path) = context.path_pair();
+        println!(
+            "#Norm-ACF files: {} | {}",
+            left_path.display(),
+            right_path.display()
+        );
+        Some(context)
+    } else {
+        None
+    };
 
     let mut processing_header = header.clone();
     processing_header.fft_point = effective_fft_point;
@@ -493,6 +511,19 @@ pub fn process_cor_file(
 
         let physical_length = actual_length;
 
+        if let Some(norm_ctx) = &norm_acf_context {
+            norm_ctx.normalize_cross_visibility(
+                &mut complex_vec,
+                current_obs_time,
+                effective_integ_time,
+                requested_length,
+                args.skip,
+                l1,
+                args.cumulate != 0,
+                pp_flag_ranges,
+            )?;
+        }
+
         if effective_fft_point != header.fft_point {
             let target_fft_half = (effective_fft_point / 2) as usize;
             complex_vec = rebin_complex_rows(
@@ -540,7 +571,7 @@ pub fn process_cor_file(
 
         let primary_search_mode = args.primary_search_mode();
 
-        let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp) =
+        let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp, pre_bandpass_results) =
             match primary_search_mode {
                 Some("deep") => {
                     let mut deep_search_result = search::run_deep_search(
@@ -568,6 +599,7 @@ pub fn process_cor_file(
                         deep_search_result.analysis_results,
                         deep_search_result.freq_rate_array,
                         deep_search_result.delay_rate_2d_data,
+                        deep_search_result.pre_bandpass_analysis_results,
                     );
 
                     prev_deep_solution = Some((
@@ -584,7 +616,7 @@ pub fn process_cor_file(
                     let rate_bounds = window_bounds(&args.rrange);
 
                     for _ in 0..args.iter {
-                        let (iter_results, _, _) = run_analysis_pipeline(
+                        let (iter_results, _, _, _) = run_analysis_pipeline(
                             &complex_vec,
                             &processing_header,
                             &loop_args,
@@ -613,7 +645,12 @@ pub fn process_cor_file(
                         }
                     }
 
-                    let (mut final_analysis_results, final_freq_rate_array, final_delay_rate_array) =
+                    let (
+                        mut final_analysis_results,
+                        final_freq_rate_array,
+                        final_delay_rate_array,
+                        pre_bandpass_results,
+                    ) =
                         run_analysis_pipeline(
                             &complex_vec,
                             &processing_header,
@@ -659,11 +696,17 @@ pub fn process_cor_file(
                         final_analysis_results,
                         final_freq_rate_array,
                         final_delay_rate_array,
+                        pre_bandpass_results,
                     )
                 }
                 _ => {
                     // No search or other modes not handled here
-                    let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp) =
+                    let (
+                        mut analysis_results,
+                        freq_rate_array,
+                        delay_rate_2d_data_comp,
+                        pre_bandpass_results,
+                    ) =
                         run_analysis_pipeline(
                             &complex_vec,
                             &processing_header,
@@ -683,7 +726,12 @@ pub fn process_cor_file(
                         )?;
                     analysis_results.length_f32 =
                         (physical_length as f32 * effective_integ_time).ceil();
-                    (analysis_results, freq_rate_array, delay_rate_2d_data_comp)
+                    (
+                        analysis_results,
+                        freq_rate_array,
+                        delay_rate_2d_data_comp,
+                        pre_bandpass_results,
+                    )
                 }
             };
 
@@ -806,16 +854,17 @@ pub fn process_cor_file(
                 args.length,
                 &rfi_display,
                 bandpass_active,
+                norm_acf_context.is_some(),
             );
             if l1 == 0 {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
                 let station2_label = format!("{}-azel", header.station2_name.trim());
-                    let header_str = format!(
+                let header_str = format!(
                         concat!(
-                            "#******************************************************************************************************************************************************************************************************************\n",
-                            "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP       \n",
-                            "#                                        [s]      [%]               [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F]     \n",
-                            "#******************************************************************************************************************************************************************************************************************"
+                            "#*************************************************************************************************************************************************************************************************************************\n",
+                            "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF \n",
+                            "#                                        [s]      [%]               [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F]\n",
+                            "#*************************************************************************************************************************************************************************************************************************"
                         ),
                         station1_label,
                         station2_label
@@ -887,16 +936,17 @@ pub fn process_cor_file(
                 args.length,
                 &rfi_display,
                 bandpass_active,
+                norm_acf_context.is_some(),
             );
             if l1 == 0 {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
                 let station2_label = format!("{}-azel", header.station2_name.trim());
                 let header_str = format!(
                     concat!(
-                        "#**********************************************************************************************************************************************************************************************************\n",
-                        "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP\n",
-                        "#                                        [s]      [%]              [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F]\n",
-                        "#**********************************************************************************************************************************************************************************************************"
+                        "#*******************************************************************************************************************************************************************************************************************\n",
+                        "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF\n",
+                        "#                                        [s]      [%]              [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F]\n",
+                        "#*******************************************************************************************************************************************************************************************************************"
                     ),
                     station1_label,
                     station2_label
@@ -1001,6 +1051,24 @@ pub fn process_cor_file(
                         .zip(analysis_results.delay_rate.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
+                    let delay_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
+                        .as_ref()
+                        .map(|pre| {
+                            pre.delay_range
+                                .iter()
+                                .zip(pre.visibility.iter())
+                                .map(|(&x, &y)| (x as f64, y as f64))
+                                .collect()
+                        });
+                    let rate_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
+                        .as_ref()
+                        .map(|pre| {
+                            pre.rate_range
+                                .iter()
+                                .zip(pre.delay_rate.iter())
+                                .map(|(&x, &y)| (x as f64, y as f64))
+                                .collect()
+                        });
                     let rows = delay_rate_2d_data_comp.shape()[0] as u32;
                     let cols = delay_rate_2d_data_comp.shape()[1] as u32;
                     let max_norm = delay_rate_2d_data_comp
@@ -1063,13 +1131,13 @@ pub fn process_cor_file(
                             plot_rrange[0].max(plot_rrange[1]) as f64,
                         )
                     } else {
-                        let rate_low = if (-8.0 / analysis_results.length_f32 as f64)
-                            < rate_data[0] as f64
-                        {
-                            rate_data[0] as f64 * effective_integ_time as f64
-                        } else {
-                            -4.0 / (analysis_results.length_f32 as f64 * effective_integ_time as f64)
-                        };
+                        let rate_low =
+                            if (-8.0 / analysis_results.length_f32 as f64) < rate_data[0] as f64 {
+                                rate_data[0] as f64 * effective_integ_time as f64
+                            } else {
+                                -4.0 / (analysis_results.length_f32 as f64
+                                    * effective_integ_time as f64)
+                            };
                         let rate_high = if (8.0 / analysis_results.length_f32 as f64)
                             > *rate_data.last().unwrap_or(&rate_data[0]) as f64
                         {
@@ -1137,12 +1205,8 @@ pub fn process_cor_file(
                         let r_max = rate_plot_max;
                         let d_den = (d_max - d_min).abs().max(1e-12);
                         let r_den = (r_max - r_min).abs().max(1e-12);
-                        let x_img = ((delay - d_min) / d_den * x_span)
-                            .max(0.0)
-                            .min(x_span);
-                        let y_img = ((rate - r_min) / r_den * y_span)
-                            .max(0.0)
-                            .min(y_span);
+                        let x_img = ((delay - d_min) / d_den * x_span).max(0.0).min(x_span);
+                        let y_img = ((rate - r_min) / r_den * y_span).max(0.0).min(y_span);
                         let x_floor = x_img.floor() as usize;
                         let y_floor = y_img.floor() as usize;
                         let x_ceil = (x_img.ceil() as usize).min(x_span as usize);
@@ -1213,7 +1277,9 @@ pub fn process_cor_file(
                     ];
                     delay_plane(
                         &delay_profile,
+                        delay_profile_pre_bp.as_deref(),
                         &rate_profile,
+                        rate_profile_pre_bp.as_deref(),
                         heatmap_func,
                         &stat_keys.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
                         &stat_vals.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
@@ -1246,12 +1312,39 @@ pub fn process_cor_file(
                         )
                         .map(|(&x, y)| (x as f64, y as f64))
                         .collect();
+                    let freq_phase_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
+                        .as_ref()
+                        .map(|pre| {
+                            pre.freq_range
+                                .iter()
+                                .zip(pre.freq_rate_spectrum.iter().map(|c| safe_arg(c).to_degrees()))
+                                .map(|(&x, y)| (x as f64, y as f64))
+                                .collect()
+                        });
                     let rate_profile: Vec<(f64, f64)> = analysis_results
                         .rate_range
                         .iter()
                         .zip(analysis_results.freq_rate.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
+                    let freq_amp_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
+                        .as_ref()
+                        .map(|pre| {
+                            pre.freq_range
+                                .iter()
+                                .zip(pre.freq_rate_spectrum.iter().map(|c| c.norm()))
+                                .map(|(&x, y)| (x as f64, y as f64))
+                                .collect()
+                        });
+                    let rate_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
+                        .as_ref()
+                        .map(|pre| {
+                            pre.rate_range
+                                .iter()
+                                .zip(pre.freq_rate.iter())
+                                .map(|(&x, &y)| (x as f64, y as f64))
+                                .collect()
+                        });
                     let freq_data: Vec<f32> = analysis_results
                         .freq_range
                         .iter()
@@ -1356,8 +1449,11 @@ pub fn process_cor_file(
                         .fold(0.0f32, |acc, x| acc.max(x));
                     frequency_plane(
                         &freq_amp_profile,
+                        freq_amp_profile_pre_bp.as_deref(),
                         &freq_phase_profile,
+                        freq_phase_profile_pre_bp.as_deref(),
                         &rate_profile,
+                        rate_profile_pre_bp.as_deref(),
                         heatmap_func,
                         &stat_keys.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
                         &stat_vals.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
@@ -1415,7 +1511,15 @@ pub(crate) fn run_analysis_pipeline(
     rfi_ranges: &[(usize, usize)],
     bandpass_data: &Option<Vec<C32>>,
     effective_fft_point: i32,
-) -> Result<(AnalysisResults, Array2<C32>, Array2<C32>), Box<dyn Error>> {
+) -> Result<
+    (
+        AnalysisResults,
+        Array2<C32>,
+        Array2<C32>,
+        Option<AnalysisResults>,
+    ),
+    Box<dyn Error>,
+> {
     let mut temp_args = base_args.clone();
     temp_args.delay_correct = delay_correct;
     temp_args.rate_correct = rate_correct;
@@ -1524,6 +1628,24 @@ pub(crate) fn run_analysis_pipeline(
         base_args.rate_padding,
     );
 
+    let pre_bandpass_analysis_results = if bandpass_data.is_some() {
+        let pre_bandpass_delay_rate_2d_data_comp =
+            process_ifft(&freq_rate_array, effective_fft_point, padding_length);
+        Some(analyze_results(
+            &freq_rate_array,
+            &pre_bandpass_delay_rate_2d_data_comp,
+            &header,
+            current_length,
+            effective_integ_time,
+            &current_obs_time,
+            padding_length,
+            &temp_args,
+            search_mode,
+        ))
+    } else {
+        None
+    };
+
     if let Some(bp_data) = &bandpass_data {
         apply_bandpass_correction(&mut freq_rate_array, bp_data);
     }
@@ -1543,5 +1665,10 @@ pub(crate) fn run_analysis_pipeline(
         search_mode,
     );
 
-    Ok((analysis_results, freq_rate_array, delay_rate_2d_data_comp))
+    Ok((
+        analysis_results,
+        freq_rate_array,
+        delay_rate_2d_data_comp,
+        pre_bandpass_analysis_results,
+    ))
 }

@@ -141,6 +141,10 @@ pub struct Args {
     #[arg(long, aliases = ["bp"])]
     pub bandpass: Option<PathBuf>,
 
+    /// Normalize cross-correlation by auto-correlation amplitudes.
+    #[arg(long = "norm-acf")]
+    pub norm_acf: bool,
+
     /// Write bandpass-corrected spectrum to binary.
     #[arg(long, aliases = ["bptable"])]
     pub bandpass_table: bool,

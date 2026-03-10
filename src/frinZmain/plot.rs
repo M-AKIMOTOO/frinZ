@@ -4,12 +4,12 @@
 // - delay/rate/frequency planes and diagnostics
 // - UV-related plots
 // - multi-sideband summary plot (merged from former plot_msb.rs)
-use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality};
-use crate::utils::safe_arg;
 use crate::args::Args;
 use crate::output;
 use crate::output::generate_output_names;
+use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
+use crate::utils::safe_arg;
 use chrono::{DateTime, TimeZone, Utc};
 use ndarray::Array2; // Added for dynamic spectrum
 use num_complex::Complex;
@@ -24,7 +24,9 @@ use std::{fs::File, io::Write};
 
 pub fn delay_plane(
     delay_profile: &[(f64, f64)],
+    delay_profile_pre_bp: Option<&[(f64, f64)]>,
     rate_profile: &[(f64, f64)],
+    rate_profile_pre_bp: Option<&[(f64, f64)]>,
     heatmap_func: impl Fn(f64, f64) -> f64,
     stat_keys: &[&str],
     stat_vals: &[&str],
@@ -54,11 +56,21 @@ pub fn delay_plane(
     let delay_max = delay_profile
         .iter()
         .map(|(_, y)| *y)
+        .chain(
+            delay_profile_pre_bp
+                .into_iter()
+                .flat_map(|profile| profile.iter().map(|(_, y)| *y)),
+        )
         .fold(f64::NEG_INFINITY, f64::max)
         * 1.1;
     let rate_max = rate_profile
         .iter()
         .map(|(_, y)| *y)
+        .chain(
+            rate_profile_pre_bp
+                .into_iter()
+                .flat_map(|profile| profile.iter().map(|(_, y)| *y)),
+        )
         .fold(f64::NEG_INFINITY, f64::max)
         * 1.1;
 
@@ -74,9 +86,7 @@ pub fn delay_plane(
             )
         };
 
-    let (rate_line_min, rate_line_max, heatmap_rate_min, heatmap_rate_max) = if rrange
-        .is_empty()
-    {
+    let (rate_line_min, rate_line_max, heatmap_rate_min, heatmap_rate_max) = if rrange.is_empty() {
         let rate_min_x = rate_profile
             .iter()
             .map(|(x, _)| *x)
@@ -146,7 +156,8 @@ pub fn delay_plane(
         for xi in 0..resolution_x {
             for yi in 0..resolution_y {
                 let x = heatmap_delay_min
-                    + (heatmap_delay_max - heatmap_delay_min) * xi as f64 / (resolution_x - 1) as f64;
+                    + (heatmap_delay_max - heatmap_delay_min) * xi as f64
+                        / (resolution_x - 1) as f64;
                 let y = heatmap_rate_min
                     + (heatmap_rate_max - heatmap_rate_min) * yi as f64 / (resolution_y - 1) as f64;
                 let val = heatmap_func(x, y);
@@ -230,6 +241,17 @@ pub fn delay_plane(
             .cloned(),
         GREEN,
     ))?;
+    if let Some(pre_bp) = delay_profile_pre_bp {
+        chart1.draw_series(LineSeries::new(
+            pre_bp
+                .iter()
+                .filter(|(x, y)| {
+                    *x >= delay_line_min && *x <= delay_line_max && x.is_finite() && y.is_finite()
+                })
+                .cloned(),
+            RED.stroke_width(1),
+        ))?;
+    }
 
     // Draw bounding box for chart1
     let x_spec = chart1.x_range();
@@ -270,6 +292,17 @@ pub fn delay_plane(
             .cloned(),
         GREEN,
     ))?;
+    if let Some(pre_bp) = rate_profile_pre_bp {
+        chart2.draw_series(LineSeries::new(
+            pre_bp
+                .iter()
+                .filter(|(x, y)| {
+                    *x >= rate_line_min && *x <= rate_line_max && x.is_finite() && y.is_finite()
+                })
+                .cloned(),
+            RED.stroke_width(1),
+        ))?;
+    }
 
     // Draw bounding box for chart2
     let x_spec = chart2.x_range();
@@ -318,7 +351,8 @@ pub fn delay_plane(
     for xi in 0..resolution_x {
         for yi in 0..resolution_y {
             let x = delay_min + (delay_max_hm - delay_min) * xi as f64 / (resolution_x - 1) as f64;
-            let y = rate_min_hm + (rate_max_hm - rate_min_hm) * yi as f64 / (resolution_y - 1) as f64;
+            let y =
+                rate_min_hm + (rate_max_hm - rate_min_hm) * yi as f64 / (resolution_y - 1) as f64;
             let val = heatmap_func(x, y);
             let normalized_val = if amplitude_norm > 0.0 {
                 (val / amplitude_norm).clamp(0.0, 1.0)
@@ -380,7 +414,15 @@ pub fn delay_plane(
         ))?;
         y += 35;
     }
-    
+    if delay_profile_pre_bp.is_some() || rate_profile_pre_bp.is_some() {
+        let legend_font = ("sans-serif ", 28).into_font();
+        lower_right.draw(&Text::new(
+            "Green: BP corrected / Red: pre-BP",
+            (left_x, y + 20),
+            TextStyle::from(legend_font).color(&BLACK),
+        ))?;
+    }
+
     root.present()?;
     compress_png_with_mode(output_path, CompressQuality::High);
     Ok(())
@@ -388,8 +430,11 @@ pub fn delay_plane(
 
 pub fn frequency_plane(
     freq_amp_profile: &[(f64, f64)],
+    freq_amp_profile_pre_bp: Option<&[(f64, f64)]>,
     freq_phase_profile: &[(f64, f64)],
+    freq_phase_profile_pre_bp: Option<&[(f64, f64)]>,
     rate_profile: &[(f64, f64)],
+    rate_profile_pre_bp: Option<&[(f64, f64)]>,
     heatmap_func: impl Fn(f64, f64) -> f64,
     stat_keys: &[&str],
     stat_vals: &[&str],
@@ -417,11 +462,21 @@ pub fn frequency_plane(
     let amp_max_y = freq_amp_profile
         .iter()
         .map(|(_, y)| *y)
+        .chain(
+            freq_amp_profile_pre_bp
+                .into_iter()
+                .flat_map(|profile| profile.iter().map(|(_, y)| *y)),
+        )
         .fold(f64::NEG_INFINITY, f64::max)
         * 1.1;
     let rate_max_y = rate_profile
         .iter()
         .map(|(_, y)| *y)
+        .chain(
+            rate_profile_pre_bp
+                .into_iter()
+                .flat_map(|profile| profile.iter().map(|(_, y)| *y)),
+        )
         .fold(f64::NEG_INFINITY, f64::max)
         * 1.1;
     let rate_min_x = rate_profile
@@ -466,6 +521,15 @@ pub fn frequency_plane(
             .cloned(),
         GREEN.stroke_width(1),
     ))?;
+    if let Some(pre_bp) = freq_phase_profile_pre_bp {
+        phase_chart.draw_series(LineSeries::new(
+            pre_bp
+                .iter()
+                .filter(|(x, y)| *x >= freq_min && *x <= freq_max && x.is_finite() && y.is_finite())
+                .cloned(),
+            RED.stroke_width(1),
+        ))?;
+    }
 
     // Draw bounding box for phase_chart
     let x_spec = phase_chart.x_range();
@@ -501,6 +565,15 @@ pub fn frequency_plane(
             .cloned(),
         GREEN.stroke_width(1),
     ))?;
+    if let Some(pre_bp) = freq_amp_profile_pre_bp {
+        amp_chart.draw_series(LineSeries::new(
+            pre_bp
+                .iter()
+                .filter(|(x, y)| *x >= freq_min && *x <= freq_max && x.is_finite() && y.is_finite())
+                .cloned(),
+            RED.stroke_width(1),
+        ))?;
+    }
 
     // Draw bounding box for amp_chart
     let x_spec = amp_chart.x_range();
@@ -532,12 +605,19 @@ pub fn frequency_plane(
     rate_chart.draw_series(LineSeries::new(
         rate_profile
             .iter()
-            .filter(|(x, y)| {
-                *x >= rate_min_x && *x <= rate_max_x && x.is_finite() && y.is_finite()
-            })
+            .filter(|(x, y)| *x >= rate_min_x && *x <= rate_max_x && x.is_finite() && y.is_finite())
             .cloned(),
         GREEN.stroke_width(1),
     ))?;
+    if let Some(pre_bp) = rate_profile_pre_bp {
+        rate_chart.draw_series(LineSeries::new(
+            pre_bp
+                .iter()
+                .filter(|(x, y)| *x >= rate_min_x && *x <= rate_max_x && x.is_finite() && y.is_finite())
+                .cloned(),
+            RED.stroke_width(1),
+        ))?;
+    }
 
     // Draw bounding box for rate_chart
     let x_spec = rate_chart.x_range();
@@ -647,6 +727,17 @@ pub fn frequency_plane(
             text_style.clone().pos(Pos::new(HPos::Right, VPos::Top)),
         ))?;
         y += 35;
+    }
+    if freq_amp_profile_pre_bp.is_some()
+        || freq_phase_profile_pre_bp.is_some()
+        || rate_profile_pre_bp.is_some()
+    {
+        let legend_font = ("sans-serif ", 28).into_font();
+        stats_area.draw(&Text::new(
+            "Green: BP corrected / Red: pre-BP",
+            (left_x, y + 20),
+            TextStyle::from(legend_font).color(&BLACK),
+        ))?;
     }
 
     root.present()?;
@@ -973,7 +1064,13 @@ pub fn cumulate_plot(
         let ln_y: Vec<f64> = cumulate_snr
             .iter()
             .zip(cumulate_len.iter())
-            .filter_map(|(&y, &x)| if x > 0.0 && y > 0.0 { Some((y as f64).ln()) } else { None })
+            .filter_map(|(&y, &x)| {
+                if x > 0.0 && y > 0.0 {
+                    Some((y as f64).ln())
+                } else {
+                    None
+                }
+            })
             .collect();
         if ln_x.len() == ln_y.len() && ln_x.len() >= 2 {
             let n = ln_x.len() as f64;
@@ -1002,7 +1099,9 @@ pub fn cumulate_plot(
                     }),
                     &RED,
                 );
-                chart.draw_series(fit_series)?.label(format!("fit: y = {:.2e} x^{:.3}", a_fit, b_fit));
+                chart
+                    .draw_series(fit_series)?
+                    .label(format!("fit: y = {:.2e} x^{:.3}", a_fit, b_fit));
 
                 // Reference line with b = 0.5, forced to pass the first point
                 let a_ref = (cumulate_snr[0] as f64) / (cumulate_len[0] as f64).powf(0.5);
@@ -1015,7 +1114,9 @@ pub fn cumulate_plot(
                     }),
                     &BLUE,
                 );
-                chart.draw_series(ref_series)?.label(format!("b=0.5: y = {:.2e} x^{:.1}", a_ref, 0.5));
+                chart
+                    .draw_series(ref_series)?
+                    .label(format!("b=0.5: y = {:.2e} x^{:.1}", a_ref, 0.5));
 
                 chart
                     .configure_series_labels()

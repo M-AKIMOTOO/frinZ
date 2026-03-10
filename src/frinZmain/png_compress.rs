@@ -1,7 +1,7 @@
-use imagequant::{new as iq_new, Attributes, Histogram, RGBA};
-use png::{AdaptiveFilterType, BitDepth, ColorType, Encoder};
+use png::{AdaptiveFilterType, BitDepth, ColorType, Encoder, FilterType};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -12,13 +12,37 @@ pub enum CompressQuality {
     Low,
 }
 
+#[derive(Clone, Copy)]
+enum PixelLayout {
+    Grayscale,
+    GrayscaleAlpha,
+    Rgb,
+    Rgba,
+}
+
+impl PixelLayout {
+    fn color_type(self) -> ColorType {
+        match self {
+            Self::Grayscale => ColorType::Grayscale,
+            Self::GrayscaleAlpha => ColorType::GrayscaleAlpha,
+            Self::Rgb => ColorType::Rgb,
+            Self::Rgba => ColorType::Rgba,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ImageAnalysis {
+    opaque: bool,
+    grayscale: bool,
+}
+
 fn warn_once(msg: &str) {
     if !WARNED.swap(true, Ordering::Relaxed) {
         eprintln!("#WARN: {}", msg);
     }
 }
 
-/// Try to compress a PNG in-place via the imagequant crate.
 pub fn compress_png<P: AsRef<Path>>(path: P) {
     compress_png_with_mode(path, CompressQuality::High);
 }
@@ -37,6 +61,10 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
         }
     };
 
+    if try_pngquant(&path_buf, original.len(), mode) {
+        return;
+    }
+
     let decoded = match image::load_from_memory(&original) {
         Ok(img) => img.to_rgba8(),
         Err(_) => {
@@ -44,133 +72,202 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
             return;
         }
     };
+
     let (width, height) = decoded.dimensions();
-    let pixels: Vec<RGBA> = decoded
-        .chunks_exact(4)
-        .map(|px| RGBA::new(px[0], px[1], px[2], px[3]))
-        .collect();
+    let rgba_bytes = decoded.as_raw();
+    let analysis = analyze_rgba(rgba_bytes);
 
-    let mut base_attr = iq_new();
-    let _ = base_attr.set_speed(1);
-    match mode {
-        CompressQuality::High => {
-            let _ = base_attr.set_quality(10, 100);
-        }
-        CompressQuality::Low => {
-            let _ = base_attr.set_quality(10, 10);
-        }
-    }
-    let _ = base_attr.set_max_colors(256);
-    let _ = base_attr.set_min_posterization(0);
-
-    let color_targets = [
-        256u32, 224, 192, 160, 144, 128, 112, 96, 80, 72, 64, 56, 48, 40, 32, 28, 24, 20, 16, 12,
-        10, 8,
-    ];
     let mut best_png: Option<Vec<u8>> = None;
-    for &colors in &color_targets {
-        if let Some(candidate) = quantize_with_colors(&base_attr, &pixels, width, height, colors) {
-            let take = best_png
-                .as_ref()
-                .map(|current| candidate.len() < current.len())
-                .unwrap_or(true);
-            if take {
-                best_png = Some(candidate);
+
+    if let Some(candidate) = encode_best_lossless_png(rgba_bytes, width, height, PixelLayout::Rgba)
+    {
+        update_best(&mut best_png, candidate);
+    }
+
+    if analysis.opaque {
+        let rgb_bytes = rgba_to_rgb(rgba_bytes);
+        if let Some(candidate) =
+            encode_best_lossless_png(&rgb_bytes, width, height, PixelLayout::Rgb)
+        {
+            update_best(&mut best_png, candidate);
+        }
+
+        if analysis.grayscale {
+            let gray_bytes = rgba_to_gray(rgba_bytes);
+            if let Some(candidate) =
+                encode_best_lossless_png(&gray_bytes, width, height, PixelLayout::Grayscale)
+            {
+                update_best(&mut best_png, candidate);
             }
-            if let Some(best) = &best_png {
-                if best.len() * 3 < original.len() {
-                    break;
-                }
-            }
+        }
+    } else if analysis.grayscale {
+        let gray_alpha_bytes = rgba_to_gray_alpha(rgba_bytes);
+        if let Some(candidate) = encode_best_lossless_png(
+            &gray_alpha_bytes,
+            width,
+            height,
+            PixelLayout::GrayscaleAlpha,
+        ) {
+            update_best(&mut best_png, candidate);
         }
     }
 
     if let Some(best) = best_png {
-        if best.len() < original.len() {
-            if let Err(_) = fs::write(&path_buf, best) {
-                warn_once("Failed to write quantized PNG.");
-            }
+        if best.len() < original.len() && fs::write(&path_buf, best).is_err() {
+            warn_once("Failed to write recompressed PNG.");
         }
     }
 }
 
-fn quantize_with_colors(
-    base_attr: &Attributes,
-    pixels: &[RGBA],
-    width: u32,
-    height: u32,
-    max_colors: u32,
-) -> Option<Vec<u8>> {
-    let mut attr = base_attr.clone();
-    attr.set_max_colors(max_colors).ok()?;
-    let posterization = if max_colors <= 32 {
-        3
-    } else if max_colors <= 64 {
-        2
-    } else if max_colors <= 96 {
-        1
-    } else {
-        0
+fn try_pngquant(path: &Path, original_size: usize, mode: CompressQuality) -> bool {
+    let (quality_min, quality_max) = match mode {
+        CompressQuality::High => ("60", "80"),
+        CompressQuality::Low => ("50", "70"),
     };
-    attr.set_min_posterization(posterization).ok()?;
+    let quality_arg = format!("{}-{}", quality_min, quality_max);
+    let output_path = path.with_extension("pngquant.tmp.png");
 
-    let mut image = attr
-        .new_image_borrowed(pixels, width as usize, height as usize, 0.0)
-        .ok()?;
-    let mut histogram = Histogram::new(&attr);
-    histogram.add_image(&attr, &mut image).ok()?;
+    let status = Command::new("pngquant")
+        .arg("--force")
+        .arg("--skip-if-larger")
+        .arg("--strip")
+        .arg("--speed")
+        .arg("1")
+        .arg("--quality")
+        .arg(&quality_arg)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--")
+        .arg(path)
+        .status();
 
-    let mut result = histogram.quantize(&attr).ok()?;
-    let dithering_level = if max_colors <= 24 {
-        0.2
-    } else if max_colors <= 48 {
-        0.35
-    } else if max_colors <= 96 {
-        0.8
-    } else {
-        1.0
+    let Ok(status) = status else {
+        return false;
     };
-    result.set_dithering_level(dithering_level).ok();
-    let (palette, indices) = result.remapped(&mut image).ok()?;
-    encode_indexed_png(&palette, &indices, width, height)
-}
 
-fn encode_indexed_png(
-    palette: &[RGBA],
-    indices: &[u8],
-    width: u32,
-    height: u32,
-) -> Option<Vec<u8>> {
-    let mut palette_rgb = Vec::with_capacity(palette.len() * 3);
-    let mut trns = Vec::with_capacity(palette.len());
-    let mut has_transparency = false;
-    for rgba in palette.iter() {
-        palette_rgb.extend_from_slice(&[rgba.r, rgba.g, rgba.b]);
-        if rgba.a != 255 {
-            has_transparency = true;
-        }
-        trns.push(rgba.a);
+    if !status.success() {
+        let _ = fs::remove_file(&output_path);
+        return false;
     }
 
-    let mut compressed = Vec::new();
+    let Ok(candidate) = fs::read(&output_path) else {
+        let _ = fs::remove_file(&output_path);
+        return false;
+    };
+
+    let _ = fs::remove_file(&output_path);
+
+    if candidate.len() >= original_size {
+        return false;
+    }
+
+    if fs::write(path, candidate).is_err() {
+        warn_once("Failed to write pngquant-compressed PNG.");
+        return false;
+    }
+
+    true
+}
+
+fn analyze_rgba(bytes: &[u8]) -> ImageAnalysis {
+    let mut opaque = true;
+    let mut grayscale = true;
+
+    for px in bytes.chunks_exact(4) {
+        if px[3] != 255 {
+            opaque = false;
+        }
+        if !(px[0] == px[1] && px[1] == px[2]) {
+            grayscale = false;
+        }
+        if !opaque && !grayscale {
+            break;
+        }
+    }
+
+    ImageAnalysis { opaque, grayscale }
+}
+
+fn rgba_to_rgb(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for px in bytes.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    out
+}
+
+fn rgba_to_gray(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for px in bytes.chunks_exact(4) {
+        out.push(px[0]);
+    }
+    out
+}
+
+fn rgba_to_gray_alpha(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for px in bytes.chunks_exact(4) {
+        out.push(px[0]);
+        out.push(px[3]);
+    }
+    out
+}
+
+fn update_best(best: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
+    let replace = best
+        .as_ref()
+        .map(|current| candidate.len() < current.len())
+        .unwrap_or(true);
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
+fn encode_best_lossless_png(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+) -> Option<Vec<u8>> {
+    let strategies = [
+        (FilterType::NoFilter, AdaptiveFilterType::NonAdaptive),
+        (FilterType::Sub, AdaptiveFilterType::NonAdaptive),
+        (FilterType::Paeth, AdaptiveFilterType::NonAdaptive),
+        (FilterType::Avg, AdaptiveFilterType::NonAdaptive),
+        (FilterType::Sub, AdaptiveFilterType::Adaptive),
+    ];
+
+    let mut best: Option<Vec<u8>> = None;
+    for (filter, adaptive) in strategies {
+        if let Some(candidate) =
+            encode_raw_png(raw, width, height, layout, BitDepth::Eight, filter, adaptive)
+        {
+            update_best(&mut best, candidate);
+        }
+    }
+    best
+}
+
+fn encode_raw_png(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    bit_depth: BitDepth,
+    filter: FilterType,
+    adaptive: AdaptiveFilterType,
+) -> Option<Vec<u8>> {
+    let mut encoded = Vec::new();
     {
-        let mut encoder = Encoder::new(&mut compressed, width, height);
-        encoder.set_color(ColorType::Indexed);
-        encoder.set_depth(BitDepth::Eight);
+        let mut encoder = Encoder::new(&mut encoded, width, height);
+        encoder.set_color(layout.color_type());
+        encoder.set_depth(bit_depth);
         encoder.set_compression(png::Compression::Best);
-        encoder.set_filter(png::FilterType::Paeth);
-        encoder.set_adaptive_filter(AdaptiveFilterType::Adaptive);
-        encoder.set_palette(palette_rgb);
-        if has_transparency {
-            encoder.set_trns(trns);
-        }
-        let mut writer = match encoder.write_header() {
-            Ok(w) => w,
-            Err(_) => return None,
-        };
-        if writer.write_image_data(indices).is_err() {
-            return None;
-        }
+        encoder.set_filter(filter);
+        encoder.set_adaptive_filter(adaptive);
+
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(raw).ok()?;
     }
-    Some(compressed)
+    Some(encoded)
 }

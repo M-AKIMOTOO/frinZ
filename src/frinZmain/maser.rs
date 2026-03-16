@@ -162,6 +162,7 @@ enum OffSpec {
 #[derive(Debug)]
 struct GaussianFitResult {
     components: Vec<(f64, f64, f64)>,
+    baseline: f64,
     residual_norm: f64,
     termination: GaussianFitTermination,
     evaluations: usize,
@@ -190,7 +191,7 @@ impl<'a> GaussianMixtureProblem<'a> {
             velocities,
             values,
             params,
-            components: initial.len() / 3,
+            components: initial.len().saturating_sub(1) / 3,
         };
         problem.enforce_constraints();
         problem
@@ -217,8 +218,12 @@ impl<'a> GaussianMixtureProblem<'a> {
         out
     }
 
+    fn baseline(&self) -> f64 {
+        self.params[self.components * 3]
+    }
+
     fn predicted_value(params: &DVector<f64>, components: usize, vel: f64) -> f64 {
-        let mut total = 0.0;
+        let mut total = params[components * 3];
         for idx in 0..components {
             let base = idx * 3;
             let amp = params[base];
@@ -259,7 +264,7 @@ impl<'a> GaussianMixtureProblem<'a> {
             return None;
         }
         let rows = self.velocities.len();
-        let cols = self.components * 3;
+        let cols = self.components * 3 + 1;
         let mut jac = DMatrix::zeros(rows, cols);
         for (row_idx, &vel) in self.velocities.iter().enumerate() {
             for component_idx in 0..self.components {
@@ -280,29 +285,32 @@ impl<'a> GaussianMixtureProblem<'a> {
                 jac[(row_idx, base + 2)] = value * ((delta * delta) / sigma_cubed) * FWHM_TO_SIGMA;
                 // ∂/∂fwhm
             }
+            jac[(row_idx, self.components * 3)] = 1.0; // ∂/∂baseline
         }
         Some(jac)
     }
 }
 
 fn flatten_gaussian_components(components: &[(f64, f64, f64)]) -> Vec<f64> {
-    let mut flat = Vec::with_capacity(components.len() * 3);
+    let mut flat = Vec::with_capacity(components.len() * 3 + 1);
     for &(amp, center, fwhm) in components {
         flat.push(amp);
         flat.push(center);
         flat.push(fwhm);
     }
+    flat.push(0.0);
     flat
 }
 
-fn evaluate_gaussian_mixture(
+fn evaluate_gaussian_model(
     velocities: &[f64],
     components: &[(f64, f64, f64)],
+    baseline: f64,
 ) -> Vec<(f64, f32)> {
     velocities
         .iter()
         .map(|&vel| {
-            let mut total = 0.0;
+            let mut total = baseline;
             for &(amp, center, fwhm) in components {
                 let sigma = fwhm.abs().max(MIN_FWHM_KMS) * FWHM_TO_SIGMA;
                 let delta = vel - center;
@@ -326,7 +334,18 @@ fn fit_gaussian_mixture(
         return Err("No Gaussian components provided.".into());
     }
 
-    let initial_flat = flatten_gaussian_components(initial_components);
+    let mut initial_flat = flatten_gaussian_components(initial_components);
+    let baseline_init = values
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, |min, val| min.min(val));
+    if let Some(last) = initial_flat.last_mut() {
+        *last = if baseline_init.is_finite() {
+            baseline_init
+        } else {
+            0.0
+        };
+    }
     let mut problem = GaussianMixtureProblem::new(velocities, values, &initial_flat);
     let mut residual_vec = problem
         .residuals()
@@ -425,6 +444,7 @@ fn fit_gaussian_mixture(
 
     let result = GaussianFitResult {
         components: problem.components(),
+        baseline: problem.baseline(),
         residual_norm: residual_vec.norm(),
         termination,
         evaluations,
@@ -968,6 +988,7 @@ fn plot_maser_spectrum(
     vel_precision: usize,
     gaussian_fit: Option<&[(f64, f32)]>,
     gaussian_params: Option<&[(f64, f64, f64)]>,
+    gaussian_baseline: Option<f64>,
 ) -> Result<(), Box<dyn Error>> {
     let root = BitMapBackend::new(output_path, (1200, 700)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -1071,6 +1092,11 @@ fn plot_maser_spectrum(
             style.clone(),
         ))?;
         y_pos += 25;
+        if let Some(baseline) = gaussian_baseline {
+            let text = format!("Baseline: {:.5}", baseline);
+            root.draw(&Text::new(text, (legend_x, y_pos), style.clone()))?;
+            y_pos += 25;
+        }
         for (idx, (amp, center, fwhm)) in params.iter().enumerate() {
             let text = format!(
                 "G{}: amp={:.4}, v={} km/s, FWHM={} km/s",
@@ -1579,7 +1605,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     let print_segment_table = maser_mode.print_segment_table();
     let base_freq_mhz = header_on.observing_frequency / 1e6;
     let freq_range_mhz: Vec<f64> = (0..header_on.fft_point as usize / 2)
-        .map(|i| i as f64 * freq_resolution_mhz + base_freq_mhz)
+        .map(|i| base_freq_mhz + (i as f64 + 0.5) * freq_resolution_mhz)
         .collect();
 
     let analysis_indices: Vec<usize> = if let Some((start_abs, end_abs)) = user_subt_range {
@@ -1876,6 +1902,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                 vel_precision,
                 None,
                 None,
+                None,
             )?;
 
             let stacked_vel_plot =
@@ -1899,6 +1926,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                 integration.channel_width_kms,
                 freq_precision,
                 vel_precision,
+                None,
                 None,
                 None,
             )?;
@@ -1933,6 +1961,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                     integration.channel_width_kms,
                     freq_precision,
                     vel_precision,
+                    None,
                     None,
                     None,
                 )?;
@@ -2079,8 +2108,10 @@ fn analyze_segment(
     let mut gaussian_fit_summary: Option<GaussianFitResult> = None;
     let mut gaussian_fit_components: Option<Vec<(f64, f64, f64)>> = None;
     let mut gaussian_fit_data_vel: Option<Vec<(f64, f32)>> = None;
+    let mut gaussian_fit_baseline: Option<f64> = None;
+    let gaussian_fit_attempted = !gaussian_initial_components.is_empty();
 
-    if !gaussian_initial_components.is_empty() {
+    if gaussian_fit_attempted {
         match fit_gaussian_mixture(
             &analysis_velocity_kms,
             &normalized_spec_f64,
@@ -2089,35 +2120,33 @@ fn analyze_segment(
             Ok(result) => {
                 maser_logln!(
                     log_lines,
-                    "  [seg {:03}] Gaussian fit termination: {:?}, residual norm: {:.6}, evaluations: {}",
+                    "  [seg {:03}] Gaussian fit termination: {:?}, residual norm: {:.6}, evaluations: {}, baseline: {:.6}",
                     seg_idx,
                     result.termination,
                     result.residual_norm,
-                    result.evaluations
+                    result.evaluations,
+                    result.baseline
                 );
-                gaussian_fit_data_vel = Some(evaluate_gaussian_mixture(
+                gaussian_fit_data_vel = Some(evaluate_gaussian_model(
                     &analysis_velocity_kms,
                     &result.components,
+                    result.baseline,
                 ));
                 gaussian_fit_components = Some(result.components.clone());
+                gaussian_fit_baseline = Some(result.baseline);
                 gaussian_fit_summary = Some(result);
             }
             Err(err) => {
                 maser_logln!(
                     log_lines,
-                    "Warning: [seg {:03}] Gaussian fit failed ({}). Using initial parameters for overlay.",
+                    "Warning: [seg {:03}] Gaussian fit failed ({}).",
                     seg_idx,
                     err
                 );
                 eprintln!(
-                    "Warning: [seg {:03}] Gaussian fit failed ({}). Using initial parameters for overlay.",
+                    "Warning: [seg {:03}] Gaussian fit failed ({}).",
                     seg_idx, err
                 );
-                gaussian_fit_data_vel = Some(evaluate_gaussian_mixture(
-                    &analysis_velocity_kms,
-                    gaussian_initial_components,
-                ));
-                gaussian_fit_components = Some(gaussian_initial_components.to_vec());
             }
         }
     }
@@ -2213,7 +2242,7 @@ fn analyze_segment(
             )?;
         }
 
-        if let Some(ref comps) = gaussian_fit_components {
+        if gaussian_fit_attempted {
             let fit_filename = output_dir.join(format!("{}{}_maser_fit.txt", on_stem, suffix));
             let mut fit_file = File::create(&fit_filename)?;
             writeln!(fit_file, "Gaussian Fit Summary")?;
@@ -2226,25 +2255,27 @@ fn analyze_segment(
                     "Objective (0.5 * residual_norm^2): {:.6}",
                     0.5 * summary.residual_norm * summary.residual_norm
                 )?;
-            } else {
+                writeln!(fit_file, "Baseline: {:.6}", summary.baseline)?;
+                writeln!(fit_file)?;
                 writeln!(
                     fit_file,
-                    "Warning: Fit failed to converge. Recording initial parameters."
+                    "# Gaussian Components (amp, velocity[km/s], FWHM[km/s])"
                 )?;
-            }
-            writeln!(fit_file)?;
-            writeln!(
-                fit_file,
-                "# Gaussian Components (amp, velocity[km/s], FWHM[km/s])"
-            )?;
-            for (idx, (amp, center, fwhm)) in comps.iter().enumerate() {
+                for (idx, (amp, center, fwhm)) in summary.components.iter().enumerate() {
+                    writeln!(
+                        fit_file,
+                        "G{}: {:.6}\t{}\t{}",
+                        idx + 1,
+                        amp,
+                        format_with_precision(*center, vel_precision),
+                        format_with_precision(*fwhm, vel_precision)
+                    )?;
+                }
+            } else {
+                writeln!(fit_file, "Status: FAILED")?;
                 writeln!(
                     fit_file,
-                    "G{}: {:.6}\t{}\t{}",
-                    idx + 1,
-                    amp,
-                    format_with_precision(*center, vel_precision),
-                    format_with_precision(*fwhm, vel_precision)
+                    "Reason: no converged solution; overlay suppressed and initial values not recorded as fit results."
                 )?;
             }
         }
@@ -2302,6 +2333,7 @@ fn analyze_segment(
             vel_precision,
             None,
             None,
+            None,
         )?;
 
         let normalized_plot_data_vel: Vec<(f64, f32)> = analysis_velocity_kms
@@ -2334,6 +2366,7 @@ fn analyze_segment(
             gaussian_fit_components
                 .as_ref()
                 .map(|components| components.as_slice()),
+            gaussian_fit_baseline,
         )?;
 
         let vel_window_kms = 10.0;
@@ -2380,6 +2413,7 @@ fn analyze_segment(
                 gaussian_fit_components
                     .as_ref()
                     .map(|components| components.as_slice()),
+                gaussian_fit_baseline,
             )?;
         }
     }

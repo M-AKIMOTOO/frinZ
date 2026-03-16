@@ -1,6 +1,6 @@
 use super::shared::{
-    compress_plot_png, output_stem, prepare_output_directory, scaled_font_size,
-    scaled_legend_font_size,
+    compress_plot_png, detect_rfi_cut, output_stem, prepare_output_directory, scaled_font_size,
+    scaled_legend_font_size, write_rfi_cut_report, RfiCutReport,
 };
 use anyhow::{anyhow, Context, Result};
 use frinZ::header::{parse_header, CorHeader};
@@ -74,15 +74,7 @@ struct DedispersionOutputs {
 }
 
 pub fn run(cli: KnownArgs) -> Result<()> {
-    if cli.period <= 0.0 {
-        return Err(anyhow!("--period must be positive"));
-    }
-    if cli.bins == 0 {
-        return Err(anyhow!("--bins must be greater than 0"));
-    }
-    if !(0.0..=1.0).contains(&cli.on_duty) {
-        return Err(anyhow!("--on-duty must be within [0, 1]"));
-    }
+    validate_known_args(&cli)?;
 
     let buffer = fs::read(&cli.input)
         .with_context(|| format!("failed to read input file {}", cli.input.display()))?;
@@ -90,12 +82,13 @@ pub fn run(cli: KnownArgs) -> Result<()> {
 
     let header = parse_header(&mut cursor)?;
 
-    let sectors = load_sectors(&mut cursor, &header, &cli)?;
+    let mut sectors = load_sectors(&mut cursor, &header, &cli)?;
     if sectors.is_empty() {
         return Err(anyhow!("no sectors were read from the file"));
     }
 
     let freq_axis_mhz = build_frequency_axis_mhz(&header);
+    let rfi_report = apply_rfi_cut_to_sectors(&mut sectors);
     let dedisp_outputs = build_dedispersed_series(&sectors, &freq_axis_mhz, &cli)?;
 
     let folded = fold_profile(
@@ -124,6 +117,7 @@ pub fn run(cli: KnownArgs) -> Result<()> {
         &folded,
         &gating,
         gated.as_ref(),
+        &rfi_report,
     )?;
 
     print_summary(
@@ -133,7 +127,26 @@ pub fn run(cli: KnownArgs) -> Result<()> {
         &folded,
         &gating,
         gated.as_ref(),
+        &rfi_report,
     )?;
+    Ok(())
+}
+
+fn validate_known_args(cli: &KnownArgs) -> Result<()> {
+    if !cli.period.is_finite() || cli.period <= 0.0 {
+        return Err(anyhow!("--period must be a finite positive value"));
+    }
+    if let Some(dm) = cli.dm {
+        if !dm.is_finite() {
+            return Err(anyhow!("--dm must be a finite value"));
+        }
+    }
+    if cli.bins == 0 {
+        return Err(anyhow!("--bins must be greater than 0"));
+    }
+    if !(0.0..=1.0).contains(&cli.on_duty) {
+        return Err(anyhow!("--on-duty must be within [0, 1]"));
+    }
     Ok(())
 }
 
@@ -175,6 +188,34 @@ fn load_sectors(
     cli: &KnownArgs,
 ) -> Result<Vec<SectorData>> {
     load_sectors_with_limits(cursor, header, cli.skip, cli.length)
+}
+
+pub(crate) fn apply_rfi_cut_to_sectors(sectors: &mut [SectorData]) -> RfiCutReport {
+    let rows: Vec<&[Complex<f32>]> = sectors
+        .iter()
+        .map(|sector| sector.spectra.as_slice())
+        .collect();
+    let report = detect_rfi_cut(&rows);
+    if report.masked_channels.is_empty() {
+        return report;
+    }
+
+    let mut masked = vec![false; report.total_channels];
+    for &chan_idx in &report.masked_channels {
+        if chan_idx < masked.len() {
+            masked[chan_idx] = true;
+        }
+    }
+
+    for sector in sectors {
+        for (chan_idx, value) in sector.spectra.iter_mut().enumerate() {
+            if masked.get(chan_idx).copied().unwrap_or(false) {
+                *value = Complex::new(0.0, 0.0);
+            }
+        }
+    }
+
+    report
 }
 
 pub(crate) fn build_frequency_axis_mhz(header: &CorHeader) -> Vec<f64> {
@@ -236,12 +277,14 @@ fn build_dedispersed_series(
     let channel_delays = cli
         .dm
         .map(|dm| compute_dispersion_delays(freq_axis_mhz, reference_freq_mhz, dm));
-    let dm_delay_stats = channel_delays.as_ref().map(|v| {
-        let (&min_delay, &max_delay) = (
-            v.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
-            v.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
-        );
-        (min_delay, max_delay)
+    let dm_delay_stats = channel_delays.as_ref().and_then(|v| {
+        let mut finite = v.iter().copied().filter(|delay| delay.is_finite());
+        let first = finite.next()?;
+        Some(
+            finite.fold((first, first), |(min_delay, max_delay), delay| {
+                (min_delay.min(delay), max_delay.max(delay))
+            }),
+        )
     });
 
     let mut raw_weights = vec![0.0f64; sectors.len()];
@@ -435,7 +478,7 @@ pub(crate) fn build_onpulse_dedispersed_sectors(
 }
 
 fn compute_dispersion_delays(freq_axis_mhz: &[f64], ref_freq_mhz: f64, dm: f64) -> Vec<f64> {
-    const DM_CONST_MS: f64 = 4.148_808e3;
+    const DM_CONST_MS: f64 = 4.148_808e6;
     freq_axis_mhz
         .iter()
         .map(|&f| {
@@ -613,11 +656,22 @@ fn determine_gating(profile: &[(f64, f64)], on_duty: f64) -> GatingResult {
     let mut sorted: Vec<(usize, f64)> = profile
         .iter()
         .enumerate()
-        .map(|(idx, &(_, amp))| (idx, amp))
+        .filter_map(|(idx, &(_, amp))| amp.is_finite().then_some((idx, amp)))
         .collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    if sorted.is_empty() {
+        return GatingResult {
+            on_bins: Vec::new(),
+            off_bins: (0..bins).collect(),
+            peak_phase: 0.0,
+            snr: 0.0,
+        };
+    }
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let on_bin_count = ((bins as f64 * on_duty).ceil() as usize).clamp(1, bins);
+    let max_on_bins = if bins > 1 { bins - 1 } else { 1 };
+    let on_bin_count = ((bins as f64 * on_duty).ceil() as usize)
+        .clamp(1, max_on_bins)
+        .min(sorted.len());
     let on_bins: Vec<usize> = sorted
         .iter()
         .take(on_bin_count)
@@ -957,6 +1011,7 @@ fn write_outputs(
     folded: &[(f64, f64)],
     gating: &GatingResult,
     gated: Option<&GatedAggregation>,
+    rfi_report: &RfiCutReport,
 ) -> Result<()> {
     let stem_owned = output_stem(&cli.input);
     let stem = stem_owned.as_str();
@@ -1026,42 +1081,52 @@ fn write_outputs(
         )?;
     }
 
-    if full_output && !dedispersed.raw_phase_heatmap.is_empty() {
-        let phase_heatmap_path = output_dir.join(format!("{stem}_raw_phase_heatmap.png"));
+    if !dedispersed.raw_phase_heatmap.is_empty() {
+        let phase_heatmap_path = output_dir.join(format!("{stem}_phase_freq_before_gating.png"));
         plot_phase_aligned_heatmap(
             &phase_heatmap_path,
             &dedispersed.raw_phase_heatmap,
             freq_axis_mhz,
             center_freq_mhz,
+            if cli.dm.is_some() {
+                "Phase vs Frequency (before DM / before gating)"
+            } else {
+                "Phase vs Frequency (before gating)"
+            },
         )?;
     }
-    if full_output && cli.dm.is_some() && !dedispersed.dedispersed_phase_heatmap.is_empty() {
-        let heatmap_path = output_dir.join(format!("{stem}_phase_aligned_heatmap.png"));
+    if cli.dm.is_some() && !dedispersed.dedispersed_phase_heatmap.is_empty() {
+        let heatmap_path = output_dir.join(format!("{stem}_phase_freq_after_dm_before_gating.png"));
         plot_phase_aligned_heatmap(
             &heatmap_path,
             &dedispersed.dedispersed_phase_heatmap,
             freq_axis_mhz,
             center_freq_mhz,
+            "Phase vs Frequency (after DM / before gating)",
         )?;
+    }
 
-        let on_diff_heatmap = build_on_pulse_phase_difference_heatmap(
-            &dedispersed.dedispersed_heatmap,
-            &dedispersed.pp_elapsed,
-            &dedispersed.pp_durations,
-            cli.period,
-            cli.bins,
-            gating,
-        );
-        if !on_diff_heatmap.is_empty() {
-            let diff_heatmap_path =
-                output_dir.join(format!("{stem}_phase_aligned_onminusoff_heatmap.png"));
-            plot_phase_aligned_heatmap(
-                &diff_heatmap_path,
-                &on_diff_heatmap,
-                freq_axis_mhz,
-                center_freq_mhz,
-            )?;
-        }
+    let on_diff_heatmap = build_on_pulse_phase_difference_heatmap(
+        &dedispersed.dedispersed_heatmap,
+        &dedispersed.pp_elapsed,
+        &dedispersed.pp_durations,
+        cli.period,
+        cli.bins,
+        gating,
+    );
+    if !on_diff_heatmap.is_empty() {
+        let diff_heatmap_path = output_dir.join(format!("{stem}_phase_freq_after_gating.png"));
+        plot_phase_aligned_heatmap(
+            &diff_heatmap_path,
+            &on_diff_heatmap,
+            freq_axis_mhz,
+            center_freq_mhz,
+            if cli.dm.is_some() {
+                "Phase vs Frequency (after DM and gating: on - off)"
+            } else {
+                "Phase vs Frequency (after gating: on - off)"
+            },
+        )?;
     }
     if let Some(gated_data) = gated {
         let diff_path = output_dir.join(format!("{stem}_gated_spectrum_difference.csv"));
@@ -1147,6 +1212,9 @@ fn write_outputs(
         writeln!(bins_file, "{idx}")?;
     }
 
+    let rfi_path = output_dir.join(format!("{stem}_rfi_cut.csv"));
+    write_rfi_cut_report(&rfi_path, freq_axis_mhz, rfi_report)?;
+
     let summary_path = output_dir.join(format!("{stem}_summary.txt"));
     let mut summary_file = fs::File::create(&summary_path)
         .with_context(|| format!("failed to write {summary_path:?}"))?;
@@ -1166,6 +1234,22 @@ fn write_outputs(
         summary_file,
         "channels             : {}",
         dedispersed.raw_spectrum.len()
+    )?;
+    writeln!(
+        summary_file,
+        "RFI masked channels  : {} / {}",
+        rfi_report.masked_count(),
+        rfi_report.total_channels
+    )?;
+    writeln!(
+        summary_file,
+        "RFI cut params       : window=+-{}, sigma>{:.1}, ratio>={:.1}",
+        rfi_report.window_radius, rfi_report.sigma_cut, rfi_report.ratio_cut
+    )?;
+    writeln!(
+        summary_file,
+        "RFI masked indices   : {}",
+        summarize_channel_indices(&rfi_report.masked_channels)
     )?;
     writeln!(
         summary_file,
@@ -1297,6 +1381,11 @@ fn cleanup_legacy_bin_outputs(output_dir: &Path, stem: &str) {
         format!("{stem}_raw_heatmap.png"),
         format!("{stem}_dedispersed_heatmap.png"),
         format!("{stem}_gated_diff_heatmap.png"),
+        format!("{stem}_phase_freq_before_dm.png"),
+        format!("{stem}_phase_freq_after_dm.png"),
+        format!("{stem}_phase_freq_before_gating.png"),
+        format!("{stem}_phase_freq_after_dm_before_gating.png"),
+        format!("{stem}_phase_freq_after_gating.png"),
     ];
     for name in legacy_png_files {
         let path = output_dir.join(name);
@@ -1335,6 +1424,7 @@ fn print_summary(
     folded: &[(f64, f64)],
     gating: &GatingResult,
     gated: Option<&GatedAggregation>,
+    rfi_report: &RfiCutReport,
 ) -> Result<()> {
     println!("Input file       : {}", cli.input.display());
     println!(
@@ -1355,6 +1445,21 @@ fn print_summary(
     );
     println!("Observation time : {:.6} s", dedispersed.total_integration);
     println!("Channels         : {}", dedispersed.raw_spectrum.len());
+    println!(
+        "RFI masked ch     : {} / {}",
+        rfi_report.masked_count(),
+        rfi_report.total_channels
+    );
+    println!(
+        "RFI cut params    : window=+-{}, sigma>{:.1}, ratio>={:.1}",
+        rfi_report.window_radius, rfi_report.sigma_cut, rfi_report.ratio_cut
+    );
+    if rfi_report.masked_count() > 0 {
+        println!(
+            "RFI masked idx    : {}",
+            summarize_channel_indices(&rfi_report.masked_channels)
+        );
+    }
     println!("Phase bins       : {}", cli.bins);
     println!("Phase bin width  : {:.6} s", cli.period / cli.bins as f64);
     if let Some(dm) = cli.dm {
@@ -1425,6 +1530,22 @@ fn print_summary(
         }
     }
     Ok(())
+}
+
+fn summarize_channel_indices(indices: &[usize]) -> String {
+    const MAX_DISPLAY: usize = 24;
+    if indices.is_empty() {
+        return "(none)".to_string();
+    }
+    if indices.len() <= MAX_DISPLAY {
+        return format!("{indices:?}");
+    }
+    let mut parts = indices[..MAX_DISPLAY]
+        .iter()
+        .map(|idx| idx.to_string())
+        .collect::<Vec<_>>();
+    parts.push(format!("... (+{} more)", indices.len() - MAX_DISPLAY));
+    format!("[{}]", parts.join(", "))
 }
 
 fn plot_folded_profile(
@@ -1981,6 +2102,7 @@ fn plot_phase_aligned_heatmap(
     heatmap: &[Vec<Complex<f32>>],
     freq_axis_mhz: &[f64],
     _center_freq_mhz: f64,
+    title: &str,
 ) -> Result<()> {
     if heatmap.is_empty()
         || heatmap[0].is_empty()
@@ -2055,6 +2177,7 @@ fn plot_phase_aligned_heatmap(
     let freq_max = last_edge;
 
     let mut chart = ChartBuilder::on(&root)
+        .caption(title, ("sans-serif", scaled_font_size(22)).into_font())
         .margin(20)
         .x_label_area_size(80)
         .y_label_area_size(110)
@@ -2215,7 +2338,7 @@ mod tests {
         let cli = KnownArgs {
             input: PathBuf::new(),
             period: 1.0,
-            dm: Some(3212.0),
+            dm: Some(3.212),
             bins: 8,
             skip: 0,
             length: 0,
@@ -2252,5 +2375,72 @@ mod tests {
                 .sum::<f32>()
                 > 0.0
         );
+    }
+
+    #[test]
+    fn known_args_require_finite_period_and_dm() {
+        let base = KnownArgs {
+            input: PathBuf::new(),
+            period: 1.0,
+            dm: Some(10.0),
+            bins: 8,
+            skip: 0,
+            length: 0,
+            on_duty: 0.1,
+            full_output: false,
+        };
+
+        let mut invalid_period = base.clone();
+        invalid_period.period = f64::NAN;
+        assert!(validate_known_args(&invalid_period).is_err());
+
+        let mut invalid_dm = base;
+        invalid_dm.dm = Some(f64::INFINITY);
+        assert!(validate_known_args(&invalid_dm).is_err());
+    }
+
+    #[test]
+    fn determine_gating_keeps_off_pulse_bin_even_at_full_duty() {
+        let profile = vec![(0.1, 1.0), (0.5, f64::NAN), (0.9, 3.0)];
+        let gating = determine_gating(&profile, 1.0);
+
+        assert_eq!(gating.on_bins.len(), 2);
+        assert_eq!(gating.off_bins.len(), 1);
+        assert_eq!(gating.off_bins[0], 1);
+        assert!((gating.peak_phase - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn apply_rfi_cut_masks_narrowband_spike_channel() {
+        let mut sectors = vec![
+            SectorData {
+                integ_time: 1.0,
+                spectra: vec![
+                    Complex::new(1.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                    Complex::new(25.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                ],
+            },
+            SectorData {
+                integ_time: 1.0,
+                spectra: vec![
+                    Complex::new(1.0, 0.0),
+                    Complex::new(1.1, 0.0),
+                    Complex::new(24.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                    Complex::new(1.0, 0.0),
+                ],
+            },
+        ];
+
+        let report = apply_rfi_cut_to_sectors(&mut sectors);
+
+        assert_eq!(report.masked_channels, vec![2]);
+        assert_eq!(sectors[0].spectra[2], Complex::new(0.0, 0.0));
+        assert_eq!(sectors[1].spectra[2], Complex::new(0.0, 0.0));
     }
 }

@@ -37,5 +37,8 @@ nalgebra = "0.33"
 ndarray = "0.16.1"
 num-complex = "0.4.2"
 plotters = "0.3.7"
+image = { version = "0.25.6", features = ["png"] }
+imagequant = "4.4.1"
+png = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

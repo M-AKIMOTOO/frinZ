@@ -6,6 +6,12 @@ mod known_pulsar;
 mod shared;
 mod unknown_pulsar;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeKind {
+    Known,
+    Unknown,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pulsar_gating",
@@ -13,7 +19,16 @@ mod unknown_pulsar;
     long_about = "GICO3 が出力した .cor 相関データを読み込み、周波数チャネル毎のスペクトルを時間方向に並べた行列を構築します。\n\
     オプションで分散補正（DM）を適用した後に折り畳み処理（fold）を行い、オンパルス／オフパルスの推定、\n\
     各種時系列やスペクトルのプロット、レポート出力を実施します。\n\
-    frinZ は .cor を解析するツールです。"
+    frinZ は .cor を解析するツールです。",
+    after_help = "使用例:\n\
+  周期・DM 未知で探索:\n\
+    pulsar_gating --input data/example.cor\n\
+\n\
+  周期既知、DM 既知で解析:\n\
+    pulsar_gating --input data/example.cor --period 0.714520 --dm 26.833 --bins 256\n\
+\n\
+  振幅しきい値を明示指定して探索:\n\
+    pulsar_gating --input data/example.cor --amp-threshold 0.020"
 )]
 struct Cli {
     /// 入力する .cor ファイルのパス
@@ -89,12 +104,12 @@ struct Cli {
     /// delay-rate 抽出で使う振幅しきい値
     #[arg(
         long,
-        default_value_t = 0.015,
-        help = "delay-rate 平面で抽出する最小振幅（amplitude >= threshold）。",
+        value_name = "THRESHOLD",
+        help = "delay-rate 平面で抽出する最小振幅（省略時は最大振幅の 1/2）。",
         long_help = "周期探索補助のため、delay-rate 平面から amplitude がこの値以上の点だけを抽出します。\n\
-        未指定時は 0.015 を使用します。"
+        未指定時は抽出対象の rate spectrum における有限最大振幅の 1/2 を使用します。"
     )]
-    amp_threshold: f64,
+    amp_threshold: Option<f64>,
 
     /// 詳細な中間CSV/PNG出力を有効化
     #[arg(
@@ -126,33 +141,67 @@ fn main() -> Result<()> {
         full_output,
     } = cli;
 
-    if let Some(period) = period {
-        let args = known_pulsar::KnownArgs {
-            input,
-            period,
-            dm,
-            bins,
-            skip,
-            length,
-            on_duty,
-            full_output,
-        };
-        known_pulsar::run(args)
-    } else {
-        if dm.is_some() {
-            return Err(anyhow!(
-                "--dm を指定する場合は --period も併せて入力してください（未知モードでは指定しません）。"
-            ));
+    match determine_mode(period, dm)? {
+        ModeKind::Known => {
+            let args = known_pulsar::KnownArgs {
+                input,
+                period: period.expect("mode already validated"),
+                dm,
+                bins,
+                skip,
+                length,
+                on_duty,
+                full_output,
+            };
+            known_pulsar::run(args)
         }
-        let args = unknown_pulsar::UnknownArgs {
-            input,
-            bins,
-            skip,
-            length,
-            on_duty,
-            amp_threshold,
-            full_output,
-        };
-        unknown_pulsar::run(args)
+        ModeKind::Unknown => {
+            let args = unknown_pulsar::UnknownArgs {
+                input,
+                bins,
+                skip,
+                length,
+                on_duty,
+                amp_threshold,
+                full_output,
+            };
+            unknown_pulsar::run(args)
+        }
+    }
+}
+
+fn determine_mode(period: Option<f64>, dm: Option<f64>) -> Result<ModeKind> {
+    if period.is_some() {
+        return Ok(ModeKind::Known);
+    }
+    if dm.is_some() {
+        return Err(anyhow!(
+            "--dm を指定する場合は --period も併せて入力してください（未知モードでは指定しません）。"
+        ));
+    }
+    Ok(ModeKind::Unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determine_mode_routes_periodless_input_to_unknown() {
+        assert_eq!(determine_mode(None, None).unwrap(), ModeKind::Unknown);
+    }
+
+    #[test]
+    fn determine_mode_routes_period_input_to_known() {
+        assert_eq!(determine_mode(Some(1.234), None).unwrap(), ModeKind::Known);
+        assert_eq!(
+            determine_mode(Some(1.234), Some(12.0)).unwrap(),
+            ModeKind::Known
+        );
+    }
+
+    #[test]
+    fn determine_mode_rejects_dm_without_period() {
+        assert!(determine_mode(None, Some(12.0)).is_err());
     }
 }

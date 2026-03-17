@@ -22,7 +22,7 @@ Thumbs.db
 *.log
 
 # Observation data and generated analysis outputs
-/data/
+
 /cor/
 
 # Optional local references and caches

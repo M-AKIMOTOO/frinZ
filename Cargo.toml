@@ -1,6 +1,6 @@
 [package]
 name = "frinZ"
-version = "4.2.1"
+version = "4.2.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Masanori AKIMOTO <masanori.akimoto.ac@gmail.com>"]
@@ -8,7 +8,7 @@ description = "fringe search for Yamaguchi Interferometer and Japanese VLBI Netw
 repository = "https://github.com/M-AKIMOTOO/frinZrs"
 documentation = "https://docs.rs/frinZ"
 readme = "README.md"    
-include = ["src/frinZmain/", "README.md", "LICENSE"]
+include = ["src/frinZmain/", "README.md", "LICENSE", "LICENSE-3RD-PARTY-WWZ"]
 
 [workspace]
 members = ["tools"]

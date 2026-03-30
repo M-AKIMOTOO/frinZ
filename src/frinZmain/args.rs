@@ -30,7 +30,7 @@ pub struct Args {
     #[arg(long = "closure-phase", aliases = ["cp"], num_args = 0.., value_name = "FILE|KEY:VALUE")]
     pub closure_phase: Option<Vec<String>>,
 
-    /// Integration time in seconds (0 = whole file).
+    /// Integration length in sectors (0 = whole file).
     #[arg(long, aliases = ["le", "len", "leng", "lengt"], default_value_t = 0)]
     pub length: i32,
 
@@ -90,6 +90,10 @@ pub struct Args {
     #[arg(long = "rrange", aliases = ["rate-w", "rate-win"], num_args = 2, value_name = "MIN MAX", allow_negative_numbers = true)]
     pub rrange: Vec<f32>,
 
+    /// Mask rectangle in time-domain delay/rate plane: DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX.
+    #[arg(long, num_args = 4, value_name = "DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX", allow_negative_numbers = true)]
+    pub mask: Vec<f32>,
+
     /// Frequency range for --frequency plots/search.
     #[arg(long = "frange", num_args = 2, value_name = "MIN MAX")]
     pub frange: Vec<f32>,
@@ -105,6 +109,10 @@ pub struct Args {
     /// Extra plots of amp/SNR/phase/noise vs time.
     #[arg(long, aliases = ["add", "add-p", "add-pl", "add-plo"])]
     pub add_plot: bool,
+
+    /// Run WWZ on per-loop fringe-search results.
+    #[arg(long)]
+    pub wwz: bool,
 
     /// Output header info.
     #[arg(long)]

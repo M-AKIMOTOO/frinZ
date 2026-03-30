@@ -140,6 +140,28 @@ fn resolve_delay_rate(
     (base_delay, base_rate)
 }
 
+fn delay_rate_mask_bounds(mask: &[f32]) -> Option<(f32, f32, f32, f32)> {
+    if mask.len() == 4 {
+        Some((
+            mask[0].min(mask[1]),
+            mask[0].max(mask[1]),
+            mask[2].min(mask[3]),
+            mask[2].max(mask[3]),
+        ))
+    } else {
+        None
+    }
+}
+
+fn in_delay_rate_mask(delay: f32, rate: f32, mask: Option<(f32, f32, f32, f32)>) -> bool {
+    match mask {
+        Some((delay_min, delay_max, rate_min, rate_max)) => {
+            delay >= delay_min && delay <= delay_max && rate >= rate_min && rate <= rate_max
+        }
+        None => false,
+    }
+}
+
 fn rebin_complex_rows(
     data: &[C32],
     rows: usize,
@@ -197,6 +219,8 @@ pub struct ProcessResult {
     pub label: Vec<String>,
     pub obs_time: chrono::DateTime<Utc>,
     pub length_arg: i32,
+    pub length_sec: f32,
+    pub wwz_times_sec: Vec<f32>,
     pub cumulate_len: Vec<f32>,
     pub cumulate_snr: Vec<f32>,
     pub add_plot_times: Vec<DateTime<Utc>>,
@@ -424,12 +448,8 @@ pub fn process_cor_file(
 
     let pp = header.number_of_sector;
     let mut length = if args.length == 0 { pp } else { args.length };
-
-    let total_obs_time_seconds = pp as f32 * effective_integ_time;
-    if args.length != 0 && args.length as f32 > total_obs_time_seconds {
-        length = (total_obs_time_seconds / effective_integ_time).ceil() as i32;
-    } else if args.length != 0 {
-        length = (args.length as f32 / effective_integ_time).ceil() as i32;
+    if args.length != 0 && args.length > pp {
+        length = pp;
     }
     let mut loop_count = if (pp - args.skip) / length <= 0 {
         1
@@ -455,6 +475,7 @@ pub fn process_cor_file(
     let mut freq_output_str = String::new();
     let mut cumulate_len: Vec<f32> = Vec::new();
     let mut cumulate_snr: Vec<f32> = Vec::new();
+    let mut wwz_times_sec: Vec<f32> = Vec::new();
     let mut add_plot_amp: Vec<f32> = Vec::new();
     let mut add_plot_phase: Vec<f32> = Vec::new();
     let mut add_plot_snr: Vec<f32> = Vec::new();
@@ -650,24 +671,23 @@ pub fn process_cor_file(
                         final_freq_rate_array,
                         final_delay_rate_array,
                         pre_bandpass_results,
-                    ) =
-                        run_analysis_pipeline(
-                            &complex_vec,
-                            &processing_header,
-                            &loop_args,
-                            Some("peak"),
-                            total_delay_correct,
-                            total_rate_correct,
-                            args.acel_correct,
-                            current_length,
-                            physical_length,
-                            effective_integ_time,
-                            &current_obs_time,
-                            &file_start_time,
-                            &rfi_ranges,
-                            &bandpass_data,
-                            effective_fft_point,
-                        )?;
+                    ) = run_analysis_pipeline(
+                        &complex_vec,
+                        &processing_header,
+                        &loop_args,
+                        Some("peak"),
+                        total_delay_correct,
+                        total_rate_correct,
+                        args.acel_correct,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &rfi_ranges,
+                        &bandpass_data,
+                        effective_fft_point,
+                    )?;
 
                     // Reflect the final residual re-evaluation so the reported value
                     // corresponds to the last constrained peak estimate.
@@ -706,24 +726,23 @@ pub fn process_cor_file(
                         freq_rate_array,
                         delay_rate_2d_data_comp,
                         pre_bandpass_results,
-                    ) =
-                        run_analysis_pipeline(
-                            &complex_vec,
-                            &processing_header,
-                            &loop_args,
-                            None,
-                            delay_correct_to_use,
-                            rate_correct_to_use,
-                            args.acel_correct,
-                            current_length,
-                            physical_length,
-                            effective_integ_time,
-                            &current_obs_time,
-                            &file_start_time,
-                            &rfi_ranges,
-                            &bandpass_data,
-                            effective_fft_point,
-                        )?;
+                    ) = run_analysis_pipeline(
+                        &complex_vec,
+                        &processing_header,
+                        &loop_args,
+                        None,
+                        delay_correct_to_use,
+                        rate_correct_to_use,
+                        args.acel_correct,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &rfi_ranges,
+                        &bandpass_data,
+                        effective_fft_point,
+                    )?;
                     analysis_results.length_f32 =
                         (physical_length as f32 * effective_integ_time).ceil();
                     (
@@ -886,14 +905,15 @@ pub fn process_cor_file(
                 cumulate_snr.push(analysis_results.delay_snr);
             }
 
+            add_plot_amp.push(analysis_results.delay_max_amp * 100.0);
             add_plot_phase.push(analysis_results.delay_phase);
             add_plot_times.push(current_obs_time);
+            wwz_times_sec.push((args.skip + l1 * length) as f32 * effective_integ_time);
             let phase_rad = analysis_results.delay_phase.to_radians();
             let complex_sample = Complex::from_polar(analysis_results.delay_max_amp, phase_rad);
             add_plot_complex.push(complex_sample);
 
             if args.add_plot {
-                add_plot_amp.push(analysis_results.delay_max_amp * 100.0);
                 add_plot_snr.push(analysis_results.delay_snr);
                 add_plot_noise.push(analysis_results.delay_noise * 100.0);
                 add_plot_res_delay.push(analysis_results.residual_delay);
@@ -1039,6 +1059,7 @@ pub fn process_cor_file(
                 };
 
                 if !args.frequency {
+                    let mask_bounds = delay_rate_mask_bounds(&args.mask);
                     let delay_profile: Vec<(f64, f64)> = analysis_results
                         .delay_range
                         .iter()
@@ -1051,18 +1072,16 @@ pub fn process_cor_file(
                         .zip(analysis_results.delay_rate.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
-                    let delay_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
-                        .as_ref()
-                        .map(|pre| {
+                    let delay_profile_pre_bp: Option<Vec<(f64, f64)>> =
+                        pre_bandpass_results.as_ref().map(|pre| {
                             pre.delay_range
                                 .iter()
                                 .zip(pre.visibility.iter())
                                 .map(|(&x, &y)| (x as f64, y as f64))
                                 .collect()
                         });
-                    let rate_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
-                        .as_ref()
-                        .map(|pre| {
+                    let rate_profile_pre_bp: Option<Vec<(f64, f64)>> =
+                        pre_bandpass_results.as_ref().map(|pre| {
                             pre.rate_range
                                 .iter()
                                 .zip(pre.delay_rate.iter())
@@ -1071,10 +1090,6 @@ pub fn process_cor_file(
                         });
                     let rows = delay_rate_2d_data_comp.shape()[0] as u32;
                     let cols = delay_rate_2d_data_comp.shape()[1] as u32;
-                    let max_norm = delay_rate_2d_data_comp
-                        .iter()
-                        .map(|c| c.norm())
-                        .fold(0.0f32, |acc, x| acc.max(x));
                     let delay_data: Vec<f32> = analysis_results
                         .delay_range
                         .iter()
@@ -1184,6 +1199,17 @@ pub fn process_cor_file(
                         .last()
                         .copied()
                         .unwrap_or_else(|| rows.saturating_sub(1) as usize);
+                    let mut max_norm = 0.0f32;
+                    for r_idx in y_start..=y_end.min(rows.saturating_sub(1) as usize) {
+                        for d_idx in x_start..=x_end.min(cols.saturating_sub(1) as usize) {
+                            let delay = delay_data[d_idx];
+                            let rate = rate_data[r_idx];
+                            if in_delay_rate_mask(delay, rate, mask_bounds) {
+                                continue;
+                            }
+                            max_norm = max_norm.max(delay_rate_2d_data_comp[[r_idx, d_idx]].norm());
+                        }
+                    }
 
                     let (heatmap_res_x, heatmap_res_y) = if args.in_beam {
                         // In in-beam mode, draw with 3x the native array dimensions.
@@ -1199,6 +1225,9 @@ pub fn process_cor_file(
                     let x_span = (x_end.saturating_sub(x_start)).max(1) as f64;
                     let y_span = (y_end.saturating_sub(y_start)).max(1) as f64;
                     let heatmap_func = move |delay: f64, rate: f64| -> f64 {
+                        if in_delay_rate_mask(delay as f32, rate as f32, mask_bounds) {
+                            return 0.0;
+                        }
                         let d_min = delay_plot_min;
                         let d_max = delay_plot_max;
                         let r_min = rate_plot_min;
@@ -1289,6 +1318,7 @@ pub fn process_cor_file(
                         effective_integ_time,
                         &plot_drange,
                         &plot_rrange,
+                        mask_bounds,
                         max_norm as f64,
                         heatmap_res_x,
                         heatmap_res_y,
@@ -1312,12 +1342,15 @@ pub fn process_cor_file(
                         )
                         .map(|(&x, y)| (x as f64, y as f64))
                         .collect();
-                    let freq_phase_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
-                        .as_ref()
-                        .map(|pre| {
+                    let freq_phase_profile_pre_bp: Option<Vec<(f64, f64)>> =
+                        pre_bandpass_results.as_ref().map(|pre| {
                             pre.freq_range
                                 .iter()
-                                .zip(pre.freq_rate_spectrum.iter().map(|c| safe_arg(c).to_degrees()))
+                                .zip(
+                                    pre.freq_rate_spectrum
+                                        .iter()
+                                        .map(|c| safe_arg(c).to_degrees()),
+                                )
                                 .map(|(&x, y)| (x as f64, y as f64))
                                 .collect()
                         });
@@ -1327,18 +1360,16 @@ pub fn process_cor_file(
                         .zip(analysis_results.freq_rate.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
-                    let freq_amp_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
-                        .as_ref()
-                        .map(|pre| {
+                    let freq_amp_profile_pre_bp: Option<Vec<(f64, f64)>> =
+                        pre_bandpass_results.as_ref().map(|pre| {
                             pre.freq_range
                                 .iter()
                                 .zip(pre.freq_rate_spectrum.iter().map(|c| c.norm()))
                                 .map(|(&x, y)| (x as f64, y as f64))
                                 .collect()
                         });
-                    let rate_profile_pre_bp: Option<Vec<(f64, f64)>> = pre_bandpass_results
-                        .as_ref()
-                        .map(|pre| {
+                    let rate_profile_pre_bp: Option<Vec<(f64, f64)>> =
+                        pre_bandpass_results.as_ref().map(|pre| {
                             pre.rate_range
                                 .iter()
                                 .zip(pre.freq_rate.iter())
@@ -1474,6 +1505,8 @@ pub fn process_cor_file(
         label,
         obs_time: file_start_time,
         length_arg: length,
+        length_sec: length as f32 * effective_integ_time,
+        wwz_times_sec,
         cumulate_len,
         cumulate_snr,
         add_plot_times,

@@ -34,6 +34,28 @@ fn in_window(value: f32, bounds: Option<(f32, f32)>) -> bool {
     }
 }
 
+fn mask_bounds(mask: &[f32]) -> Option<(f32, f32, f32, f32)> {
+    if mask.len() == 4 {
+        Some((
+            mask[0].min(mask[1]),
+            mask[0].max(mask[1]),
+            mask[2].min(mask[3]),
+            mask[2].max(mask[3]),
+        ))
+    } else {
+        None
+    }
+}
+
+fn in_mask_region(delay: f32, rate: f32, mask: Option<(f32, f32, f32, f32)>) -> bool {
+    match mask {
+        Some((delay_min, delay_max, rate_min, rate_max)) => {
+            delay >= delay_min && delay <= delay_max && rate >= rate_min && rate <= rate_max
+        }
+        None => false,
+    }
+}
+
 fn refine_peak_3x3_quadratic(
     surface: &Array2<f32>,
     center_rate_idx: usize,
@@ -42,6 +64,7 @@ fn refine_peak_3x3_quadratic(
     delay_range: &Array1<f32>,
     rrange: &[f32],
     drange: &[f32],
+    mask: Option<(f32, f32, f32, f32)>,
 ) -> Option<(f32, f32)> {
     let (rows, cols) = surface.dim();
     if rows < 3 || cols < 3 {
@@ -66,6 +89,7 @@ fn refine_peak_3x3_quadratic(
             let d_idx = (center_delay_idx as isize + dx) as usize;
             if !in_window(rate_range[r_idx], rate_bounds)
                 || !in_window(delay_range[d_idx], delay_bounds)
+                || in_mask_region(delay_range[d_idx], rate_range[r_idx], mask)
             {
                 return None;
             }
@@ -207,6 +231,11 @@ pub fn analyze_results(
     let delay_rate_2d_data_array = delay_rate_array.clone().mapv(|x| x.norm());
     let delay_noise_raw = noise_level(delay_rate_array.view(), delay_rate_array.mean().unwrap());
     let delay_noise = sanitize_noise(delay_noise_raw);
+    let delay_rate_mask = if args.frequency {
+        None
+    } else {
+        mask_bounds(&args.mask)
+    };
 
     let (peak_rate_idx, peak_delay_idx) = if !args.drange.is_empty() || !args.rrange.is_empty() {
         // Case 3: Window options are specified (either/both), search within them.
@@ -232,6 +261,9 @@ pub fn analyze_results(
             if rate_range[r_idx] >= rate_win_low && rate_range[r_idx] <= rate_win_high {
                 for d_idx in 0..delay_range.len() {
                     if delay_range[d_idx] >= delay_win_low && delay_range[d_idx] <= delay_win_high {
+                        if in_mask_region(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
+                            continue;
+                        }
                         let current_val = delay_rate_2d_data_array[[r_idx, d_idx]];
                         if current_val > max_val_in_window {
                             max_val_in_window = current_val;
@@ -248,6 +280,25 @@ pub fn analyze_results(
         let (mut max_val, mut max_r_idx, mut max_d_idx) = (0.0f32, 0, 0);
         for r_idx in 0..delay_rate_2d_data_array.shape()[0] {
             for d_idx in 0..delay_rate_2d_data_array.shape()[1] {
+                if in_mask_region(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
+                    continue;
+                }
+                let current_val = delay_rate_2d_data_array[[r_idx, d_idx]];
+                if current_val > max_val {
+                    max_val = current_val;
+                    max_r_idx = r_idx;
+                    max_d_idx = d_idx;
+                }
+            }
+        }
+        (max_r_idx, max_d_idx)
+    } else if delay_rate_mask.is_some() {
+        let (mut max_val, mut max_r_idx, mut max_d_idx) = (0.0f32, padding_length_half, fft_point_half - 1);
+        for r_idx in 0..delay_rate_2d_data_array.shape()[0] {
+            for d_idx in 0..delay_rate_2d_data_array.shape()[1] {
+                if in_mask_region(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
+                    continue;
+                }
                 let current_val = delay_rate_2d_data_array[[r_idx, d_idx]];
                 if current_val > max_val {
                     max_val = current_val;
@@ -274,6 +325,7 @@ pub fn analyze_results(
             &delay_range,
             &args.rrange,
             &args.drange,
+            delay_rate_mask,
         )
     } else {
         None
@@ -296,7 +348,9 @@ pub fn analyze_results(
                 if current_idx >= 0 && current_idx < delay_range.len() as isize {
                     let d_idx = current_idx as usize;
                     let delay_val = delay_range[d_idx];
-                    if in_window(delay_val, delay_bounds) {
+                    if in_window(delay_val, delay_bounds)
+                        && !in_mask_region(delay_val, rate_range[peak_rate_idx], delay_rate_mask)
+                    {
                         x_coords.push(delay_val as f64);
                         y_values.push(delay_rate_2d_data_array[[peak_rate_idx, d_idx]] as f64);
                     }
@@ -526,7 +580,9 @@ pub fn analyze_results(
                 if current_idx >= 0 && current_idx < rate_range.len() as isize {
                     let r_idx = current_idx as usize;
                     let rate_val = rate_range[r_idx];
-                    if in_window(rate_val, rate_bounds) {
+                    if in_window(rate_val, rate_bounds)
+                        && !in_mask_region(delay_range[peak_delay_idx], rate_val, delay_rate_mask)
+                    {
                         x_coords.push(rate_val as f64);
                         y_values.push(delay_rate_array[[r_idx, peak_delay_idx]].norm() as f64);
                     }

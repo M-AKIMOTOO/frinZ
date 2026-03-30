@@ -36,6 +36,7 @@ pub fn delay_plane(
     effective_integration_length: f32,
     drange: &[f32],
     rrange: &[f32],
+    mask: Option<(f32, f32, f32, f32)>,
     max_amplitude: f64,
     heatmap_res_x: usize,
     heatmap_res_y: usize,
@@ -172,6 +173,35 @@ pub fn delay_plane(
                 )))?;
             }
         }
+        if let Some((mask_delay_min, mask_delay_max, mask_rate_min, mask_rate_max)) = mask {
+            let x0 = mask_delay_min as f64;
+            let x1 = mask_delay_max as f64;
+            let y0 = mask_rate_min as f64;
+            let y1 = mask_rate_max as f64;
+            chart.draw_series(std::iter::once(Rectangle::new(
+                [(x0, y0), (x1, y1)],
+                WHITE.mix(0.18).filled(),
+            )))?;
+            let span_x = (x1 - x0).abs();
+            let span_y = (y1 - y0).abs();
+            let hatch_step = (span_x.min(span_y) / 12.0).max(0.2);
+            let mut offset = -span_y;
+            while offset <= span_x {
+                let sx = x0 + offset.max(0.0);
+                let sy = y0 + (-offset).max(0.0);
+                let ex = x0 + (offset + span_y).min(span_x);
+                let ey = y0 + (span_y + offset).min(span_y);
+                chart.draw_series(std::iter::once(PathElement::new(
+                    vec![(sx, sy), (ex, ey)],
+                    BLACK.mix(0.35).stroke_width(1),
+                )))?;
+                offset += hatch_step;
+            }
+            chart.draw_series(std::iter::once(Rectangle::new(
+                [(x0, y0), (x1, y1)],
+                BLACK.mix(0.45).stroke_width(1),
+            )))?;
+        }
 
         let mut colorbar = ChartBuilder::on(&colorbar_area)
             .margin_top(15)
@@ -252,6 +282,31 @@ pub fn delay_plane(
             RED.stroke_width(1),
         ))?;
     }
+    if let Some((mask_delay_min, mask_delay_max, _, _)) = mask {
+        let x0 = mask_delay_min as f64;
+        let x1 = mask_delay_max as f64;
+        chart1.draw_series(std::iter::once(Rectangle::new(
+            [(x0, 0.0), (x1, delay_max)],
+            WHITE.mix(0.18).filled(),
+        )))?;
+        let hatch_step = ((x1 - x0).abs() / 20.0).max(0.1);
+        let mut x = x0 - delay_max;
+        while x <= x1 {
+            let sx = x.max(x0);
+            let sy = (x0 - x).max(0.0);
+            let ex = (x + delay_max).min(x1);
+            let ey = (ex - x).max(0.0).min(delay_max);
+            chart1.draw_series(std::iter::once(PathElement::new(
+                vec![(sx, sy), (ex, ey)],
+                BLACK.mix(0.35).stroke_width(1),
+            )))?;
+            x += hatch_step;
+        }
+        chart1.draw_series(std::iter::once(Rectangle::new(
+            [(x0, 0.0), (x1, delay_max)],
+            BLACK.mix(0.45).stroke_width(1),
+        )))?;
+    }
 
     // Draw bounding box for chart1
     let x_spec = chart1.x_range();
@@ -302,6 +357,31 @@ pub fn delay_plane(
                 .cloned(),
             RED.stroke_width(1),
         ))?;
+    }
+    if let Some((_, _, mask_rate_min, mask_rate_max)) = mask {
+        let x0 = mask_rate_min as f64;
+        let x1 = mask_rate_max as f64;
+        chart2.draw_series(std::iter::once(Rectangle::new(
+            [(x0, 0.0), (x1, rate_max)],
+            WHITE.mix(0.18).filled(),
+        )))?;
+        let hatch_step = ((x1 - x0).abs() / 20.0).max(0.001);
+        let mut x = x0 - rate_max;
+        while x <= x1 {
+            let sx = x.max(x0);
+            let sy = (x0 - x).max(0.0);
+            let ex = (x + rate_max).min(x1);
+            let ey = (ex - x).max(0.0).min(rate_max);
+            chart2.draw_series(std::iter::once(PathElement::new(
+                vec![(sx, sy), (ex, ey)],
+                BLACK.mix(0.35).stroke_width(1),
+            )))?;
+            x += hatch_step;
+        }
+        chart2.draw_series(std::iter::once(Rectangle::new(
+            [(x0, 0.0), (x1, rate_max)],
+            BLACK.mix(0.45).stroke_width(1),
+        )))?;
     }
 
     // Draw bounding box for chart2
@@ -364,6 +444,35 @@ pub fn delay_plane(
                 HSLColor((1.0 - normalized_val) * 0.7, 1.0, 0.5).filled(),
             )))?;
         }
+    }
+    if let Some((mask_delay_min, mask_delay_max, mask_rate_min, mask_rate_max)) = mask {
+        let x0 = mask_delay_min as f64;
+        let x1 = mask_delay_max as f64;
+        let y0 = mask_rate_min as f64;
+        let y1 = mask_rate_max as f64;
+        chart3.draw_series(std::iter::once(Rectangle::new(
+            [(x0, y0), (x1, y1)],
+            WHITE.mix(0.18).filled(),
+        )))?;
+        let span_x = (x1 - x0).abs();
+        let span_y = (y1 - y0).abs();
+        let hatch_step = (span_x.min(span_y) / 12.0).max(0.2);
+        let mut offset = -span_y;
+        while offset <= span_x {
+            let sx = x0 + offset.max(0.0);
+            let sy = y0 + (-offset).max(0.0);
+            let ex = x0 + (offset + span_y).min(span_x);
+            let ey = y0 + (span_y + offset).min(span_y);
+            chart3.draw_series(std::iter::once(PathElement::new(
+                vec![(sx, sy), (ex, ey)],
+                BLACK.mix(0.35).stroke_width(1),
+            )))?;
+            offset += hatch_step;
+        }
+        chart3.draw_series(std::iter::once(Rectangle::new(
+            [(x0, y0), (x1, y1)],
+            BLACK.mix(0.45).stroke_width(1),
+        )))?;
     }
 
     // 4. Colorbar
@@ -613,7 +722,9 @@ pub fn frequency_plane(
         rate_chart.draw_series(LineSeries::new(
             pre_bp
                 .iter()
-                .filter(|(x, y)| *x >= rate_min_x && *x <= rate_max_x && x.is_finite() && y.is_finite())
+                .filter(|(x, y)| {
+                    *x >= rate_min_x && *x <= rate_max_x && x.is_finite() && y.is_finite()
+                })
                 .cloned(),
             RED.stroke_width(1),
         ))?;
@@ -835,7 +946,7 @@ pub fn write_add_plot_outputs(
             &result.add_plot_res_delay,
             &result.add_plot_res_rate,
             &result.header.source_name,
-            result.length_arg,
+            result.length_sec,
             &result.obs_time,
         )?;
 
@@ -865,7 +976,7 @@ pub fn add_plot(
     res_delay: &[f32],
     res_rate: &[f32],
     source_name: &str,
-    len_val: i32,
+    len_val_sec: f32,
     obs_start_time: &DateTime<Utc>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut phase_unwrapped = phase.to_vec();
@@ -916,7 +1027,7 @@ pub fn add_plot(
 
         let mut chart = ChartBuilder::on(&root)
             .caption(
-                format!("{}, length: {} s", source_name, len_val),
+                format!("{}, length: {:.3} s", source_name, len_val_sec),
                 ("sans-serif ", 25).into_font(),
             )
             .margin(10)

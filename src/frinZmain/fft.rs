@@ -47,39 +47,29 @@ pub fn process_fft(
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(padding_length);
 
-    let complex_array =
-        Array::from_shape_vec((rows, fft_point_half), complex_vec.to_vec()).unwrap();
     let mut freq_rate_array = Array2::<C32>::zeros((fft_point_half, padding_length));
+    let mut fft_exe = vec![C32::new(0.0, 0.0); padding_length];
 
     for i in 1..fft_point_half {
-        // DC成分（FFTシフト前のインデックス0）を0+0jに設定
-        let mut fft_exe = vec![C32::new(0.0, 0.0); padding_length];
+        fft_exe.fill(C32::new(0.0, 0.0));
         let is_rfi_channel = rfi_ranges.iter().any(|(min, max)| i >= *min && i <= *max);
 
         if !is_rfi_channel {
-            for (j, val) in complex_array.column(i).iter().enumerate() {
-                fft_exe[j] = *val;
+            for j in 0..rows {
+                fft_exe[j] = complex_vec[j * fft_point_half + i];
             }
         }
 
         fft.process(&mut fft_exe);
 
-        let mut shifted_out = vec![C32::new(0.0, 0.0); padding_length];
-
-        // FFT shift (works for even/odd lengths)
         let (first_half, second_half) = fft_exe.split_at(padding_length_half);
-        // For odd lengths, second_half.len() = first_half.len() + 1
-        shifted_out[..second_half.len()].copy_from_slice(second_half);
-        shifted_out[second_half.len()..].copy_from_slice(first_half);
-
-        let scaled_shifted_out: Vec<C32> = shifted_out
+        let mut row = freq_rate_array.row_mut(i);
+        for (dst, src) in row
             .iter_mut()
-            .map(|val| *val * scale_factor)
-            .collect();
-
-        freq_rate_array
-            .row_mut(i)
-            .assign(&ArrayView::from(&scaled_shifted_out));
+            .zip(second_half.iter().chain(first_half.iter()))
+        {
+            *dst = *src * scale_factor;
+        }
     }
 
     (freq_rate_array, padding_length)
@@ -92,13 +82,26 @@ pub fn process_ifft(
 ) -> Array2<C32> {
     let fft_point_usize = fft_point as usize;
     let mut delay_rate_array = Array2::<C32>::zeros((padding_length, fft_point_usize));
+    let mut planner = FftPlanner::new();
+    let ifft = planner.plan_fft_inverse(fft_point_usize);
+    let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point_usize];
 
     for i in 0..freq_rate_array.dim().1 {
-        let freq_data_col = freq_rate_array.column(i);
-        let ifft_result = perform_ifft_on_vec(&freq_data_col.to_vec(), fft_point_usize);
-        delay_rate_array
-            .row_mut(i)
-            .assign(&ArrayView::from(&ifft_result));
+        ifft_exe.fill(C32::new(0.0, 0.0));
+        for (dst, src) in ifft_exe.iter_mut().zip(freq_rate_array.column(i).iter()) {
+            *dst = *src;
+        }
+
+        ifft.process(&mut ifft_exe);
+
+        let (first_half, second_half) = ifft_exe.split_at(fft_point_usize / 2);
+        let mut row = delay_rate_array.row_mut(i);
+        for (dst, src) in row
+            .iter_mut()
+            .zip(second_half.iter().chain(first_half.iter()).rev())
+        {
+            *dst = *src / fft_point_usize as f32;
+        }
     }
 
     delay_rate_array
@@ -128,9 +131,9 @@ pub fn perform_ifft_on_vec(input: &[C32], ifft_size: usize) -> Vec<C32> {
     shifted_out
 }
 
-/// Applies phase correction to input data
-pub fn apply_phase_correction(
-    input_data: &[Vec<Complex<f64>>],
+pub fn apply_phase_correction_in_place(
+    data: &mut [C32],
+    fft_point_half: usize,
     rate_hz_for_correction: f32,
     delay_samples_for_correction: f32,
     acel_hz_for_correction: f32,
@@ -138,47 +141,42 @@ pub fn apply_phase_correction(
     sampling_speed: u32,
     fft_point: u32,
     start_time_offset_sec: f32,
-) -> Vec<Vec<Complex<f64>>> {
-    let mut corrected_data = input_data.to_vec();
+) {
+    if data.is_empty()
+        || fft_point_half == 0
+        || data.len() % fft_point_half != 0
+        || sampling_speed == 0
+        || fft_point < 2
+        || (effective_integration_length as f64).abs() <= 1e-9
+    {
+        return;
+    }
 
-    let n_rows_original = input_data.len();
-    let n_cols_original = if n_rows_original > 0 {
-        input_data[0].len()
-    } else {
-        0
-    };
+    if rate_hz_for_correction == 0.0
+        && delay_samples_for_correction == 0.0
+        && acel_hz_for_correction == 0.0
+    {
+        return;
+    }
 
-    let can_phase_correct = sampling_speed > 0
-        && fft_point >= 2
-        && (effective_integration_length as f64).abs() > 1e-9
-        && n_cols_original > 0;
+    let freq_resolution_hz = sampling_speed as f64 / fft_point as f64;
+    let delay_seconds = delay_samples_for_correction as f64 / sampling_speed as f64;
+    let delay_factors: Vec<C32> = (0..fft_point_half)
+        .map(|col| {
+            let phase = -2.0 * PI * delay_seconds * col as f64 * freq_resolution_hz;
+            C32::new(phase.cos() as f32, phase.sin() as f32)
+        })
+        .collect();
 
-    if can_phase_correct {
-        let freq_resolution_hz = sampling_speed as f64 / fft_point as f64;
-        let delay_seconds = delay_samples_for_correction as f64 / sampling_speed as f64;
+    for (row_idx, row) in data.chunks_mut(fft_point_half).enumerate() {
+        let time_for_rate_corr_sec =
+            row_idx as f64 * effective_integration_length as f64 + start_time_offset_sec as f64;
+        let phase = -2.0 * PI * rate_hz_for_correction as f64 * time_for_rate_corr_sec
+            - PI * acel_hz_for_correction as f64 * time_for_rate_corr_sec.powi(2);
+        let rate_factor = C32::new(phase.cos() as f32, phase.sin() as f32);
 
-        for r_orig in 0..n_rows_original {
-            let time_for_rate_corr_sec = (r_orig as f64 * effective_integration_length as f64)
-                + start_time_offset_sec as f64;
-            let rate_corr_factor = Complex::new(
-                0.0,
-                -2.0 * PI * rate_hz_for_correction as f64 * time_for_rate_corr_sec,
-            )
-            .exp()
-                * Complex::new(
-                    0.0,
-                    -1.0 * PI * acel_hz_for_correction as f64 * time_for_rate_corr_sec.powi(2),
-                )
-                .exp();
-
-            for c_orig in 0..n_cols_original {
-                let freq_k_hz_for_delay_corr = c_orig as f64 * freq_resolution_hz;
-                let delay_corr_factor =
-                    Complex::new(0.0, -2.0 * PI * delay_seconds * freq_k_hz_for_delay_corr).exp();
-
-                corrected_data[r_orig][c_orig] *= rate_corr_factor * delay_corr_factor;
-            }
+        for (sample, delay_factor) in row.iter_mut().zip(delay_factors.iter()) {
+            *sample *= rate_factor * *delay_factor;
         }
     }
-    corrected_data
 }

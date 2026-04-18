@@ -1622,19 +1622,13 @@ pub(crate) fn run_analysis_pipeline(
             .num_seconds() as f32
     };
 
-    let corrected_complex_vec =
-        if delay_correct != 0.0 || rate_correct != 0.0 || acel_correct != 0.0 {
-            let input_data_2d: Vec<Vec<Complex<f64>>> = complex_vec
-                .chunks(fft_point_half)
-                .map(|chunk| {
-                    chunk
-                        .iter()
-                        .map(|&c| Complex::new(c.re as f64, c.im as f64))
-                        .collect()
-                })
-                .collect();
-            let corrected_complex_vec_2d = fft::apply_phase_correction(
-                &input_data_2d,
+    let corrected_complex_vec;
+    let fft_input = if delay_correct != 0.0 || rate_correct != 0.0 || acel_correct != 0.0 {
+        corrected_complex_vec = {
+            let mut corrected = complex_vec.to_vec();
+            fft::apply_phase_correction_in_place(
+                &mut corrected,
+                fft_point_half,
                 rate_correct,
                 delay_correct,
                 acel_correct,
@@ -1643,17 +1637,15 @@ pub(crate) fn run_analysis_pipeline(
                 effective_fft_point as u32,
                 start_time_offset_sec,
             );
-            corrected_complex_vec_2d
-                .into_iter()
-                .flatten()
-                .map(|v| Complex::new(v.re as f32, v.im as f32))
-                .collect()
-        } else {
-            complex_vec.to_vec()
+            corrected
         };
+        corrected_complex_vec.as_slice()
+    } else {
+        complex_vec
+    };
 
     let (mut freq_rate_array, padding_length) = process_fft(
-        &corrected_complex_vec,
+        fft_input,
         physical_length,
         effective_fft_point,
         header.sampling_speed,

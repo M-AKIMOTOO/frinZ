@@ -428,17 +428,10 @@ fn apply_phase_solution(
         return complex_vec.to_vec();
     }
 
-    let input_2d: Vec<Vec<Complex<f64>>> = complex_vec
-        .chunks(fft_half)
-        .map(|row| {
-            row.iter()
-                .map(|c| Complex::new(c.re as f64, c.im as f64))
-                .collect()
-        })
-        .collect();
-
-    let corrected_2d = fft::apply_phase_correction(
-        &input_2d,
+    let mut corrected = complex_vec.to_vec();
+    fft::apply_phase_correction_in_place(
+        &mut corrected,
+        fft_half,
         rate_hz,
         delay_samples,
         acel_hz,
@@ -448,11 +441,7 @@ fn apply_phase_solution(
         start_time_offset_sec,
     );
 
-    corrected_2d
-        .into_iter()
-        .flatten()
-        .map(|z| C32::new(z.re as f32, z.im as f32))
-        .collect()
+    corrected
 }
 
 fn collect_baseline_visibility(

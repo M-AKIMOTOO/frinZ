@@ -239,9 +239,15 @@ fn encode_best_lossless_png(
 
     let mut best: Option<Vec<u8>> = None;
     for (filter, adaptive) in strategies {
-        if let Some(candidate) =
-            encode_raw_png(raw, width, height, layout, BitDepth::Eight, filter, adaptive)
-        {
+        if let Some(candidate) = encode_raw_png(
+            raw,
+            width,
+            height,
+            layout,
+            BitDepth::Eight,
+            filter,
+            adaptive,
+        ) {
             update_best(&mut best, candidate);
         }
     }

@@ -26,3 +26,4 @@ pub mod rfi;
 pub mod uptimeplot;
 pub mod utils;
 pub mod uv;
+pub mod wwz;

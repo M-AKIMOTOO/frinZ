@@ -271,6 +271,18 @@ fn get_split_element(original_filename: &Path, target_index: usize) -> Option<St
     file_stem.split('_').nth(target_index).map(String::from)
 }
 
+fn trailing_label(parts: &[&str], start_index: usize) -> Option<String> {
+    if parts.len() <= start_index {
+        return None;
+    }
+    let label = parts[start_index..].join("_");
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
 /// 出力ファイル名を生成する
 fn generate_output_filename(input_files: &[PathBuf]) -> Result<PathBuf, Box<dyn Error>> {
     if input_files.is_empty() {
@@ -296,6 +308,7 @@ fn generate_output_filename(input_files: &[PathBuf]) -> Result<PathBuf, Box<dyn 
         "最初のファイル \"{:?}\" から3番目の要素を取得できませんでした.",
         first_filename
     ))?;
+    let first_label = trailing_label(&parts, TARGET_INDEX + 1);
 
     let output_filename_str = if input_files.len() > 1 {
         let last_filename = &input_files[input_files.len() - 1];
@@ -303,15 +316,70 @@ fn generate_output_filename(input_files: &[PathBuf]) -> Result<PathBuf, Box<dyn 
             "最後のファイル \"{:?}\" から3番目の要素を取得できませんでした.",
             last_filename
         ))?;
+        let last_stem = last_filename
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("最後のファイル名からステムを取得できません.")?;
+        let last_parts: Vec<&str> = last_stem.split('_').collect();
+        let label_suffix = match (
+            first_label.as_deref(),
+            trailing_label(&last_parts, TARGET_INDEX + 1).as_deref(),
+        ) {
+            (Some(first), Some(last)) if first == last => format!("_{}", first),
+            (Some(first), _) => format!("_{}", first),
+            _ => String::new(),
+        };
         format!(
-            "{}_{}T{}_cormerge.cor",
-            base_parts, first_file_third, last_file_third
+            "{}_{}T{}{}_cormerge.cor",
+            base_parts, first_file_third, last_file_third, label_suffix
         )
     } else {
-        format!("{}_{}Tcormerge.cor", base_parts, first_file_third)
+        let label_suffix = first_label
+            .as_ref()
+            .map(|label| format!("_{}", label))
+            .unwrap_or_default();
+        format!(
+            "{}_{}T{}_cormerge.cor",
+            base_parts, first_file_third, label_suffix
+        )
     };
 
     Ok(PathBuf::from(output_filename_str))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_output_filename_preserves_common_trailing_label() {
+        let files = vec![
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600_x.cor"),
+            PathBuf::from("YAMAGU34_YAMAGU34_2025310003600_x.cor"),
+        ];
+
+        let output = generate_output_filename(&files).unwrap();
+
+        assert_eq!(
+            output,
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600T2025310003600_x_cormerge.cor")
+        );
+    }
+
+    #[test]
+    fn generate_output_filename_preserves_multi_part_trailing_label() {
+        let files = vec![
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600_x_usb.cor"),
+            PathBuf::from("YAMAGU34_YAMAGU34_2025310003600_x_usb.cor"),
+        ];
+
+        let output = generate_output_filename(&files).unwrap();
+
+        assert_eq!(
+            output,
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600T2025310003600_x_usb_cormerge.cor")
+        );
+    }
 }
 
 fn cleanup_temp_files(paths: &[&Path]) {

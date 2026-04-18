@@ -13,7 +13,7 @@
 
 [入力・基本]
   --in <FILE>                        入力 .cor
-  --len <SEC>                        積分長 (0=全区間)
+  --len <N>                          積分長 [sector数] (0=全区間)
   --skip <SEC>                       冒頭スキップ
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
@@ -75,6 +75,7 @@
 
 [出力・グラフ補助]
   --add-plot                         Amp/SNR/位相/雑音の時系列
+  --wwz                              各 loop の fringe-search 結果に対して WWZ を実行（frinZ/wwz/）
   --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）
   --bandpass-table                   補正後スペクトルをバイナリ保存
   --spectrum                         クロススペクトルをバイナリ保存

@@ -8,7 +8,7 @@ use num_complex::Complex;
 use crate::analysis::analyze_results;
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
-use crate::fft::{apply_phase_correction, process_fft, process_ifft};
+use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
 use crate::plot::frequency_plane_msb;
 use crate::read::{read_sector_header, read_visibility_data};
@@ -561,13 +561,9 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         }
 
         let c_start_time_offset_sec = 0.0;
-        let c_complex_vec_sector_f64: Vec<Complex<f64>> = c_complex_vec_sector
-            .iter()
-            .map(|&c| num_complex::Complex::new(c.re as f64, c.im as f64))
-            .collect();
-
-        let corrected_c_complex_vec = apply_phase_correction(
-            &[c_complex_vec_sector_f64],
+        apply_phase_correction_in_place(
+            &mut c_complex_vec_sector,
+            (c_band_header.fft_point / 2) as usize,
             0.0,
             delta_tau_c,
             0.0,
@@ -577,18 +573,12 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             c_start_time_offset_sec,
         );
 
-        let corrected_c_complex_vec_f32: Vec<C32> = corrected_c_complex_vec
-            .into_iter()
-            .flatten()
-            .map(|v| C32::new(v.re as f32, v.im as f32))
-            .collect();
-
         output_file.write_all(&c_sector_header[0])?;
-        for val in corrected_c_complex_vec_f32.iter() {
+        for val in c_complex_vec_sector.iter() {
             output_file.write_all(&val.re.to_le_bytes())?;
             output_file.write_all(&val.im.to_le_bytes())?;
         }
-        all_c_spectra.push(corrected_c_complex_vec_f32.clone());
+        all_c_spectra.push(c_complex_vec_sector);
 
         let mut x_band_cursor_sector = Cursor::new(x_band_buffer.as_slice());
         let _x_sector_header =
@@ -615,13 +605,9 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         }
 
         let x_start_time_offset_sec = 0.0;
-        let x_complex_vec_sector_f64: Vec<Complex<f64>> = x_complex_vec_sector
-            .iter()
-            .map(|&c| num_complex::Complex::new(c.re as f64, c.im as f64))
-            .collect();
-
-        let corrected_x_complex_vec = apply_phase_correction(
-            &[x_complex_vec_sector_f64],
+        apply_phase_correction_in_place(
+            &mut x_complex_vec_sector,
+            (x_band_header.fft_point / 2) as usize,
             0.0,
             delta_tau_x,
             0.0,
@@ -631,18 +617,12 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             x_start_time_offset_sec,
         );
 
-        let mut corrected_x_complex_vec_f32: Vec<C32> = corrected_x_complex_vec
-            .into_iter()
-            .flatten()
-            .map(|v| C32::new(v.re as f32, v.im as f32))
-            .collect();
-
-        for val in corrected_x_complex_vec_f32.iter_mut() {
+        for val in x_complex_vec_sector.iter_mut() {
             *val *= correction_factor;
             output_file.write_all(&val.re.to_le_bytes())?;
             output_file.write_all(&val.im.to_le_bytes())?;
         }
-        all_x_spectra.push(corrected_x_complex_vec_f32.clone());
+        all_x_spectra.push(x_complex_vec_sector);
     }
 
     writeln!(tee_writer, "Initial analysis complete for both bands.")?;

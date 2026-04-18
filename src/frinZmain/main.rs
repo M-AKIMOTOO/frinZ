@@ -41,6 +41,7 @@ mod rfi;
 mod uptimeplot;
 mod utils;
 mod uv;
+mod wwz;
 
 use crate::args::{check_memory_usage, Args};
 use crate::bispectrum::run_closure_phase_analysis;
@@ -59,6 +60,7 @@ use crate::raw_visibility::run_raw_visibility_plot;
 use crate::search::run_acel_search_analysis;
 use crate::uptimeplot::run_uptime_plot;
 use crate::uv::run_uv_plot;
+use crate::wwz::write_wwz_outputs;
 
 // --- Type Aliases for Clarity ---
 pub type C32 = Complex<f32>;
@@ -75,7 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let command = Args::command();
+    let command = Args::command_with_aliases();
     let mut matches = match command.try_get_matches_from(env_args.clone()) {
         Ok(m) => m,
         Err(e) => {
@@ -99,6 +101,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         const DETAIL_TEXT: &str = include_str!("command_detail.txt");
         print!("{}", DETAIL_TEXT);
         return Ok(());
+    }
+
+    if args.wwz && args.frequency {
+        eprintln!(
+            "Error: --wwz currently supports delay-rate fringe-search results only and cannot be combined with --frequency."
+        );
+        exit(1);
+    }
+
+    if args.wwz && args.primary_search_mode().is_none() {
+        println!("#INFO: --wwz が指定されたため --search peak を有効化します。");
+        args.search.push("peak".to_string());
     }
 
     if args.scan_correct.is_some() {
@@ -612,6 +626,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let frinz_dir = parent_dir.join("frinZ");
         write_cumulate_outputs(&args, &result, &frinz_dir)?;
         let base_filename = write_add_plot_outputs(&args, &result, &frinz_dir)?;
+        write_wwz_outputs(&args, &result, &frinz_dir)?;
         if args.allan_deviance {
             utils::write_allan_deviation_outputs(
                 &result.add_plot_phase,
@@ -649,7 +664,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // If we reach here, no primary mode was selected.
     eprintln!("Error: Either --input or --phase-reference must be provided.");
-    let mut cmd = Args::command();
+    let mut cmd = Args::command_with_aliases();
     cmd.print_help().expect("Failed to print help");
     exit(1);
 }

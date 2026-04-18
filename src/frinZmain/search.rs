@@ -544,7 +544,7 @@ mod deep {
     use crate::analysis::{analyze_results, AnalysisResults};
     use crate::args::Args;
     use crate::bandpass::apply_bandpass_correction;
-    use crate::fft::{apply_phase_correction, process_fft, process_ifft};
+    use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
     use crate::header::CorHeader;
 
     type C32 = Complex<f32>;
@@ -728,22 +728,21 @@ mod deep {
             final_freq_rate_array,
             final_delay_rate_2d_data,
             pre_bandpass_analysis_results,
-        ) =
-            perform_final_analysis(
-                complex_vec,
-                header,
-                current_length,
-                physical_length,
-                effective_integ_time,
-                current_obs_time,
-                rfi_ranges,
-                bandpass_data,
-                args,
-                final_delay,
-                final_rate,
-                start_time_offset_sec,
-                effective_fft_point,
-            )?;
+        ) = perform_final_analysis(
+            complex_vec,
+            header,
+            current_length,
+            physical_length,
+            effective_integ_time,
+            current_obs_time,
+            rfi_ranges,
+            bandpass_data,
+            args,
+            final_delay,
+            final_rate,
+            start_time_offset_sec,
+            effective_fft_point,
+        )?;
 
         Ok(DeepSearchResult {
             analysis_results: final_analysis_results,
@@ -1169,7 +1168,7 @@ mod deep {
         start_time_offset_sec: f32,
         effective_fft_point: i32,
     ) -> Result<Vec<C32>, Box<dyn Error>> {
-        if rate == 0.0 && delay == 0.0 {
+        if rate == 0.0 && delay == 0.0 && acel == 0.0 {
             return Ok(complex_vec.to_vec());
         }
 
@@ -1178,18 +1177,10 @@ mod deep {
             return Err("FFT チャンネル数が 0 です".into());
         }
 
-        let input_data_2d: Vec<Vec<Complex<f64>>> = complex_vec
-            .chunks(fft_point_half)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|&c| Complex::new(c.re as f64, c.im as f64))
-                    .collect()
-            })
-            .collect();
-
-        let corrected_complex_vec_2d = apply_phase_correction(
-            &input_data_2d,
+        let mut corrected_vec = complex_vec.to_vec();
+        apply_phase_correction_in_place(
+            &mut corrected_vec,
+            fft_point_half,
             rate,
             delay,
             acel,
@@ -1198,12 +1189,6 @@ mod deep {
             effective_fft_point as u32,
             start_time_offset_sec,
         );
-
-        let corrected_vec = corrected_complex_vec_2d
-            .into_iter()
-            .flatten()
-            .map(|v| Complex::new(v.re as f32, v.im as f32))
-            .collect();
 
         Ok(corrected_vec)
     }

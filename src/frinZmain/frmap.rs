@@ -12,7 +12,7 @@ use ndarray::{Array, Array2, ArrayView1, Axis};
 use num_complex::Complex;
 
 use crate::args::Args;
-use crate::fft::{apply_phase_correction, process_fft, process_ifft};
+use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
 use crate::plot::{plot_cross_section, plot_sky_map, plot_uv_coverage};
 use crate::read::read_visibility_data;
@@ -20,8 +20,6 @@ use crate::utils::{rate_cal, uvw_cal};
 use plotters::prelude::*;
 use std::cmp::Ordering;
 use std::f64::consts::PI;
-
-type C32 = Complex<f32>;
 
 #[derive(Debug, Clone)]
 struct FringeLineMeasurement {
@@ -339,12 +337,9 @@ pub fn run_fringe_rate_map_analysis(
 
     let pp = header.number_of_sector;
     let length_in_sectors = if args.length == 0 {
-        let segment_duration_sec = pp as f32;
-        (segment_duration_sec / effective_integ_time)
-            .ceil()
-            .max(1.0) as i32
+        pp.max(1)
     } else {
-        (args.length as f32 / effective_integ_time).ceil() as i32
+        args.length.max(1).min(pp)
     };
     println!(
         "Processing in segments of {} sectors (approx. {} seconds)",
@@ -393,26 +388,10 @@ pub fn run_fringe_rate_map_analysis(
                 args.delay_correct, args.rate_correct, args.acel_correct
             );
 
-            let n_rows = length_in_sectors as usize;
-            let n_cols = (header.fft_point / 2) as usize;
-            let mut input_data_f64: Vec<Vec<Complex<f64>>> =
-                vec![vec![Complex::new(0.0, 0.0); n_cols]; n_rows];
-            for r in 0..n_rows {
-                for c in 0..n_cols {
-                    let index = r * n_cols + c;
-                    if index < complex_vec.len() {
-                        input_data_f64[r][c] = Complex::new(
-                            complex_vec[index].re as f64,
-                            complex_vec[index].im as f64,
-                        );
-                    }
-                }
-            }
-
             let start_time_offset_sec = 0.0;
-
-            let corrected_data_f64 = apply_phase_correction(
-                &input_data_f64,
+            apply_phase_correction_in_place(
+                &mut complex_vec,
+                (header.fft_point / 2) as usize,
                 args.rate_correct,
                 args.delay_correct,
                 args.acel_correct,
@@ -421,12 +400,6 @@ pub fn run_fringe_rate_map_analysis(
                 header.fft_point as u32,
                 start_time_offset_sec,
             );
-
-            complex_vec = corrected_data_f64
-                .into_iter()
-                .flatten()
-                .map(|c| C32::new(c.re as f32, c.im as f32))
-                .collect();
         }
 
         let (freq_rate_array, padding_length) = process_fft(
@@ -645,12 +618,9 @@ fn run_frmap_maser(
 
     let pp = header.number_of_sector;
     let length_in_sectors = if args.length == 0 {
-        let segment_duration_sec = pp as f32;
-        (segment_duration_sec / effective_integ_time)
-            .ceil()
-            .max(1.0) as i32
+        pp.max(1)
     } else {
-        (args.length as f32 / effective_integ_time).ceil() as i32
+        args.length.max(1).min(pp)
     };
     println!(
         "Processing in segments of {} sectors (approx. {:.2} seconds)",
@@ -714,26 +684,11 @@ fn run_frmap_maser(
                 args.delay_correct, args.rate_correct, args.acel_correct
             );
 
-            let n_rows = length_in_sectors as usize;
-            let n_cols = (header.fft_point / 2) as usize;
-            let mut input_data_f64: Vec<Vec<Complex<f64>>> =
-                vec![vec![Complex::new(0.0, 0.0); n_cols]; n_rows];
-            for r in 0..n_rows {
-                for c in 0..n_cols {
-                    let index = r * n_cols + c;
-                    if index < complex_vec.len() {
-                        input_data_f64[r][c] = Complex::new(
-                            complex_vec[index].re as f64,
-                            complex_vec[index].im as f64,
-                        );
-                    }
-                }
-            }
-
             let start_time_offset_sec = 0.0;
 
-            let corrected_data_f64 = apply_phase_correction(
-                &input_data_f64,
+            apply_phase_correction_in_place(
+                &mut complex_vec,
+                (header.fft_point / 2) as usize,
                 args.rate_correct,
                 args.delay_correct,
                 args.acel_correct,
@@ -742,12 +697,6 @@ fn run_frmap_maser(
                 header.fft_point as u32,
                 start_time_offset_sec,
             );
-
-            complex_vec = corrected_data_f64
-                .into_iter()
-                .flatten()
-                .map(|c| C32::new(c.re as f32, c.im as f32))
-                .collect();
         }
 
         let (freq_rate_array, padding_length) = process_fft(

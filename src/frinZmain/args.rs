@@ -1,10 +1,135 @@
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Command, CommandFactory, Parser};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::header::parse_header;
+
+#[derive(Clone, Copy)]
+struct PrefixAliasSpec {
+    arg_id: &'static str,
+    base: &'static str,
+    min_len: usize,
+}
+
+const PREFIX_ALIASES: &[PrefixAliasSpec] = &[
+    PrefixAliasSpec {
+        arg_id: "input",
+        base: "input",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "phase_reference",
+        base: "phase",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "phase_reference",
+        base: "phase-reference",
+        min_len: "phase-r".len(),
+    },
+    PrefixAliasSpec {
+        arg_id: "length",
+        base: "length",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "skip",
+        base: "skip",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "loop_",
+        base: "loop",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "plot",
+        base: "plot",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "frequency",
+        base: "frequency",
+        min_len: 3,
+    },
+    PrefixAliasSpec {
+        arg_id: "cor2bin",
+        base: "cor2bin",
+        min_len: "cor2b".len(),
+    },
+    PrefixAliasSpec {
+        arg_id: "spectrum",
+        base: "spectrum",
+        min_len: 4,
+    },
+    PrefixAliasSpec {
+        arg_id: "output",
+        base: "output",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "rate_padding",
+        base: "rate-padding",
+        min_len: "rate-p".len(),
+    },
+    PrefixAliasSpec {
+        arg_id: "cumulate",
+        base: "cumulate",
+        min_len: 2,
+    },
+    PrefixAliasSpec {
+        arg_id: "add_plot",
+        base: "add-plot",
+        min_len: "add".len(),
+    },
+    PrefixAliasSpec {
+        arg_id: "raw_visibility",
+        base: "raw-visibility",
+        min_len: 2,
+    },
+];
+
+const EXPLICIT_ALIASES: &[(&str, &[&str])] = &[
+    ("closure_phase", &["cp"]),
+    ("cor2bin", &["c2b"]),
+    ("delay_correct", &["delay", "delay-corr"]),
+    ("rate_correct", &["rate", "rate-corr"]),
+    ("acel_correct", &["acel", "acel-corr"]),
+    ("drange", &["delay-w", "delay-win"]),
+    ("rrange", &["rate-w", "rate-win"]),
+    ("in_beam", &["inbeam", "in-beam-vlbi"]),
+    ("dynamic_spectrum", &["ds", "dynamic"]),
+    ("bandpass", &["bp"]),
+    ("bandpass_table", &["bptable"]),
+    ("flagging", &["flag"]),
+    ("allan_deviance", &["allan", "allan-dev"]),
+    ("fringe_rate_map", &["frmap"]),
+    ("folding", &["fold"]),
+    ("multi_sideband", &["msb"]),
+];
+
+fn with_aliases(mut command: Command) -> Command {
+    for spec in PREFIX_ALIASES {
+        command = add_prefix_aliases(command, spec);
+    }
+    for (arg_id, aliases) in EXPLICIT_ALIASES {
+        command = command.mut_arg(*arg_id, |arg| arg.aliases(*aliases));
+    }
+    command
+}
+
+fn add_prefix_aliases(mut command: Command, spec: &PrefixAliasSpec) -> Command {
+    for end in spec.min_len..spec.base.len() {
+        if !spec.base.is_char_boundary(end) {
+            continue;
+        }
+        let alias = &spec.base[..end];
+        command = command.mut_arg(spec.arg_id, |arg| arg.alias(alias));
+    }
+    command
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -19,27 +144,27 @@ see https://opensource.org/license/mit"#
 )]
 pub struct Args {
     /// Path to the input .cor file
-    #[arg(long, aliases = ["in", "inp", "inpu"])]
+    #[arg(long)]
     pub input: Option<PathBuf>,
 
     /// Phase referencing: CAL TARGET [FIT_SPEC CAL_LEN TGT_LEN LOOP]
-    #[arg(long, num_args = 2..=6, value_names = ["CALIBRATOR", "TARGET", "FIT_SPEC", "CAL_LENGTH", "TGT_LENGTH", "LOOP"], aliases = ["ph", "pha", "phas", "phase","phase-r", "phase-re","phase-ref","phase-refe","phase-refer","phase-refere","phase-referen","phase-referenc"])]
+    #[arg(long, num_args = 2..=6, value_names = ["CALIBRATOR", "TARGET", "FIT_SPEC", "CAL_LENGTH", "TGT_LENGTH", "LOOP"])]
     pub phase_reference: Vec<String>,
 
     /// Compute closure phase from three baselines. Provide: FILE1 FILE2 FILE3 [refant:NAME].
-    #[arg(long = "closure-phase", aliases = ["cp"], num_args = 0.., value_name = "FILE|KEY:VALUE")]
+    #[arg(long = "closure-phase", num_args = 0.., value_name = "FILE|KEY:VALUE")]
     pub closure_phase: Option<Vec<String>>,
 
     /// Integration length in sectors (0 = whole file).
-    #[arg(long, aliases = ["le", "len", "leng", "lengt"], default_value_t = 0)]
+    #[arg(long, default_value_t = 0)]
     pub length: i32,
 
     /// Skip time in seconds from the start.
-    #[arg(long, aliases = ["sk", "ski"], default_value_t = 0)]
+    #[arg(long, default_value_t = 0)]
     pub skip: i32,
 
     /// Number of loops.
-    #[arg(long, aliases = ["lo", "loo"], default_value_t = 1)]
+    #[arg(long, default_value_t = 1)]
     pub loop_: i32,
 
     /// RFI ranges to exclude (e.g., "100,120"). Repeatable.
@@ -47,35 +172,35 @@ pub struct Args {
     pub rfi: Vec<String>,
 
     /// Generate plots.
-    #[arg(long, aliases = ["pl", "plo"])]
+    #[arg(long)]
     pub plot: bool,
 
     /// Use frequency-domain mode.
-    #[arg(long, aliases = ["fre", "freq", "frequ", "freque", "frequen", "frequenc"])]
+    #[arg(long)]
     pub frequency: bool,
 
     /// Output raw complex visibility to binary.
-    #[arg(long, aliases = ["c2b", "cor2b", "cor2bi"])]
+    #[arg(long)]
     pub cor2bin: bool,
 
     /// Output cross spectrum to binary.
-    #[arg(long, aliases = ["spec", "spect", "spectr", "spectru"])]
+    #[arg(long)]
     pub spectrum: bool,
 
     /// Output analysis results to .txt.
-    #[arg(long, aliases = ["ou", "out", "outp", "outpu"])]
+    #[arg(long)]
     pub output: bool,
 
     /// Delay correction value.
-    #[arg(long, aliases = ["delay","delay-corr"], default_value_t = 0.0, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub delay_correct: f32,
 
     /// Rate correction value.
-    #[arg(long, aliases = ["rate","rate-corr"], default_value_t = 0.0, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub rate_correct: f32,
 
     /// Acceleration correction value.
-    #[arg(long, aliases = ["acel","acel-corr"], default_value_t = 0.0, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub acel_correct: f32,
 
     /// Apply scan table corrections (CSV: start, integ, delay[samp], rate[Hz]).
@@ -83,15 +208,30 @@ pub struct Args {
     pub scan_correct: Option<PathBuf>,
 
     /// Delay range (min max).
-    #[arg(long = "drange", aliases = ["delay-w", "delay-win"], num_args = 2, value_name = "MIN MAX", allow_negative_numbers = true)]
+    #[arg(
+        long = "drange",
+        num_args = 2,
+        value_name = "MIN MAX",
+        allow_negative_numbers = true
+    )]
     pub drange: Vec<f32>,
 
     /// Rate range (min max).
-    #[arg(long = "rrange", aliases = ["rate-w", "rate-win"], num_args = 2, value_name = "MIN MAX", allow_negative_numbers = true)]
+    #[arg(
+        long = "rrange",
+        num_args = 2,
+        value_name = "MIN MAX",
+        allow_negative_numbers = true
+    )]
     pub rrange: Vec<f32>,
 
     /// Mask rectangle in time-domain delay/rate plane: DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX.
-    #[arg(long, num_args = 4, value_name = "DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX", allow_negative_numbers = true)]
+    #[arg(
+        long,
+        num_args = 4,
+        value_name = "DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX",
+        allow_negative_numbers = true
+    )]
     pub mask: Vec<f32>,
 
     /// Frequency range for --frequency plots/search.
@@ -99,15 +239,15 @@ pub struct Args {
     pub frange: Vec<f32>,
 
     /// Rate padding factor (1/2/4/8/16). Deep defaults to 4.
-    #[arg(long, aliases = ["rate-p", "rate-pa", "rate-pad", "rate-padd", "rate-paddi", "rate-paddin"], default_value_t = 1)]
+    #[arg(long, default_value_t = 1)]
     pub rate_padding: u32,
 
     /// Cumulate length in seconds (0=off).
-    #[arg(long, aliases = ["cu", "cum", "cumu", "cumul", "cumula", "cumulat"], default_value_t = 0)]
+    #[arg(long, default_value_t = 0)]
     pub cumulate: i32,
 
     /// Extra plots of amp/SNR/phase/noise vs time.
-    #[arg(long, aliases = ["add", "add-p", "add-pl", "add-plo"])]
+    #[arg(long)]
     pub add_plot: bool,
 
     /// Run WWZ on per-loop fringe-search results.
@@ -134,7 +274,7 @@ pub struct Args {
     pub search: Vec<String>,
 
     /// In-beam VLBI mode (standard delay-rate fringe search workflow).
-    #[arg(long = "in-beam", aliases = ["inbeam", "in-beam-vlbi"])]
+    #[arg(long = "in-beam")]
     pub in_beam: bool,
 
     /// Iterations for --search=peak/deep (deep default=4 when omitted).
@@ -142,11 +282,11 @@ pub struct Args {
     pub iter: u32,
 
     /// Plot dynamic spectrum.
-    #[arg(long, aliases = ["ds","dynamic"])]
+    #[arg(long)]
     pub dynamic_spectrum: bool,
 
     /// Bandpass calibration file.
-    #[arg(long, aliases = ["bp"])]
+    #[arg(long)]
     pub bandpass: Option<PathBuf>,
 
     /// Normalize cross-correlation by auto-correlation amplitudes.
@@ -154,7 +294,7 @@ pub struct Args {
     pub norm_acf: bool,
 
     /// Write bandpass-corrected spectrum to binary.
-    #[arg(long, aliases = ["bptable"])]
+    #[arg(long)]
     pub bandpass_table: bool,
 
     /// CPU cores for --search deep (0 = auto).
@@ -162,22 +302,22 @@ pub struct Args {
     pub cpu: u32,
 
     /// Flag data by time or pp ranges.
-    #[arg(long, num_args = 1.., value_name = "MODE [ARGS...]", aliases = ["flag"])]
+    #[arg(long, num_args = 1.., value_name = "MODE [ARGS...]")]
     pub flagging: Vec<String>,
 
     /// Plot Allan deviation (requires length/loop).
-    #[arg(long, aliases = ["allan","allan-dev"])]
+    #[arg(long)]
     pub allan_deviance: bool,
 
     /// Heatmaps of raw visibility (amp/phase).
-    #[arg(long, aliases = ["ra","raw","raw-v","raw-vi","raw-vis","raw-visi","raw-visib","raw-visibi","raw-visibils","raw-visibili","raw-visibilit"])]
+    #[arg(long)]
     pub raw_visibility: bool,
 
     /// UV coverage plot (0 planar, 1 3D).
     #[arg(long, num_args = 0..=1, default_missing_value = "1")]
     pub uv: Option<i32>,
 
-    #[arg(long, aliases = ["frmap"], num_args = 0.., value_name = "KEY[:VALUE]")]
+    #[arg(long, num_args = 0.., value_name = "KEY[:VALUE]")]
     pub fringe_rate_map: Option<Vec<String>>,
 
     /// Maser analysis (off:<path> / off:linear / off:quad; see --detail).
@@ -185,11 +325,11 @@ pub struct Args {
     pub maser: Vec<String>,
 
     /// Visibility-domain pulse folding (period/bins/on-duty).
-    #[arg(long, aliases = ["fold"], num_args = 1.., value_name = "KEY:VALUE")]
+    #[arg(long, num_args = 1.., value_name = "KEY:VALUE")]
     pub folding: Vec<String>,
 
     /// Multi-sideband inputs (see --detail).
-    #[arg(long, num_args = 6, value_names = ["C_COR", "C_BP", "C_DELAY", "X_COR", "X_BP", "X_DELAY"], aliases = ["msb"], allow_negative_numbers = true)]
+    #[arg(long, num_args = 6, value_names = ["C_COR", "C_BP", "C_DELAY", "X_COR", "X_BP", "X_DELAY"], allow_negative_numbers = true)]
     pub multi_sideband: Vec<String>,
 
     /// Plot antenna uptime (Az/El).
@@ -210,6 +350,10 @@ pub struct Args {
 }
 
 impl Args {
+    pub fn command_with_aliases() -> Command {
+        with_aliases(Self::command())
+    }
+
     pub fn primary_search_mode(&self) -> Option<&str> {
         self.search
             .iter()

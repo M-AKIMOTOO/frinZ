@@ -135,16 +135,12 @@ pub fn generate_output_names(
 pub fn format_delay_output(
     results: &AnalysisResults,
     label: &[&str],
-    args_length: i32,
+    _args_length: i32,
     rfi_display: &str,
     bandpass_applied: bool,
     norm_acf_applied: bool,
 ) -> String {
-    let display_length = if args_length != 0 {
-        args_length as f32
-    } else {
-        results.length_f32.ceil()
-    };
+    let display_length = results.length_f32;
     let label_segment = label.get(3).copied().unwrap_or("");
     format!(
         " {}   {:<5}  {:<10} {:<8.2} {:<3.6} {:>7.1} {:>+10.3}  {:>10.6}  {:>+9.8}   {:>+4.8}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
@@ -176,16 +172,12 @@ pub fn format_delay_output(
 pub fn format_freq_output(
     results: &AnalysisResults,
     label: &[&str],
-    args_length: i32,
+    _args_length: i32,
     rfi_display: &str,
     bandpass_applied: bool,
     norm_acf_applied: bool,
 ) -> String {
-    let display_length = if args_length != 0 {
-        args_length as f32
-    } else {
-        results.length_f32.ceil()
-    };
+    let display_length = results.length_f32;
     let label_segment = label.get(3).copied().unwrap_or("");
     format!(
         " {}   {:<5}  {:<10} {:<8.2} {:<8.6}  {:>7.1}   {:>+10.3} {:>+12.7} {:>10.6} {:>+10.6} {:>7.3} {:>7.3} {:>7.3}  {:>7.3} {:>7.3} {:>7.3} {:>12.5}   {:<15} {:<5} {:<5}",

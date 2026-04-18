@@ -56,8 +56,12 @@ fn in_mask_region(delay: f32, rate: f32, mask: Option<(f32, f32, f32, f32)>) -> 
     }
 }
 
+fn norm_at(data: &Array2<C32>, row: usize, col: usize) -> f32 {
+    data[[row, col]].norm()
+}
+
 fn refine_peak_3x3_quadratic(
-    surface: &Array2<f32>,
+    surface: &Array2<C32>,
     center_rate_idx: usize,
     center_delay_idx: usize,
     rate_range: &[f32],
@@ -96,15 +100,15 @@ fn refine_peak_3x3_quadratic(
         }
     }
 
-    let f00 = surface[[center_rate_idx, center_delay_idx]] as f64;
-    let f_xm = surface[[center_rate_idx, center_delay_idx - 1]] as f64;
-    let f_xp = surface[[center_rate_idx, center_delay_idx + 1]] as f64;
-    let f_ym = surface[[center_rate_idx - 1, center_delay_idx]] as f64;
-    let f_yp = surface[[center_rate_idx + 1, center_delay_idx]] as f64;
-    let f_pp = surface[[center_rate_idx + 1, center_delay_idx + 1]] as f64;
-    let f_pm = surface[[center_rate_idx + 1, center_delay_idx - 1]] as f64;
-    let f_mp = surface[[center_rate_idx - 1, center_delay_idx + 1]] as f64;
-    let f_mm = surface[[center_rate_idx - 1, center_delay_idx - 1]] as f64;
+    let f00 = norm_at(surface, center_rate_idx, center_delay_idx) as f64;
+    let f_xm = norm_at(surface, center_rate_idx, center_delay_idx - 1) as f64;
+    let f_xp = norm_at(surface, center_rate_idx, center_delay_idx + 1) as f64;
+    let f_ym = norm_at(surface, center_rate_idx - 1, center_delay_idx) as f64;
+    let f_yp = norm_at(surface, center_rate_idx + 1, center_delay_idx) as f64;
+    let f_pp = norm_at(surface, center_rate_idx + 1, center_delay_idx + 1) as f64;
+    let f_pm = norm_at(surface, center_rate_idx + 1, center_delay_idx - 1) as f64;
+    let f_mp = norm_at(surface, center_rate_idx - 1, center_delay_idx + 1) as f64;
+    let f_mm = norm_at(surface, center_rate_idx - 1, center_delay_idx - 1) as f64;
 
     let fx = 0.5 * (f_xp - f_xm);
     let fy = 0.5 * (f_yp - f_ym);
@@ -228,7 +232,6 @@ pub fn analyze_results(
     let rate_range = rate_cal(padding_length as f32, effective_integ_time);
 
     // --- Delay Analysis ---
-    let delay_rate_2d_data_array = delay_rate_array.clone().mapv(|x| x.norm());
     let delay_noise_raw = noise_level(delay_rate_array.view(), delay_rate_array.mean().unwrap());
     let delay_noise = sanitize_noise(delay_noise_raw);
     let delay_rate_mask = if args.frequency {
@@ -264,7 +267,7 @@ pub fn analyze_results(
                         if in_mask_region(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
                             continue;
                         }
-                        let current_val = delay_rate_2d_data_array[[r_idx, d_idx]];
+                        let current_val = norm_at(delay_rate_array, r_idx, d_idx);
                         if current_val > max_val_in_window {
                             max_val_in_window = current_val;
                             temp_peak_rate_idx = r_idx;
@@ -278,12 +281,12 @@ pub fn analyze_results(
     } else if search_mode == Some("peak") || search_mode == Some("deep") {
         // Case 2: --search or --search_deep is specified, no window. Find the global maximum.
         let (mut max_val, mut max_r_idx, mut max_d_idx) = (0.0f32, 0, 0);
-        for r_idx in 0..delay_rate_2d_data_array.shape()[0] {
-            for d_idx in 0..delay_rate_2d_data_array.shape()[1] {
+        for r_idx in 0..delay_rate_array.shape()[0] {
+            for d_idx in 0..delay_rate_array.shape()[1] {
                 if in_mask_region(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
                     continue;
                 }
-                let current_val = delay_rate_2d_data_array[[r_idx, d_idx]];
+                let current_val = norm_at(delay_rate_array, r_idx, d_idx);
                 if current_val > max_val {
                     max_val = current_val;
                     max_r_idx = r_idx;
@@ -293,13 +296,14 @@ pub fn analyze_results(
         }
         (max_r_idx, max_d_idx)
     } else if delay_rate_mask.is_some() {
-        let (mut max_val, mut max_r_idx, mut max_d_idx) = (0.0f32, padding_length_half, fft_point_half - 1);
-        for r_idx in 0..delay_rate_2d_data_array.shape()[0] {
-            for d_idx in 0..delay_rate_2d_data_array.shape()[1] {
+        let (mut max_val, mut max_r_idx, mut max_d_idx) =
+            (0.0f32, padding_length_half, fft_point_half - 1);
+        for r_idx in 0..delay_rate_array.shape()[0] {
+            for d_idx in 0..delay_rate_array.shape()[1] {
                 if in_mask_region(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
                     continue;
                 }
-                let current_val = delay_rate_2d_data_array[[r_idx, d_idx]];
+                let current_val = norm_at(delay_rate_array, r_idx, d_idx);
                 if current_val > max_val {
                     max_val = current_val;
                     max_r_idx = r_idx;
@@ -313,12 +317,15 @@ pub fn analyze_results(
         (padding_length_half, fft_point_half - 1)
     };
 
-    let delay_max_amp = delay_rate_2d_data_array[[peak_rate_idx, peak_delay_idx]];
+    let delay_max_amp = norm_at(delay_rate_array, peak_rate_idx, peak_delay_idx);
     let delay_phase = safe_arg(&delay_rate_array[[peak_rate_idx, peak_delay_idx]]).to_degrees();
-    let delay_rate_slice = delay_rate_2d_data_array.column(peak_delay_idx).to_owned();
+    let delay_rate_slice = Array1::from_iter(
+        (0..delay_rate_array.shape()[0])
+            .map(|r_idx| norm_at(delay_rate_array, r_idx, peak_delay_idx)),
+    );
     let refined_peak_3x3 = if search_mode == Some("peak") && !args.frequency {
         refine_peak_3x3_quadratic(
-            &delay_rate_2d_data_array,
+            delay_rate_array,
             peak_rate_idx,
             peak_delay_idx,
             &rate_range,
@@ -352,7 +359,7 @@ pub fn analyze_results(
                         && !in_mask_region(delay_val, rate_range[peak_rate_idx], delay_rate_mask)
                     {
                         x_coords.push(delay_val as f64);
-                        y_values.push(delay_rate_2d_data_array[[peak_rate_idx, d_idx]] as f64);
+                        y_values.push(norm_at(delay_rate_array, peak_rate_idx, d_idx) as f64);
                     }
                 }
             }
@@ -369,13 +376,15 @@ pub fn analyze_results(
     }
 
     let delay_snr = delay_max_amp / delay_noise;
-    let visibility = delay_rate_2d_data_array.row(peak_rate_idx).to_owned();
+    let visibility = Array1::from_iter(
+        (0..delay_rate_array.shape()[1])
+            .map(|d_idx| norm_at(delay_rate_array, peak_rate_idx, d_idx)),
+    );
 
     let mut residual_rate_val: f32;
     let mut rate_offset = 0.0;
 
     // --- Frequency Analysis ---
-    let freq_rate_2d_data_array = freq_rate_array.clone().mapv(|x| x.norm());
 
     let (peak_freq_row_idx, peak_rate_col_idx) =
         if !args.rrange.is_empty() || !args.frange.is_empty() {
@@ -402,7 +411,7 @@ pub fn analyze_results(
                         if freq_mhz < freq_win_low || freq_mhz > freq_win_high {
                             continue;
                         }
-                        let current_val = freq_rate_2d_data_array[[f_idx, r_idx]];
+                        let current_val = norm_at(freq_rate_array, f_idx, r_idx);
                         if current_val > max_val_in_window {
                             max_val_in_window = current_val;
                             temp_peak_freq_row_idx = f_idx;
@@ -420,13 +429,13 @@ pub fn analyze_results(
             } else {
                 (freq_range[0], *freq_range.last().unwrap_or(&freq_range[0]))
             };
-            for f_idx in 0..freq_rate_2d_data_array.shape()[0] {
+            for f_idx in 0..freq_rate_array.shape()[0] {
                 let freq_mhz = freq_range[f_idx];
                 if freq_mhz < freq_win_low || freq_mhz > freq_win_high {
                     continue;
                 }
-                for r_idx in 0..freq_rate_2d_data_array.shape()[1] {
-                    let current_val = freq_rate_2d_data_array[[f_idx, r_idx]];
+                for r_idx in 0..freq_rate_array.shape()[1] {
+                    let current_val = norm_at(freq_rate_array, f_idx, r_idx);
                     if current_val > max_val {
                         max_val = current_val;
                         max_f_idx = f_idx;
@@ -437,21 +446,19 @@ pub fn analyze_results(
             (max_f_idx, max_r_idx)
         } else {
             // Case 1: No window and no --search. Use the center point (rate=0) and find max frequency.
-            let cross_power_slice = freq_rate_2d_data_array.column(padding_length_half);
-            let (max_f_idx, _) = cross_power_slice.iter().enumerate().fold(
-                (0, 0.0f32),
-                |(i_max, v_max), (i, &v)| {
+            let (max_f_idx, _) =
+                (0..freq_rate_array.shape()[0]).fold((0, 0.0f32), |(i_max, v_max), i| {
+                    let v = norm_at(freq_rate_array, i, padding_length_half);
                     if v > v_max {
                         (i, v)
                     } else {
                         (i_max, v_max)
                     }
-                },
-            );
+                });
             (max_f_idx, padding_length_half)
         };
 
-    let freq_max_amp = freq_rate_2d_data_array[[peak_freq_row_idx, peak_rate_col_idx]];
+    let freq_max_amp = norm_at(freq_rate_array, peak_freq_row_idx, peak_rate_col_idx);
     let freq_phase =
         safe_arg(&freq_rate_array[[peak_freq_row_idx, peak_rate_col_idx]]).to_degrees();
     let mut freq_freq = freq_range[peak_freq_row_idx];
@@ -460,23 +467,28 @@ pub fn analyze_results(
     let peak_rate_hz = rate_range[peak_rate_col_idx];
     let noise_rate_threshold = 0.1; // Hz
 
-    let mut noise_complex_values = Vec::new();
+    let mut noise_sum = C32::new(0.0, 0.0);
+    let mut noise_count = 0usize;
     for (r_idx, &rate_val) in rate_range.iter().enumerate() {
         if (rate_val - peak_rate_hz).abs() > noise_rate_threshold {
             for f_idx in 0..freq_rate_array.shape()[0] {
-                noise_complex_values.push(freq_rate_array[[f_idx, r_idx]]);
+                noise_sum += freq_rate_array[[f_idx, r_idx]];
+                noise_count += 1;
             }
         }
     }
 
-    let freq_noise_raw = if !noise_complex_values.is_empty() {
-        let noise_sum: C32 = noise_complex_values.iter().sum();
-        let noise_mean: C32 = noise_sum / (noise_complex_values.len() as f32);
-        let noise_abs_dev_sum: f32 = noise_complex_values
-            .iter()
-            .map(|c| (c - noise_mean).norm())
-            .sum();
-        noise_abs_dev_sum / noise_complex_values.len() as f32
+    let freq_noise_raw = if noise_count > 0 {
+        let noise_mean = noise_sum / noise_count as f32;
+        let mut noise_abs_dev_sum = 0.0f32;
+        for (r_idx, &rate_val) in rate_range.iter().enumerate() {
+            if (rate_val - peak_rate_hz).abs() > noise_rate_threshold {
+                for f_idx in 0..freq_rate_array.shape()[0] {
+                    noise_abs_dev_sum += (freq_rate_array[[f_idx, r_idx]] - noise_mean).norm();
+                }
+            }
+        }
+        noise_abs_dev_sum / noise_count as f32
     } else {
         // Fallback to old method if no noise region is found
         eprintln!("Warning: Could not find noise region for frequency SNR calculation. Falling back to old method.");
@@ -490,9 +502,9 @@ pub fn analyze_results(
             let mid_idx = center_idx as usize;
             let right_idx = (center_idx + 1) as usize;
 
-            let y_left = freq_rate_2d_data_array[[left_idx, peak_rate_col_idx]] as f64;
-            let y_mid = freq_rate_2d_data_array[[mid_idx, peak_rate_col_idx]] as f64;
-            let y_right = freq_rate_2d_data_array[[right_idx, peak_rate_col_idx]] as f64;
+            let y_left = norm_at(freq_rate_array, left_idx, peak_rate_col_idx) as f64;
+            let y_mid = norm_at(freq_rate_array, mid_idx, peak_rate_col_idx) as f64;
+            let y_right = norm_at(freq_rate_array, right_idx, peak_rate_col_idx) as f64;
 
             let is_local_max = y_mid.is_finite()
                 && y_left.is_finite()
@@ -524,7 +536,10 @@ pub fn analyze_results(
 
     let freq_noise = sanitize_noise(freq_noise_raw);
     let freq_snr = freq_max_amp / freq_noise;
-    let freq_rate = freq_rate_2d_data_array.row(peak_freq_row_idx).to_owned();
+    let freq_rate = Array1::from_iter(
+        (0..freq_rate_array.shape()[1])
+            .map(|r_idx| norm_at(freq_rate_array, peak_freq_row_idx, r_idx)),
+    );
     let freq_rate_spectrum = freq_rate_array.column(peak_rate_col_idx).to_owned();
 
     // Set the final residual_rate_val based on the mode
@@ -551,7 +566,7 @@ pub fn analyze_results(
                     let rate_val = rate_range[r_idx];
                     if in_window(rate_val, rate_bounds) {
                         x_coords.push(rate_val as f64);
-                        y_values.push(freq_rate_2d_data_array[[peak_freq_row_idx, r_idx]] as f64);
+                        y_values.push(norm_at(freq_rate_array, peak_freq_row_idx, r_idx) as f64);
                     }
                 }
             }

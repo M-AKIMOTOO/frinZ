@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use image::GenericImageView;
 use num_complex::Complex;
-use std::fs::File;
 use std::fs;
+use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
 use std::path::{Path, PathBuf};

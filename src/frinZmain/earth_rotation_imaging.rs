@@ -4,7 +4,7 @@
 
 use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
-use crate::fft::apply_phase_correction;
+use crate::fft::apply_phase_correction_in_place;
 use crate::header::{parse_header, CorHeader};
 use crate::processing::run_analysis_pipeline;
 use crate::read::read_visibility_data;
@@ -980,12 +980,8 @@ fn collect_visibilities_from_cor(
 
     let pp = header.number_of_sector;
     let mut length = if args.length == 0 { pp } else { args.length };
-
-    let total_obs_time_seconds = pp as f32 * effective_integ_time;
-    if args.length != 0 && args.length as f32 > total_obs_time_seconds {
-        length = (total_obs_time_seconds / effective_integ_time).ceil() as i32;
-    } else if args.length != 0 {
-        length = (args.length as f32 / effective_integ_time).ceil() as i32;
+    if args.length != 0 && args.length > pp {
+        length = pp;
     }
 
     if length <= 0 {
@@ -1127,8 +1123,10 @@ fn collect_visibilities_from_cor(
 
         let start_time_offset_sec = 0.0;
 
-        let corrected = apply_phase_correction(
-            &reshape_to_complex64_matrix(&complex_vec, fft_point_half_used),
+        let mut corrected = complex_vec.clone();
+        apply_phase_correction_in_place(
+            &mut corrected,
+            fft_point_half_used,
             correction.rate,
             correction.delay,
             correction.acel,
@@ -1138,7 +1136,7 @@ fn collect_visibilities_from_cor(
             start_time_offset_sec,
         );
 
-        let averaged = average_complex_matrix(&corrected);
+        let averaged = average_complex_slice(&corrected);
         let amplitude = averaged.norm();
         if amplitude < 1e-10 {
             continue;
@@ -1336,30 +1334,15 @@ fn determine_segment_correction(
     }
 }
 
-fn reshape_to_complex64_matrix(data: &[C32], columns: usize) -> Vec<Vec<Complex<f64>>> {
-    data.chunks(columns)
-        .map(|chunk| {
-            chunk
-                .iter()
-                .map(|&c| Complex::new(c.re as f64, c.im as f64))
-                .collect()
-        })
-        .collect()
-}
-
-fn average_complex_matrix(matrix: &[Vec<Complex<f64>>]) -> Complex<f64> {
+fn average_complex_slice(data: &[C32]) -> Complex<f64> {
     let mut sum = Complex::new(0.0, 0.0);
-    let mut count = 0usize;
-    for row in matrix {
-        for value in row {
-            sum += *value;
-            count += 1;
-        }
+    for value in data {
+        sum += Complex::new(value.re as f64, value.im as f64);
     }
-    if count == 0 {
+    if data.is_empty() {
         Complex::new(0.0, 0.0)
     } else {
-        sum / count as f64
+        sum / data.len() as f64
     }
 }
 

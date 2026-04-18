@@ -7,6 +7,7 @@ use crate::plot::{write_add_plot_outputs, write_cumulate_outputs};
 use crate::processing::process_cor_file;
 use crate::search::run_acel_search_analysis;
 use crate::utils;
+use crate::wwz::write_wwz_outputs;
 use chrono::{DateTime, Utc};
 use std::error::Error;
 use std::io;
@@ -62,6 +63,7 @@ pub fn run_inbeam_vlbi_analysis(
     let inbeam_dir = parent_dir.join("frinZ").join("inbeamVLBI");
     write_cumulate_outputs(args, &result, &inbeam_dir)?;
     let base_filename = write_add_plot_outputs(args, &result, &inbeam_dir)?;
+    write_wwz_outputs(args, &result, &inbeam_dir)?;
 
     if args.allan_deviance {
         utils::write_allan_deviation_outputs(

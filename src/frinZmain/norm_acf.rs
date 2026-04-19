@@ -3,12 +3,16 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use byteorder::{LittleEndian, ReadBytesExt};
+use chrono::{DateTime, TimeZone, Utc};
 use memmap2::Mmap;
 use num_complex::Complex;
 
 use crate::header::{parse_header, CorHeader};
-use crate::read::read_visibility_data;
+use crate::read::{
+    calculate_sector_range, normalize_effective_integration_time, EFFECTIVE_INTEG_TIME_OFFSET,
+    FILE_HEADER_SIZE, SECTOR_HEADER_SIZE,
+};
 
 type C32 = Complex<f32>;
 
@@ -51,22 +55,10 @@ impl NormAcfContext {
         is_cumulate: bool,
         pp_flag_ranges: &[(u32, u32)],
     ) -> Result<(), Box<dyn Error>> {
-        let (left_vis, left_obs_time, left_integ_time) = read_norm_data(
-            &self.left,
-            length,
-            skip,
-            loop_index,
-            is_cumulate,
-            pp_flag_ranges,
-        )?;
-        let (right_vis, right_obs_time, right_integ_time) = read_norm_data(
-            &self.right,
-            length,
-            skip,
-            loop_index,
-            is_cumulate,
-            pp_flag_ranges,
-        )?;
+        let (left_obs_time, left_integ_time) =
+            read_norm_timing(&self.left, length, skip, loop_index, is_cumulate)?;
+        let (right_obs_time, right_integ_time) =
+            read_norm_timing(&self.right, length, skip, loop_index, is_cumulate)?;
 
         validate_loop_timing(
             cross_obs_time,
@@ -83,32 +75,30 @@ impl NormAcfContext {
             self.right.path.as_path(),
         )?;
 
-        if left_vis.len() != cross_vis.len() || right_vis.len() != cross_vis.len() {
+        let expected_len =
+            norm_sample_count(&self.left.header, length, skip, loop_index, is_cumulate)?;
+        let right_expected_len =
+            norm_sample_count(&self.right.header, length, skip, loop_index, is_cumulate)?;
+        if expected_len != cross_vis.len() || right_expected_len != cross_vis.len() {
             return Err(format!(
                 "Error: autocorrelation data length mismatch (cross={}, auto1={}, auto2={}).",
                 cross_vis.len(),
-                left_vis.len(),
-                right_vis.len()
+                expected_len,
+                right_expected_len
             )
             .into());
         }
 
-        for ((cross, auto1), auto2) in cross_vis
-            .iter_mut()
-            .zip(left_vis.iter())
-            .zip(right_vis.iter())
-        {
-            let norm1 = auto1.norm();
-            let norm2 = auto2.norm();
-            let scale = (norm1 * norm2).sqrt();
-            if scale.is_finite() && scale > 0.0 {
-                *cross /= scale;
-            } else {
-                *cross = C32::new(0.0, 0.0);
-            }
-        }
-
-        Ok(())
+        normalize_from_auto_streams(
+            cross_vis,
+            &self.left,
+            &self.right,
+            length,
+            skip,
+            loop_index,
+            is_cumulate,
+            pp_flag_ranges,
+        )
     }
 
     pub fn path_pair(&self) -> (&Path, &Path) {
@@ -116,24 +106,103 @@ impl NormAcfContext {
     }
 }
 
-fn read_norm_data(
+fn norm_sample_count(
+    header: &CorHeader,
+    length: i32,
+    skip: i32,
+    loop_index: i32,
+    is_cumulate: bool,
+) -> Result<usize, Box<dyn Error>> {
+    let (start, end) = calculate_sector_range(header, length, skip, loop_index, is_cumulate);
+    if start >= end {
+        return Err("skip/length の指定が利用可能なセクター数を超えています".into());
+    }
+    Ok((end - start) as usize * (header.fft_point / 2) as usize)
+}
+
+fn read_norm_timing(
     auto: &AutoCorFile,
     length: i32,
     skip: i32,
     loop_index: i32,
     is_cumulate: bool,
-    pp_flag_ranges: &[(u32, u32)],
-) -> Result<(Vec<C32>, chrono::DateTime<chrono::Utc>, f32), Box<dyn Error>> {
+) -> Result<(chrono::DateTime<chrono::Utc>, f32), Box<dyn Error>> {
+    let sector_size = (8 + auto.header.fft_point / 4) * 16;
+    let (start, end) = calculate_sector_range(&auto.header, length, skip, loop_index, is_cumulate);
+    if start >= end {
+        return Err("skip/length の指定が利用可能なセクター数を超えています".into());
+    }
+
     let mut cursor = Cursor::new(&auto.mmap[..]);
-    Ok(read_visibility_data(
-        &mut cursor,
-        &auto.header,
-        length,
-        skip,
-        loop_index,
-        is_cumulate,
-        pp_flag_ranges,
-    )?)
+    let sector_start_pos = FILE_HEADER_SIZE + start as u64 * sector_size as u64;
+    cursor.set_position(sector_start_pos);
+    let correlation_time_sec = cursor.read_i32::<LittleEndian>()?;
+    let obs_time = chrono::Utc
+        .timestamp_opt(correlation_time_sec as i64, 0)
+        .single()
+        .ok_or_else(|| format!("Invalid timestamp seconds: {}", correlation_time_sec))?;
+
+    cursor.set_position(sector_start_pos + EFFECTIVE_INTEG_TIME_OFFSET);
+    let effective_integ_time =
+        normalize_effective_integration_time(cursor.read_f32::<LittleEndian>()?);
+
+    Ok((obs_time, effective_integ_time))
+}
+
+fn normalize_from_auto_streams(
+    cross_vis: &mut [C32],
+    left: &AutoCorFile,
+    right: &AutoCorFile,
+    length: i32,
+    skip: i32,
+    loop_index: i32,
+    is_cumulate: bool,
+    pp_flag_ranges: &[(u32, u32)],
+) -> Result<(), Box<dyn Error>> {
+    let fft_point_half = (left.header.fft_point / 2) as usize;
+    let left_sector_size = (8 + left.header.fft_point / 4) * 16;
+    let right_sector_size = (8 + right.header.fft_point / 4) * 16;
+    let (start, end) = calculate_sector_range(&left.header, length, skip, loop_index, is_cumulate);
+
+    let mut left_cursor = Cursor::new(&left.mmap[..]);
+    let mut right_cursor = Cursor::new(&right.mmap[..]);
+    let mut sample_idx = 0usize;
+
+    for sector in start..end {
+        let left_sector_start = FILE_HEADER_SIZE + sector as u64 * left_sector_size as u64;
+        let right_sector_start = FILE_HEADER_SIZE + sector as u64 * right_sector_size as u64;
+        left_cursor.set_position(left_sector_start + SECTOR_HEADER_SIZE);
+        right_cursor.set_position(right_sector_start + SECTOR_HEADER_SIZE);
+
+        let is_pp_flagged = pp_flag_ranges.iter().any(|(flag_start, flag_end)| {
+            sector as u32 >= *flag_start && sector as u32 <= *flag_end
+        });
+
+        for _ in 0..fft_point_half {
+            let auto1 = C32::new(
+                left_cursor.read_f32::<LittleEndian>()?,
+                left_cursor.read_f32::<LittleEndian>()?,
+            );
+            let auto2 = C32::new(
+                right_cursor.read_f32::<LittleEndian>()?,
+                right_cursor.read_f32::<LittleEndian>()?,
+            );
+
+            if is_pp_flagged {
+                cross_vis[sample_idx] = C32::new(0.0, 0.0);
+            } else {
+                let scale = (auto1.norm() * auto2.norm()).sqrt();
+                if scale.is_finite() && scale > 0.0 {
+                    cross_vis[sample_idx] /= scale;
+                } else {
+                    cross_vis[sample_idx] = C32::new(0.0, 0.0);
+                }
+            }
+            sample_idx += 1;
+        }
+    }
+
+    Ok(())
 }
 
 fn load_auto_cor_file(path: &Path) -> Result<AutoCorFile, Box<dyn Error>> {

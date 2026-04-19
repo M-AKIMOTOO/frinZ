@@ -13,10 +13,6 @@ name = "gfrinZ"
 path = "../src/gfrinZmain/main.rs"
 
 [[bin]]
-name = "corshow"
-path = "../src/corshow/main.rs"
-
-[[bin]]
 name = "bandscythe"
 path = "../src/bandscythe/main.rs"
 

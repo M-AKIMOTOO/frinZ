@@ -14,7 +14,9 @@ use crate::args::Args;
 use crate::bandpass::{
     apply_bandpass_correction, read_bandpass_file, write_complex_spectrum_binary,
 };
-use crate::fft::{self, process_fft, process_ifft};
+use crate::fft::{
+    perform_ifft_on_vec, process_fft, process_fft_with_phase_correction, process_ifft,
+};
 use crate::header::{parse_header, CorHeader};
 use crate::norm_acf::NormAcfContext;
 use crate::output::{
@@ -26,7 +28,9 @@ use crate::plot::{
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
-use crate::utils::{parse_flag_time, safe_arg};
+use crate::utils::{
+    delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg, window_bounds,
+};
 use memmap2::Mmap;
 
 type C32 = Complex<f32>;
@@ -138,28 +142,6 @@ fn resolve_delay_rate(
         }
     }
     (base_delay, base_rate)
-}
-
-fn delay_rate_mask_bounds(mask: &[f32]) -> Option<(f32, f32, f32, f32)> {
-    if mask.len() == 4 {
-        Some((
-            mask[0].min(mask[1]),
-            mask[0].max(mask[1]),
-            mask[2].min(mask[3]),
-            mask[2].max(mask[3]),
-        ))
-    } else {
-        None
-    }
-}
-
-fn in_delay_rate_mask(delay: f32, rate: f32, mask: Option<(f32, f32, f32, f32)>) -> bool {
-    match mask {
-        Some((delay_min, delay_max, rate_min, rate_max)) => {
-            delay >= delay_min && delay <= delay_max && rate >= rate_min && rate <= rate_max
-        }
-        None => false,
-    }
 }
 
 fn rebin_complex_rows(
@@ -848,8 +830,7 @@ pub fn process_cor_file(
             let mut lag_data = Array::zeros((usable_rows, effective_fft_point as usize));
             let fft_point_usize = effective_fft_point as usize;
             for (i, row) in spectrum_array.rows().into_iter().enumerate() {
-                let shifted_out =
-                    fft::perform_ifft_on_vec(row.as_slice().unwrap(), fft_point_usize);
+                let shifted_out = perform_ifft_on_vec(row.as_slice().unwrap(), fft_point_usize);
                 for (j, val) in shifted_out.iter().enumerate() {
                     lag_data[[i, j]] = val.norm();
                 }
@@ -1325,6 +1306,9 @@ pub fn process_cor_file(
                         args.in_beam,
                     )?;
                 } else {
+                    let freq_rate_array = freq_rate_array.as_ref().ok_or(
+                        "--frequency が指定されているのに freq_rate_array が保持されていません",
+                    )?;
                     let freq_amp_profile: Vec<(f64, f64)> = analysis_results
                         .freq_range
                         .iter()
@@ -1520,14 +1504,6 @@ pub fn process_cor_file(
     })
 }
 
-fn window_bounds(window: &[f32]) -> Option<(f32, f32)> {
-    if window.len() == 2 {
-        Some((window[0].min(window[1]), window[0].max(window[1])))
-    } else {
-        None
-    }
-}
-
 pub(crate) fn run_analysis_pipeline(
     complex_vec: &[C32],
     header: &CorHeader,
@@ -1547,7 +1523,7 @@ pub(crate) fn run_analysis_pipeline(
 ) -> Result<
     (
         AnalysisResults,
-        Array2<C32>,
+        Option<Array2<C32>>,
         Array2<C32>,
         Option<AnalysisResults>,
     ),
@@ -1622,36 +1598,31 @@ pub(crate) fn run_analysis_pipeline(
             .num_seconds() as f32
     };
 
-    let corrected_complex_vec;
-    let fft_input = if delay_correct != 0.0 || rate_correct != 0.0 || acel_correct != 0.0 {
-        corrected_complex_vec = {
-            let mut corrected = complex_vec.to_vec();
-            fft::apply_phase_correction_in_place(
-                &mut corrected,
-                fft_point_half,
+    let (mut freq_rate_array, padding_length) =
+        if delay_correct != 0.0 || rate_correct != 0.0 || acel_correct != 0.0 {
+            process_fft_with_phase_correction(
+                complex_vec,
+                physical_length,
+                effective_fft_point,
+                header.sampling_speed,
+                rfi_ranges,
+                base_args.rate_padding,
                 rate_correct,
                 delay_correct,
                 acel_correct,
                 effective_integ_time,
-                header.sampling_speed as u32,
-                effective_fft_point as u32,
                 start_time_offset_sec,
-            );
-            corrected
+            )
+        } else {
+            process_fft(
+                complex_vec,
+                physical_length,
+                effective_fft_point,
+                header.sampling_speed,
+                rfi_ranges,
+                base_args.rate_padding,
+            )
         };
-        corrected_complex_vec.as_slice()
-    } else {
-        complex_vec
-    };
-
-    let (mut freq_rate_array, padding_length) = process_fft(
-        fft_input,
-        physical_length,
-        effective_fft_point,
-        header.sampling_speed,
-        rfi_ranges,
-        base_args.rate_padding,
-    );
 
     let pre_bandpass_analysis_results = if bandpass_data.is_some() {
         let pre_bandpass_delay_rate_2d_data_comp =
@@ -1692,7 +1663,7 @@ pub(crate) fn run_analysis_pipeline(
 
     Ok((
         analysis_results,
-        freq_rate_array,
+        base_args.frequency.then_some(freq_rate_array),
         delay_rate_2d_data_comp,
         pre_bandpass_analysis_results,
     ))

@@ -8,7 +8,7 @@ use crate::header::{parse_header, CorHeader};
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::run_analysis_pipeline;
-use crate::read::{read_sector_header, read_visibility_data};
+use crate::read::{normalize_effective_integration_time, read_sector_header, read_visibility_data};
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
 use chrono::{DateTime, Utc};
@@ -123,23 +123,6 @@ impl ValueFormatter<f64> for PhaseAxis {
     fn format(value: &f64) -> String {
         format!("{:>4.0}", value.round())
     }
-}
-
-fn normalize_effective_integration_time(value: f32) -> f32 {
-    if !value.is_finite() || value <= 0.0 {
-        return 1.0;
-    }
-    if (value - 1.0).abs() <= 0.1 {
-        return 1.0;
-    }
-    let mut a = 0.1f32;
-    while a >= 0.000001 {
-        if value >= a * 0.9 && value <= a * 1.1 {
-            return a;
-        }
-        a /= 10.0;
-    }
-    value
 }
 
 fn peek_effective_integ_time(path: &Path, header: &CorHeader) -> Result<f32, Box<dyn Error>> {

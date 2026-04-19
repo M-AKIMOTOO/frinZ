@@ -88,7 +88,6 @@
 [サブコマンド用バイナリ]
   gfrinZ          低レベルフリンジ処理/JSONL 出力（--help 参照）
   cormerge        複数 cor の結合
-  corshow         cor の可視化/エクスポート
   bandscythe      バンドスライス処理
   pulsar_gating   パルサーゲーティング
 

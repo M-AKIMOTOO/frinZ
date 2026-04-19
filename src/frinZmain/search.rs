@@ -544,8 +544,10 @@ mod deep {
     use crate::analysis::{analyze_results, AnalysisResults};
     use crate::args::Args;
     use crate::bandpass::apply_bandpass_correction;
-    use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
+    use crate::fft::{process_fft, process_fft_with_phase_correction, process_ifft};
     use crate::header::CorHeader;
+    use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, positive_or_epsilon, rate_cal};
+    use rustfft::FftPlanner;
 
     type C32 = Complex<f32>;
 
@@ -577,9 +579,189 @@ mod deep {
     #[derive(Debug, Clone)]
     pub struct DeepSearchResult {
         pub analysis_results: AnalysisResults,
-        pub freq_rate_array: Array2<C32>,
+        pub freq_rate_array: Option<Array2<C32>>,
         pub delay_rate_2d_data: Array2<C32>,
         pub pre_bandpass_analysis_results: Option<AnalysisResults>,
+    }
+
+    struct DeepSearchContext<'a> {
+        complex_vec: &'a [C32],
+        header: &'a CorHeader,
+        current_length: i32,
+        physical_length: i32,
+        effective_integ_time: f32,
+        current_obs_time: &'a DateTime<Utc>,
+        rfi_ranges: &'a [(usize, usize)],
+        bandpass_data: &'a Option<Vec<C32>>,
+        args: &'a Args,
+        start_time_offset_sec: f32,
+        effective_fft_point: i32,
+    }
+
+    impl<'a> DeepSearchContext<'a> {
+        fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
+            if rate == 0.0 && delay == 0.0 && self.args.acel_correct == 0.0 {
+                process_fft(
+                    self.complex_vec,
+                    self.physical_length,
+                    self.effective_fft_point,
+                    self.header.sampling_speed,
+                    self.rfi_ranges,
+                    self.args.rate_padding,
+                )
+            } else {
+                process_fft_with_phase_correction(
+                    self.complex_vec,
+                    self.physical_length,
+                    self.effective_fft_point,
+                    self.header.sampling_speed,
+                    self.rfi_ranges,
+                    self.args.rate_padding,
+                    rate,
+                    delay,
+                    self.args.acel_correct,
+                    self.effective_integ_time,
+                    self.start_time_offset_sec,
+                )
+            }
+        }
+
+        fn apply_bandpass(&self, freq_rate_array: &mut Array2<C32>) {
+            if let Some(bp_data) = self.bandpass_data {
+                apply_bandpass_correction(freq_rate_array, bp_data);
+            }
+        }
+
+        fn coarse_estimates(&self) -> Result<(f32, f32), Box<dyn Error>> {
+            // drange/rrange が指定されている場合は、その範囲で探索
+            if !self.args.drange.is_empty() || !self.args.rrange.is_empty() {
+                println!("[DEEP SEARCH] Using specified delay/rate windows for coarse estimation");
+                let search_args = self.args;
+                let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
+                self.apply_bandpass(&mut freq_rate_array);
+                let delay_rate_2d_data_comp =
+                    process_ifft(&freq_rate_array, self.effective_fft_point, padding_length);
+                let analysis_results = analyze_results(
+                    &freq_rate_array,
+                    &delay_rate_2d_data_comp,
+                    self.header,
+                    self.current_length,
+                    self.effective_integ_time,
+                    self.current_obs_time,
+                    padding_length,
+                    search_args,
+                    search_args.primary_search_mode(),
+                );
+                Ok((
+                    analysis_results.residual_delay,
+                    analysis_results.residual_rate,
+                ))
+            } else {
+                println!("[DEEP SEARCH] No windows specified, running coarse search (no fitting) for initial estimates");
+                let mut search_args = self.args.clone();
+                search_args.search = vec!["deep".to_string()];
+                let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
+                self.apply_bandpass(&mut freq_rate_array);
+                let delay_rate_2d_data_comp =
+                    process_ifft(&freq_rate_array, self.effective_fft_point, padding_length);
+                let analysis_results = analyze_results(
+                    &freq_rate_array,
+                    &delay_rate_2d_data_comp,
+                    self.header,
+                    self.current_length,
+                    self.effective_integ_time,
+                    self.current_obs_time,
+                    padding_length,
+                    &search_args,
+                    search_args.primary_search_mode(),
+                );
+                Ok((
+                    analysis_results.residual_delay,
+                    analysis_results.residual_rate,
+                ))
+            }
+        }
+
+        fn evaluate_candidate_snr(&self, delay: f32, rate: f32) -> f32 {
+            let (mut freq_rate_array, padding_length) = self.fft_for_correction(delay, rate);
+            self.apply_bandpass(&mut freq_rate_array);
+            let temp_args = create_corrected_args(self.args, delay, rate);
+            evaluate_delay_snr_streaming(
+                &freq_rate_array,
+                self.effective_integ_time,
+                padding_length,
+                self.effective_fft_point,
+                &temp_args,
+            )
+        }
+
+        fn final_analysis(
+            &self,
+            final_delay: f32,
+            final_rate: f32,
+        ) -> Result<
+            (
+                AnalysisResults,
+                Option<Array2<C32>>,
+                Array2<C32>,
+                Option<AnalysisResults>,
+            ),
+            Box<dyn Error>,
+        > {
+            let (mut final_freq_rate_array, padding_length) =
+                self.fft_for_correction(final_delay, final_rate);
+            let final_args = create_corrected_args(self.args, final_delay, final_rate);
+
+            let pre_bandpass_analysis_results = if self.bandpass_data.is_some() {
+                let pre_bandpass_delay_rate_2d_data_comp = process_ifft(
+                    &final_freq_rate_array,
+                    self.effective_fft_point,
+                    padding_length,
+                );
+                Some(analyze_results(
+                    &final_freq_rate_array,
+                    &pre_bandpass_delay_rate_2d_data_comp,
+                    self.header,
+                    self.current_length,
+                    self.effective_integ_time,
+                    self.current_obs_time,
+                    padding_length,
+                    &final_args,
+                    Some("deep"),
+                ))
+            } else {
+                None
+            };
+
+            self.apply_bandpass(&mut final_freq_rate_array);
+            let final_delay_rate_2d_data_comp = process_ifft(
+                &final_freq_rate_array,
+                self.effective_fft_point,
+                padding_length,
+            );
+            let mut analysis_results = analyze_results(
+                &final_freq_rate_array,
+                &final_delay_rate_2d_data_comp,
+                self.header,
+                self.current_length,
+                self.effective_integ_time,
+                self.current_obs_time,
+                padding_length,
+                &final_args,
+                Some("deep"),
+            );
+
+            analysis_results.residual_delay = final_delay;
+            analysis_results.residual_rate = final_rate;
+            analysis_results.length_f32 = self.physical_length as f32 * self.effective_integ_time;
+
+            Ok((
+                analysis_results,
+                self.args.frequency.then_some(final_freq_rate_array),
+                final_delay_rate_2d_data_comp,
+                pre_bandpass_analysis_results,
+            ))
+        }
     }
 
     /// Deep searchメイン関数
@@ -623,6 +805,19 @@ mod deep {
             return Err("FFT チャンネル数が 0 です".into());
         }
         let effective_fft_point = (fft_point_half * 2) as i32;
+        let context = DeepSearchContext {
+            complex_vec,
+            header,
+            current_length,
+            physical_length,
+            effective_integ_time,
+            current_obs_time,
+            rfi_ranges,
+            bandpass_data,
+            args,
+            start_time_offset_sec,
+            effective_fft_point,
+        };
 
         // Step 1: 粗い遅延・レート推定
         let (coarse_delay, coarse_rate) = if let Some((prev_delay, prev_rate)) = previous_solution {
@@ -633,18 +828,7 @@ mod deep {
             (prev_delay, prev_rate)
         } else {
             println!("[DEEP SEARCH] Running coarse grid search for initial estimate");
-            get_coarse_estimates(
-                complex_vec,
-                header,
-                current_length,
-                physical_length,
-                effective_integ_time,
-                current_obs_time,
-                rfi_ranges,
-                bandpass_data,
-                args,
-                effective_fft_point,
-            )?
+            context.coarse_estimates()?
         };
 
         println!(
@@ -684,15 +868,7 @@ mod deep {
 
             // 並列グリッド探索
             let (best_delay, best_rate, best_snr) = parallel_grid_search(
-                complex_vec,
-                header,
-                current_length,
-                physical_length,
-                effective_integ_time,
-                current_obs_time,
-                rfi_ranges,
-                bandpass_data,
-                args,
+                &context,
                 current_delay,
                 current_rate,
                 delay_range,
@@ -700,8 +876,6 @@ mod deep {
                 delay_step,
                 rate_step,
                 &pool,
-                start_time_offset_sec,
-                effective_fft_point,
             )?;
 
             // 結果を更新
@@ -728,21 +902,7 @@ mod deep {
             final_freq_rate_array,
             final_delay_rate_2d_data,
             pre_bandpass_analysis_results,
-        ) = perform_final_analysis(
-            complex_vec,
-            header,
-            current_length,
-            physical_length,
-            effective_integ_time,
-            current_obs_time,
-            rfi_ranges,
-            bandpass_data,
-            args,
-            final_delay,
-            final_rate,
-            start_time_offset_sec,
-            effective_fft_point,
-        )?;
+        ) = context.final_analysis(final_delay, final_rate)?;
 
         Ok(DeepSearchResult {
             analysis_results: final_analysis_results,
@@ -763,110 +923,9 @@ mod deep {
         }
     }
 
-    /// 粗い遅延・レート推定 (delay-windowとrate-windowから、または通常の探索から)
-    fn get_coarse_estimates(
-        complex_vec: &[C32],
-        header: &CorHeader,
-        current_length: i32,
-        physical_length: i32,
-        effective_integ_time: f32,
-        current_obs_time: &DateTime<Utc>,
-        rfi_ranges: &[(usize, usize)],
-        bandpass_data: &Option<Vec<C32>>,
-        args: &Args,
-        effective_fft_point: i32,
-    ) -> Result<(f32, f32), Box<dyn Error>> {
-        // drange/rrange が指定されている場合は、その範囲で探索
-        if !args.drange.is_empty() || !args.rrange.is_empty() {
-            println!("[DEEP SEARCH] Using specified delay/rate windows for coarse estimation");
-
-            let (mut freq_rate_array, padding_length) = process_fft(
-                complex_vec,
-                physical_length,
-                effective_fft_point,
-                header.sampling_speed,
-                rfi_ranges,
-                args.rate_padding,
-            );
-
-            if let Some(bp_data) = bandpass_data {
-                apply_bandpass_correction(&mut freq_rate_array, bp_data);
-            }
-
-            let delay_rate_2d_data_comp =
-                process_ifft(&freq_rate_array, effective_fft_point, padding_length);
-
-            let analysis_results = analyze_results(
-                &freq_rate_array,
-                &delay_rate_2d_data_comp,
-                header,
-                current_length,
-                effective_integ_time,
-                current_obs_time,
-                padding_length,
-                args,
-                args.primary_search_mode(),
-            );
-
-            let coarse_delay = analysis_results.residual_delay;
-            let coarse_rate = analysis_results.residual_rate;
-
-            Ok((coarse_delay, coarse_rate))
-        } else {
-            // delay-windowとrate-windowが指定されていない場合は、二次関数フィッティングなしの粗い探索を実行
-            println!("[DEEP SEARCH] No windows specified, running coarse search (no fitting) for initial estimates");
-
-            let mut search_args = args.clone();
-            search_args.search = vec!["deep".to_string()]; // Enable global max search, disable fitting
-
-            let (mut freq_rate_array, padding_length) = process_fft(
-                complex_vec,
-                physical_length,
-                effective_fft_point,
-                header.sampling_speed,
-                rfi_ranges,
-                args.rate_padding,
-            );
-
-            if let Some(bp_data) = bandpass_data {
-                apply_bandpass_correction(&mut freq_rate_array, bp_data);
-            }
-
-            let delay_rate_2d_data_comp =
-                process_ifft(&freq_rate_array, effective_fft_point, padding_length);
-
-            let analysis_results = analyze_results(
-                &freq_rate_array,
-                &delay_rate_2d_data_comp,
-                header,
-                current_length,
-                effective_integ_time,
-                current_obs_time,
-                padding_length,
-                &search_args,
-                search_args.primary_search_mode(),
-            );
-
-            // 粗い探索の結果（フィッティングなし）を取得
-            // delay_offsetとrate_offsetは0になるので、delay_rangeとrate_rangeから直接ピーク位置を取得
-            let coarse_delay = analysis_results.residual_delay;
-            let coarse_rate = analysis_results.residual_rate;
-
-            Ok((coarse_delay, coarse_rate))
-        }
-    }
-
     /// 並列グリッド探索
     fn parallel_grid_search(
-        complex_vec: &[C32],
-        header: &CorHeader,
-        current_length: i32,
-        physical_length: i32,
-        effective_integ_time: f32,
-        current_obs_time: &DateTime<Utc>,
-        rfi_ranges: &[(usize, usize)],
-        bandpass_data: &Option<Vec<C32>>,
-        args: &Args,
+        context: &DeepSearchContext<'_>,
         center_delay: f32,
         center_rate: f32,
         delay_range: f32,
@@ -874,8 +933,6 @@ mod deep {
         delay_step: f32,
         rate_step: f32,
         pool: &rayon::ThreadPool,
-        start_time_offset_sec: f32,
-        effective_fft_point: i32,
     ) -> Result<(f32, f32, f32), Box<dyn Error>> {
         // 探索グリッドを生成
         let delay_points = generate_search_points(center_delay, delay_range, delay_step);
@@ -888,63 +945,45 @@ mod deep {
             delay_points.len() * rate_points.len()
         );
 
-        // 全ての組み合わせを生成
-        let mut search_combinations = Vec::with_capacity(delay_points.len() * rate_points.len());
-        let delay_bounds = if args.drange.len() == 2 {
+        let delay_bounds = if context.args.drange.len() == 2 {
             Some((
-                args.drange[0].min(args.drange[1]),
-                args.drange[0].max(args.drange[1]),
+                context.args.drange[0].min(context.args.drange[1]),
+                context.args.drange[0].max(context.args.drange[1]),
             ))
         } else {
             None
         };
-        let rate_bounds = if args.rrange.len() == 2 {
+        let rate_bounds = if context.args.rrange.len() == 2 {
             Some((
-                args.rrange[0].min(args.rrange[1]),
-                args.rrange[0].max(args.rrange[1]),
+                context.args.rrange[0].min(context.args.rrange[1]),
+                context.args.rrange[0].max(context.args.rrange[1]),
             ))
         } else {
             None
         };
-
-        for &delay in &delay_points {
-            if let Some((low, high)) = delay_bounds {
-                if delay < low || delay > high {
-                    continue;
-                }
-            }
-            for &rate in &rate_points {
-                if let Some((low, high)) = rate_bounds {
-                    if rate < low || rate > high {
-                        continue;
-                    }
-                }
-                search_combinations.push((delay, rate));
-            }
-        }
 
         // 並列探索実行
         let final_result = pool.install(|| {
-            search_combinations
+            delay_points
                 .par_iter()
-                .filter_map(|&(delay, rate)| {
-                    evaluate_delay_rate_snr(
-                        complex_vec,
-                        header,
-                        current_length,
-                        physical_length,
-                        effective_integ_time,
-                        current_obs_time,
-                        rfi_ranges,
-                        bandpass_data,
-                        args,
-                        delay,
-                        rate,
-                        start_time_offset_sec,
-                        effective_fft_point,
-                    )
-                    .ok()
-                    .map(|snr| (delay, rate, snr))
+                .filter_map(|&delay| {
+                    if let Some((low, high)) = delay_bounds {
+                        if delay < low || delay > high {
+                            return None;
+                        }
+                    }
+                    let best_for_delay = rate_points
+                        .iter()
+                        .filter_map(|&rate| {
+                            if let Some((low, high)) = rate_bounds {
+                                if rate < low || rate > high {
+                                    return None;
+                                }
+                            }
+                            Some((delay, rate, context.evaluate_candidate_snr(delay, rate)))
+                        })
+                        .max_by(|a, b| a.2.total_cmp(&b.2));
+                    best_for_delay
                 })
                 .reduce_with(|best, candidate| {
                     if candidate.2 > best.2 {
@@ -959,164 +998,109 @@ mod deep {
         Ok(final_result)
     }
 
-    /// 特定の遅延・レート組み合わせでのSNRを評価
-    fn evaluate_delay_rate_snr(
-        complex_vec: &[C32],
-        header: &CorHeader,
-        current_length: i32,
-        physical_length: i32,
+    fn evaluate_delay_snr_streaming(
+        freq_rate_array: &Array2<C32>,
         effective_integ_time: f32,
-        current_obs_time: &DateTime<Utc>,
-        rfi_ranges: &[(usize, usize)],
-        bandpass_data: &Option<Vec<C32>>,
-        args: &Args,
-        delay: f32,
-        rate: f32,
-        start_time_offset_sec: f32,
+        padding_length: usize,
         effective_fft_point: i32,
-    ) -> Result<f32, Box<dyn Error>> {
-        // 位相補正を適用
-        let corrected_complex_vec = apply_corrections(
-            complex_vec,
-            rate,
-            delay,
-            args.acel_correct,
-            effective_integ_time,
-            header,
-            start_time_offset_sec,
-            effective_fft_point,
-        )?;
-
-        // FFT処理
-        let (mut freq_rate_array, padding_length) = process_fft(
-            &corrected_complex_vec,
-            physical_length,
-            effective_fft_point,
-            header.sampling_speed,
-            rfi_ranges,
-            args.rate_padding,
-        );
-
-        // バンドパス補正
-        if let Some(bp_data) = bandpass_data {
-            apply_bandpass_correction(&mut freq_rate_array, bp_data);
+        args: &Args,
+    ) -> f32 {
+        let fft_point_usize = effective_fft_point as usize;
+        if fft_point_usize == 0 || padding_length == 0 {
+            return 0.0;
         }
 
-        // IFFT処理
-        let delay_rate_2d_data_comp =
-            process_ifft(&freq_rate_array, effective_fft_point, padding_length);
-
-        // 解析実行
-        let temp_args = create_corrected_args(args, delay, rate);
-        let analysis_results = analyze_results(
-            &freq_rate_array,
-            &delay_rate_2d_data_comp,
-            header,
-            current_length,
-            effective_integ_time,
-            current_obs_time,
-            padding_length,
-            &temp_args,
-            None, // No search fitting during deep search iterations
+        let fft_point_f32 = fft_point_usize as f32;
+        let fft_point_half = fft_point_usize / 2;
+        let delay_range = Array::linspace(
+            -(fft_point_f32 / 2.0) + 1.0,
+            fft_point_f32 / 2.0,
+            fft_point_usize,
         );
+        let rate_range = rate_cal(padding_length as f32, effective_integ_time);
+        let padding_length_half = padding_length / 2;
+        let delay_rate_mask = if args.frequency {
+            None
+        } else {
+            delay_rate_mask_bounds(&args.mask)
+        };
 
-        Ok(analysis_results.delay_snr)
-    }
-
-    /// 最終的な解析を実行
-    fn perform_final_analysis(
-        complex_vec: &[C32],
-        header: &CorHeader,
-        current_length: i32,
-        physical_length: i32,
-        effective_integ_time: f32,
-        current_obs_time: &DateTime<Utc>,
-        rfi_ranges: &[(usize, usize)],
-        bandpass_data: &Option<Vec<C32>>,
-        args: &Args,
-        final_delay: f32,
-        final_rate: f32,
-        start_time_offset_sec: f32,
-        effective_fft_point: i32,
-    ) -> Result<
-        (
-            AnalysisResults,
-            Array2<C32>,
-            Array2<C32>,
-            Option<AnalysisResults>,
-        ),
-        Box<dyn Error>,
-    > {
-        // 最適解で最終的な処理を実行
-        let corrected_complex_vec = apply_corrections(
-            complex_vec,
-            final_rate,
-            final_delay,
-            args.acel_correct,
-            effective_integ_time,
-            header,
-            start_time_offset_sec,
-            effective_fft_point,
-        )?;
-
-        let (mut final_freq_rate_array, padding_length) = process_fft(
-            &corrected_complex_vec,
-            physical_length,
-            effective_fft_point,
-            header.sampling_speed,
-            rfi_ranges,
-            args.rate_padding,
-        );
-
-        let final_args = create_corrected_args(args, final_delay, final_rate);
-        let pre_bandpass_analysis_results = if bandpass_data.is_some() {
-            let pre_bandpass_delay_rate_2d_data_comp =
-                process_ifft(&final_freq_rate_array, effective_fft_point, padding_length);
-            Some(analyze_results(
-                &final_freq_rate_array,
-                &pre_bandpass_delay_rate_2d_data_comp,
-                header,
-                current_length,
-                effective_integ_time,
-                current_obs_time,
-                padding_length,
-                &final_args,
-                Some("deep"),
+        let delay_window = if args.drange.len() == 2 {
+            Some((
+                args.drange[0].min(args.drange[1]),
+                args.drange[0].max(args.drange[1]),
+            ))
+        } else {
+            None
+        };
+        let rate_window = if args.rrange.len() == 2 {
+            Some((
+                args.rrange[0].min(args.rrange[1]),
+                args.rrange[0].max(args.rrange[1]),
             ))
         } else {
             None
         };
 
-        if let Some(bp_data) = bandpass_data {
-            apply_bandpass_correction(&mut final_freq_rate_array, bp_data);
+        let use_window_search = delay_window.is_some() || rate_window.is_some();
+        let use_mask_search = !use_window_search && delay_rate_mask.is_some();
+        let center_rate_idx = padding_length_half.min(padding_length.saturating_sub(1));
+        let center_delay_idx = fft_point_half.min(fft_point_usize.saturating_sub(1));
+
+        let mut planner = FftPlanner::new();
+        let ifft = planner.plan_fft_inverse(fft_point_usize);
+        let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point_usize];
+        let mut norm_sum = 0.0f32;
+        let mut peak_norm = 0.0f32;
+
+        for r_idx in 0..padding_length {
+            ifft_exe.fill(C32::new(0.0, 0.0));
+            for (dst, src) in ifft_exe
+                .iter_mut()
+                .zip(freq_rate_array.column(r_idx).iter())
+            {
+                *dst = *src;
+            }
+
+            ifft.process(&mut ifft_exe);
+
+            let rate_val = rate_range[r_idx];
+            let rate_in_window = rate_window
+                .map(|(low, high)| rate_val >= low && rate_val <= high)
+                .unwrap_or(true);
+            let (first_half, second_half) = ifft_exe.split_at(fft_point_usize / 2);
+            for (d_idx, src) in second_half
+                .iter()
+                .chain(first_half.iter())
+                .rev()
+                .enumerate()
+            {
+                let value = *src / fft_point_usize as f32;
+                let norm = value.norm();
+                norm_sum += norm;
+
+                let delay_val = delay_range[d_idx];
+                let masked = in_delay_rate_mask(delay_val, rate_val, delay_rate_mask);
+                let is_candidate = if use_window_search {
+                    let delay_in_window = delay_window
+                        .map(|(low, high)| delay_val >= low && delay_val <= high)
+                        .unwrap_or(true);
+                    delay_in_window && rate_in_window && !masked
+                } else if use_mask_search {
+                    !masked
+                } else {
+                    r_idx == center_rate_idx && d_idx == center_delay_idx
+                };
+
+                if is_candidate && norm > peak_norm {
+                    peak_norm = norm;
+                }
+            }
         }
 
-        let final_delay_rate_2d_data_comp =
-            process_ifft(&final_freq_rate_array, effective_fft_point, padding_length);
-
-        let mut analysis_results = analyze_results(
-            &final_freq_rate_array,
-            &final_delay_rate_2d_data_comp,
-            header,
-            current_length,
-            effective_integ_time,
-            current_obs_time,
-            padding_length,
-            &final_args,
-            Some("deep"), // Final analysis for deep search should find the global max
-        );
-
-        // Deep searchの結果を反映
-        analysis_results.residual_delay = final_delay;
-        analysis_results.residual_rate = final_rate;
-        analysis_results.length_f32 = physical_length as f32 * effective_integ_time;
-
-        Ok((
-            analysis_results,
-            final_freq_rate_array,
-            final_delay_rate_2d_data_comp,
-            pre_bandpass_analysis_results,
-        ))
+        let total_cells = padding_length.saturating_mul(fft_point_usize).max(1);
+        let delay_noise = positive_or_epsilon(norm_sum / total_cells as f32);
+        peak_norm / delay_noise
     }
 
     /// 探索点を生成
@@ -1155,42 +1139,6 @@ mod deep {
         }
 
         points
-    }
-
-    /// 位相補正を適用
-    fn apply_corrections(
-        complex_vec: &[C32],
-        rate: f32,
-        delay: f32,
-        acel: f32,
-        effective_integ_time: f32,
-        header: &CorHeader,
-        start_time_offset_sec: f32,
-        effective_fft_point: i32,
-    ) -> Result<Vec<C32>, Box<dyn Error>> {
-        if rate == 0.0 && delay == 0.0 && acel == 0.0 {
-            return Ok(complex_vec.to_vec());
-        }
-
-        let fft_point_half = (effective_fft_point / 2) as usize;
-        if fft_point_half == 0 {
-            return Err("FFT チャンネル数が 0 です".into());
-        }
-
-        let mut corrected_vec = complex_vec.to_vec();
-        apply_phase_correction_in_place(
-            &mut corrected_vec,
-            fft_point_half,
-            rate,
-            delay,
-            acel,
-            effective_integ_time,
-            header.sampling_speed as u32,
-            effective_fft_point as u32,
-            start_time_offset_sec,
-        );
-
-        Ok(corrected_vec)
     }
 
     /// 補正された引数を作成

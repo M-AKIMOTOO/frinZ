@@ -52,7 +52,7 @@ cargo build --workspace --release
 This repository is split into:
 
 - `frinZ`: publishable crate and main binary
-- `frinZ-tools`: local-only package for `gfrinZ`, `pulsar_gating`, `cormerge`, `corshow`, and `bandscythe`
+- `frinZ-tools`: local-only package for `gfrinZ`, `pulsar_gating`, `cormerge`, and `bandscythe`
 
 ```bash
 # Check all local tools
@@ -65,7 +65,6 @@ cargo build -p frinZ-tools
 cargo build -p frinZ-tools --bin gfrinZ --release
 cargo build -p frinZ-tools --bin pulsar_gating --release
 cargo build -p frinZ-tools --bin cormerge --release
-cargo build -p frinZ-tools --bin corshow --release
 cargo build -p frinZ-tools --bin bandscythe --release
 ```
 
@@ -75,7 +74,6 @@ Run examples:
 cargo run -p frinZ-tools --bin gfrinZ --release -- --help
 cargo run -p frinZ-tools --bin pulsar_gating --release -- --help
 cargo run -p frinZ-tools --bin cormerge --release -- --help
-cargo run -p frinZ-tools --bin corshow --release -- --help
 cargo run -p frinZ-tools --bin bandscythe --release -- --help
 ```
 

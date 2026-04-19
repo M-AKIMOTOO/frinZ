@@ -8,13 +8,13 @@ use crate::header::CorHeader;
 type C32 = Complex<f32>;
 
 // ファイルヘッダーのサイズ (256 バイト)
-const FILE_HEADER_SIZE: u64 = 256;
+pub const FILE_HEADER_SIZE: u64 = 256;
 // 各セクターのヘッダーサイズ (128 バイト)
-const SECTOR_HEADER_SIZE: u64 = 128;
+pub const SECTOR_HEADER_SIZE: u64 = 128;
 // セクターヘッダー内での有効積分時間のオフセット
-const EFFECTIVE_INTEG_TIME_OFFSET: u64 = 112;
+pub const EFFECTIVE_INTEG_TIME_OFFSET: u64 = 112;
 
-fn normalize_effective_integration_time(value: f32) -> f32 {
+pub fn normalize_effective_integration_time(value: f32) -> f32 {
     if !value.is_finite() || value <= 0.0 {
         return 1.0;
     }
@@ -162,7 +162,7 @@ pub fn read_sector_header(
 }
 
 /// 読み込むセクターの範囲を計算するヘルパー関数
-fn calculate_sector_range(
+pub fn calculate_sector_range(
     header: &CorHeader,
     length: i32,
     skip: i32,

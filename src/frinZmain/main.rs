@@ -247,7 +247,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        let mut all_spectra: Vec<Vec<C32>> = Vec::new();
+        let output_file_path = output_dir.join(format!("{}.cor.bin", base_filename));
+
+        let mut output_file = match fs::File::create(&output_file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Error creating output file {:?}: {}", output_file_path, e);
+                exit(1);
+            }
+        };
+
+        if let Err(e) = output_file.write_f32::<LittleEndian>(header.fft_point as f32) {
+            eprintln!("Error writing fft_point to file: {}", e);
+            exit(1);
+        }
+        if let Err(e) = output_file.write_f32::<LittleEndian>(header.number_of_sector as f32) {
+            eprintln!("Error writing number_of_sector to file: {}", e);
+            exit(1);
+        }
+
+        let mut sectors_written = 0;
         for l1 in 0..header.number_of_sector {
             let (complex_vec, _, _) = match crate::read::read_visibility_data(
                 &mut cursor,
@@ -268,41 +287,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Warning: Empty sector {} found, stopping read.", l1);
                 break;
             }
-            all_spectra.push(complex_vec);
+            for val in &complex_vec {
+                if let Err(e) = output_file.write_f32::<LittleEndian>(val.re) {
+                    eprintln!("Error writing real part to file: {}", e);
+                    exit(1);
+                }
+                if let Err(e) = output_file.write_f32::<LittleEndian>(val.im) {
+                    eprintln!("Error writing imaginary part to file: {}", e);
+                    exit(1);
+                }
+            }
+            sectors_written += 1;
         }
 
-        if all_spectra.is_empty() {
+        if sectors_written == 0 {
             eprintln!("No visibility data found in the file.");
-            exit(1);
-        }
-
-        let flattened_spectra: Vec<C32> = all_spectra.iter().flatten().cloned().collect();
-        let output_file_path = output_dir.join(format!("{}.cor.bin", base_filename));
-
-        let mut output_file = match fs::File::create(&output_file_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Error creating output file {:?}: {}", output_file_path, e);
-                exit(1);
+            if let Err(e) = fs::remove_file(&output_file_path) {
+                eprintln!(
+                    "Warning: Could not remove incomplete output file {:?}: {}",
+                    output_file_path, e
+                );
             }
-        };
-
-        if let Err(e) = output_file.write_f32::<LittleEndian>(header.fft_point as f32) {
-            eprintln!("Error writing fft_point to file: {}", e);
-            exit(1);
-        }
-        if let Err(e) = output_file.write_f32::<LittleEndian>(header.number_of_sector as f32) {
-            eprintln!("Error writing number_of_sector to file: {}", e);
             exit(1);
         }
 
-        for val in &flattened_spectra {
-            if let Err(e) = output_file.write_f32::<LittleEndian>(val.re) {
-                eprintln!("Error writing real part to file: {}", e);
-                exit(1);
-            }
-            if let Err(e) = output_file.write_f32::<LittleEndian>(val.im) {
-                eprintln!("Error writing imaginary part to file: {}", e);
+        if sectors_written != header.number_of_sector {
+            eprintln!(
+                "Warning: Wrote {} sectors, expected {} sectors.",
+                sectors_written, header.number_of_sector
+            );
+            if let Err(e) = output_file.flush() {
+                eprintln!("Error flushing output file: {}", e);
                 exit(1);
             }
         }

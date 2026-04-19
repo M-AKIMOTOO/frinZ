@@ -1,0 +1,4 @@
+[alias]
+build-versioned = "run --package xtask -- build"
+frinZ = "run --package xtask -- install frinZ"
+gfrinZ = "run --package xtask -- install gfrinZ"

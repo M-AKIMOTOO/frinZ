@@ -41,6 +41,51 @@ pub fn rate_cal(n: f32, d: f32) -> Vec<f32> {
     rate
 }
 
+pub fn positive_or_epsilon(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        f32::EPSILON
+    }
+}
+
+pub fn window_bounds(window: &[f32]) -> Option<(f32, f32)> {
+    if window.len() == 2 {
+        Some((window[0].min(window[1]), window[0].max(window[1])))
+    } else {
+        None
+    }
+}
+
+pub fn in_window(value: f32, bounds: Option<(f32, f32)>) -> bool {
+    match bounds {
+        Some((low, high)) => value >= low && value <= high,
+        None => true,
+    }
+}
+
+pub fn delay_rate_mask_bounds(mask: &[f32]) -> Option<(f32, f32, f32, f32)> {
+    if mask.len() == 4 {
+        Some((
+            mask[0].min(mask[1]),
+            mask[0].max(mask[1]),
+            mask[2].min(mask[3]),
+            mask[2].max(mask[3]),
+        ))
+    } else {
+        None
+    }
+}
+
+pub fn in_delay_rate_mask(delay: f32, rate: f32, mask: Option<(f32, f32, f32, f32)>) -> bool {
+    match mask {
+        Some((delay_min, delay_max, rate_min, rate_max)) => {
+            delay >= delay_min && delay <= delay_max && rate >= rate_min && rate <= rate_max
+        }
+        None => false,
+    }
+}
+
 pub fn noise_level(array: ArrayView2<C32>, array_mean: C32) -> f32 {
     let (rows, cols) = array.dim();
     if rows == 0 || cols == 0 {

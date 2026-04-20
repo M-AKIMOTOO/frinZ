@@ -27,3 +27,8 @@ pub mod uptimeplot;
 pub mod utils;
 pub mod uv;
 pub mod wwz;
+
+pub use header::CorHeader;
+pub use read::{
+    read_cor_bytes, read_cor_file, read_cor_file_with_options, CorData, CorReadOptions,
+};

@@ -1,11 +1,13 @@
 use byteorder::ReadBytesExt;
 use chrono::{DateTime, TimeZone, Utc};
 use num_complex::Complex;
+use std::fs;
 use std::io::{self, Cursor, Error, ErrorKind, Read};
+use std::path::Path;
 
-use crate::header::CorHeader;
+use crate::header::{parse_header, CorHeader};
 
-type C32 = Complex<f32>;
+pub type C32 = Complex<f32>;
 
 // ファイルヘッダーのサイズ (256 バイト)
 pub const FILE_HEADER_SIZE: u64 = 256;
@@ -13,6 +15,95 @@ pub const FILE_HEADER_SIZE: u64 = 256;
 pub const SECTOR_HEADER_SIZE: u64 = 128;
 // セクターヘッダー内での有効積分時間のオフセット
 pub const EFFECTIVE_INTEG_TIME_OFFSET: u64 = 112;
+
+/// Data read from a `.cor` file for library users.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct CorData {
+    pub header: CorHeader,
+    pub visibility: Vec<C32>,
+    pub obs_time: DateTime<Utc>,
+    pub effective_integ_time: f32,
+    pub first_sector: i32,
+    pub sectors_read: i32,
+}
+
+/// Options for reading visibility data from a `.cor` file.
+///
+/// `length = None` or `Some(0)` means "read all remaining sectors after `skip`".
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct CorReadOptions {
+    pub length: Option<i32>,
+    pub skip: i32,
+    pub loop_index: i32,
+    pub is_cumulate: bool,
+    pub pp_flag_ranges: Vec<(u32, u32)>,
+}
+
+/// Read the full visibility payload from a `.cor` file.
+#[allow(dead_code)]
+pub fn read_cor_file<P: AsRef<Path>>(path: P) -> io::Result<CorData> {
+    read_cor_file_with_options(path, &CorReadOptions::default())
+}
+
+/// Read visibility data from a `.cor` file with library-friendly options.
+#[allow(dead_code)]
+pub fn read_cor_file_with_options<P: AsRef<Path>>(
+    path: P,
+    options: &CorReadOptions,
+) -> io::Result<CorData> {
+    let bytes = fs::read(path)?;
+    read_cor_bytes(&bytes, options)
+}
+
+/// Read visibility data from in-memory `.cor` bytes.
+#[allow(dead_code)]
+pub fn read_cor_bytes(bytes: &[u8], options: &CorReadOptions) -> io::Result<CorData> {
+    let mut cursor = Cursor::new(bytes);
+    let header = parse_header(&mut cursor)?;
+    let (length, loop_index) = resolve_read_params(&header, options);
+    let (first_sector, end_sector) = calculate_sector_range(
+        &header,
+        length,
+        options.skip,
+        loop_index,
+        options.is_cumulate,
+    );
+
+    let (visibility, obs_time, effective_integ_time) = read_visibility_data(
+        &mut cursor,
+        &header,
+        length,
+        options.skip,
+        loop_index,
+        options.is_cumulate,
+        &options.pp_flag_ranges,
+    )?;
+
+    Ok(CorData {
+        header,
+        visibility,
+        obs_time,
+        effective_integ_time,
+        first_sector,
+        sectors_read: end_sector - first_sector,
+    })
+}
+
+fn resolve_read_params(header: &CorHeader, options: &CorReadOptions) -> (i32, i32) {
+    if let Some(length) = options.length.filter(|length| *length > 0) {
+        return (length, options.loop_index);
+    }
+
+    let total_sectors = header.number_of_sector.max(0);
+    if options.is_cumulate {
+        return (total_sectors, 0);
+    }
+
+    let skip = options.skip.clamp(0, total_sectors);
+    (total_sectors.saturating_sub(skip), 0)
+}
 
 pub fn normalize_effective_integration_time(value: f32) -> f32 {
     if !value.is_finite() || value <= 0.0 {
@@ -199,4 +290,51 @@ pub fn calculate_sector_range(
     }
 
     (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_read_params, CorReadOptions};
+    use crate::header::CorHeader;
+
+    fn header_with_sectors(number_of_sector: i32) -> CorHeader {
+        CorHeader {
+            number_of_sector,
+            ..CorHeader::default()
+        }
+    }
+
+    #[test]
+    fn default_read_options_read_all_sectors() {
+        let header = header_with_sectors(28800);
+        let options = CorReadOptions::default();
+
+        assert_eq!(resolve_read_params(&header, &options), (28800, 0));
+    }
+
+    #[test]
+    fn zero_length_reads_remaining_sectors_after_skip() {
+        let header = header_with_sectors(28800);
+        let options = CorReadOptions {
+            length: Some(0),
+            skip: 120,
+            loop_index: 7,
+            ..CorReadOptions::default()
+        };
+
+        assert_eq!(resolve_read_params(&header, &options), (28680, 0));
+    }
+
+    #[test]
+    fn explicit_length_preserves_loop_index() {
+        let header = header_with_sectors(28800);
+        let options = CorReadOptions {
+            length: Some(1440),
+            skip: 0,
+            loop_index: 3,
+            ..CorReadOptions::default()
+        };
+
+        assert_eq!(resolve_read_params(&header, &options), (1440, 3));
+    }
 }

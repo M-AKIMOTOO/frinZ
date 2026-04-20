@@ -238,7 +238,7 @@ pub struct Args {
     #[arg(long = "frange", num_args = 2, value_name = "MIN MAX")]
     pub frange: Vec<f32>,
 
-    /// Rate padding factor (1/2/4/8/16). Deep defaults to 4.
+    /// Rate padding factor (1/2/4/8). Deep defaults to 4.
     #[arg(long, default_value_t = 1)]
     pub rate_padding: u32,
 
@@ -262,13 +262,13 @@ pub struct Args {
     #[arg(long, value_name = "POINTS")]
     pub fft_rebin: Option<i32>,
 
-    /// Search mode: peak (default), deep, rate, or acel.
+    /// Search mode: peak (default), deep, deep2, rate, or acel.
     #[arg(
         long,
         num_args = 0..=1,
         default_missing_value = "peak",
         value_name = "MODE",
-        value_parser = ["peak", "deep", "rate", "acel"],
+        value_parser = ["peak", "deep", "deep2", "rate", "acel"],
         action = ArgAction::Append
     )]
     pub search: Vec<String>,
@@ -277,7 +277,7 @@ pub struct Args {
     #[arg(long = "in-beam")]
     pub in_beam: bool,
 
-    /// Iterations for --search=peak/deep (deep default=4 when omitted).
+    /// Iterations for --search=peak/deep/deep2 (deep/deep2 default=4 when omitted).
     #[arg(long, default_value_t = 5)]
     pub iter: u32,
 
@@ -297,7 +297,7 @@ pub struct Args {
     #[arg(long)]
     pub bandpass_table: bool,
 
-    /// CPU cores for --search deep (0 = auto).
+    /// CPU cores for --search deep/deep2 (0 = auto).
     #[arg(long, default_value_t = 0)]
     pub cpu: u32,
 
@@ -357,7 +357,7 @@ impl Args {
     pub fn primary_search_mode(&self) -> Option<&str> {
         self.search
             .iter()
-            .find(|mode| *mode == "peak" || *mode == "deep")
+            .find(|mode| *mode == "peak" || *mode == "deep" || *mode == "deep2")
             .map(|s| s.as_str())
     }
 }

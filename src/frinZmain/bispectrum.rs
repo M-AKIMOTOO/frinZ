@@ -512,9 +512,14 @@ fn collect_baseline_visibility(
         }
 
         let (solve_delay, solve_rate, solve_acel) = match search_mode {
-            Some("deep") => {
+            Some("deep") | Some("deep2") => {
                 let start_ref = file_start_time.unwrap_or(current_obs_time);
-                let mut deep_result = search::run_deep_search(
+                let run_deep = if search_mode == Some("deep2") {
+                    search::run_deep2_search
+                } else {
+                    search::run_deep_search
+                };
+                let mut deep_result = run_deep(
                     &complex_vec,
                     &header,
                     actual_length,
@@ -560,6 +565,7 @@ fn collect_baseline_visibility(
                         &start_ref,
                         &rfi_ranges,
                         &bandpass_data,
+                        false,
                         header.fft_point,
                     )?;
                     total_delay += iter_results.delay_offset;
@@ -1484,7 +1490,7 @@ pub fn run_closure_phase_analysis(
     }
     if !args.search.is_empty() && args.primary_search_mode().is_none() {
         eprintln!(
-            "#WARN: --closure-phase で有効な --search は peak/deep のみです。指定モード {:?} は無視されます。",
+            "#WARN: --closure-phase で有効な --search は peak/deep/deep2 のみです。指定モード {:?} は無視されます。",
             args.search
         );
     }

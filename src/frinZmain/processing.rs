@@ -576,8 +576,13 @@ pub fn process_cor_file(
 
         let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp, pre_bandpass_results) =
             match primary_search_mode {
-                Some("deep") => {
-                    let mut deep_search_result = search::run_deep_search(
+                Some("deep") | Some("deep2") => {
+                    let run_deep = if primary_search_mode == Some("deep2") {
+                        search::run_deep2_search
+                    } else {
+                        search::run_deep_search
+                    };
+                    let mut deep_search_result = run_deep(
                         &complex_vec,
                         &processing_header,
                         current_length,
@@ -634,6 +639,7 @@ pub fn process_cor_file(
                             &file_start_time,
                             &rfi_ranges,
                             &bandpass_data,
+                            false,
                             effective_fft_point,
                         )?;
                         total_delay_correct += iter_results.delay_offset;
@@ -668,6 +674,7 @@ pub fn process_cor_file(
                         &file_start_time,
                         &rfi_ranges,
                         &bandpass_data,
+                        args.plot,
                         effective_fft_point,
                     )?;
 
@@ -723,6 +730,7 @@ pub fn process_cor_file(
                         &file_start_time,
                         &rfi_ranges,
                         &bandpass_data,
+                        args.plot,
                         effective_fft_point,
                     )?;
                     analysis_results.length_f32 =
@@ -765,7 +773,10 @@ pub fn process_cor_file(
                 let output_file_path = path.join(format!("{}_cross.spec", base_filename));
                 write_complex_spectrum_binary(
                     &output_file_path,
-                    &analysis_results.freq_rate_spectrum.to_vec(),
+                    analysis_results
+                        .freq_rate_spectrum
+                        .as_slice()
+                        .ok_or("freq_rate_spectrum が連続メモリではありません")?,
                     effective_fft_point,
                     1,
                 )?;
@@ -781,7 +792,10 @@ pub fn process_cor_file(
                 let output_file_path = path.join(format!("{}_bptable.bin", base_filename));
                 write_complex_spectrum_binary(
                     &output_file_path,
-                    &analysis_results.freq_rate_spectrum.to_vec(),
+                    analysis_results
+                        .freq_rate_spectrum
+                        .as_slice()
+                        .ok_or("freq_rate_spectrum が連続メモリではありません")?,
                     effective_fft_point,
                     0,
                 )?;
@@ -1082,8 +1096,10 @@ pub fn process_cor_file(
                         .map(|&x| x as f32)
                         .collect();
                     let mut plot_drange: Vec<f32> = if args.drange.len() == 2
-                        && matches!(primary_search_mode, Some("peak") | Some("deep"))
-                    {
+                        && matches!(
+                            primary_search_mode,
+                            Some("peak") | Some("deep") | Some("deep2")
+                        ) {
                         vec![
                             args.drange[0] - analysis_results.corrected_delay,
                             args.drange[1] - analysis_results.corrected_delay,
@@ -1092,8 +1108,10 @@ pub fn process_cor_file(
                         args.drange.clone()
                     };
                     let mut plot_rrange: Vec<f32> = if args.rrange.len() == 2
-                        && matches!(primary_search_mode, Some("peak") | Some("deep"))
-                    {
+                        && matches!(
+                            primary_search_mode,
+                            Some("peak") | Some("deep") | Some("deep2")
+                        ) {
                         vec![
                             args.rrange[0] - analysis_results.corrected_rate,
                             args.rrange[1] - analysis_results.corrected_rate,
@@ -1519,6 +1537,7 @@ pub(crate) fn run_analysis_pipeline(
     file_start_time: &DateTime<Utc>,
     rfi_ranges: &[(usize, usize)],
     bandpass_data: &Option<Vec<C32>>,
+    keep_pre_bandpass_results: bool,
     effective_fft_point: i32,
 ) -> Result<
     (
@@ -1624,9 +1643,15 @@ pub(crate) fn run_analysis_pipeline(
             )
         };
 
-    let pre_bandpass_analysis_results = if bandpass_data.is_some() {
-        let pre_bandpass_delay_rate_2d_data_comp =
-            process_ifft(&freq_rate_array, effective_fft_point, padding_length);
+    let skip_delay_rate_ifft =
+        base_args.frequency && search_mode.is_none() && base_args.drange.is_empty();
+
+    let pre_bandpass_analysis_results = if keep_pre_bandpass_results && bandpass_data.is_some() {
+        let pre_bandpass_delay_rate_2d_data_comp = if skip_delay_rate_ifft {
+            Array2::zeros((1, 1))
+        } else {
+            process_ifft(&freq_rate_array, effective_fft_point, padding_length)
+        };
         Some(analyze_results(
             &freq_rate_array,
             &pre_bandpass_delay_rate_2d_data_comp,
@@ -1646,8 +1671,11 @@ pub(crate) fn run_analysis_pipeline(
         apply_bandpass_correction(&mut freq_rate_array, bp_data);
     }
 
-    let delay_rate_2d_data_comp =
-        process_ifft(&freq_rate_array, effective_fft_point, padding_length);
+    let delay_rate_2d_data_comp = if skip_delay_rate_ifft {
+        Array2::zeros((1, 1))
+    } else {
+        process_ifft(&freq_rate_array, effective_fft_point, padding_length)
+    };
 
     let analysis_results = analyze_results(
         &freq_rate_array,

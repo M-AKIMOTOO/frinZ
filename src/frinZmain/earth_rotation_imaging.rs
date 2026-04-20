@@ -1218,8 +1218,13 @@ fn determine_segment_correction(
     let effective_fft_point = (fft_point_half * 2) as i32;
 
     match search_mode {
-        Some("deep") => {
-            let deep = search::run_deep_search(
+        Some("deep") | Some("deep2") => {
+            let run_deep = if search_mode == Some("deep2") {
+                search::run_deep2_search
+            } else {
+                search::run_deep_search
+            };
+            let deep = run_deep(
                 complex_vec,
                 header,
                 current_length,
@@ -1269,6 +1274,7 @@ fn determine_segment_correction(
                     obs_time,
                     rfi_ranges,
                     bandpass_data,
+                    false,
                     effective_fft_point,
                 )?;
                 total_delay += results.delay_offset;
@@ -1290,6 +1296,7 @@ fn determine_segment_correction(
                 obs_time,
                 rfi_ranges,
                 bandpass_data,
+                false,
                 effective_fft_point,
             )?;
 
@@ -1319,6 +1326,7 @@ fn determine_segment_correction(
                 obs_time,
                 rfi_ranges,
                 bandpass_data,
+                false,
                 effective_fft_point,
             )?;
             Ok(SegmentCorrection {

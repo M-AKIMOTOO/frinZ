@@ -122,6 +122,19 @@ fn process_fft_impl(
 
     let mut freq_rate_array = Array2::<C32>::zeros((fft_point_half, padding_length));
     let mut fft_exe = vec![C32::new(0.0, 0.0); padding_length];
+    let mut rfi_mask = vec![false; fft_point_half];
+    for &(min, max) in rfi_ranges {
+        if min >= fft_point_half {
+            continue;
+        }
+        let end = max.min(fft_point_half.saturating_sub(1));
+        if end < min {
+            continue;
+        }
+        for masked in &mut rfi_mask[min..=end] {
+            *masked = true;
+        }
+    }
 
     let phase_factors = phase_correction.and_then(|phase| {
         build_phase_factors(
@@ -134,18 +147,18 @@ fn process_fft_impl(
     });
 
     for i in 1..fft_point_half {
-        fft_exe.fill(C32::new(0.0, 0.0));
-        let is_rfi_channel = rfi_ranges.iter().any(|(min, max)| i >= *min && i <= *max);
-
-        if !is_rfi_channel {
-            for j in 0..rows {
-                let mut sample = complex_vec[j * fft_point_half + i];
-                if let Some((delay_factors, row_factors)) = &phase_factors {
-                    sample *= row_factors[j] * delay_factors[i];
-                }
-                fft_exe[j] = sample;
-            }
+        if rfi_mask[i] {
+            continue;
         }
+
+        for j in 0..rows {
+            let mut sample = complex_vec[j * fft_point_half + i];
+            if let Some((delay_factors, row_factors)) = &phase_factors {
+                sample *= row_factors[j] * delay_factors[i];
+            }
+            fft_exe[j] = sample;
+        }
+        fft_exe[rows..].fill(C32::new(0.0, 0.0));
 
         fft.process(&mut fft_exe);
 
@@ -205,22 +218,28 @@ pub fn process_ifft(
     let mut planner = FftPlanner::new();
     let ifft = planner.plan_fft_inverse(fft_point_usize);
     let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point_usize];
+    let freq_bins = freq_rate_array.dim().0.min(fft_point_usize);
+    let scale = fft_point_usize as f32;
 
     for i in 0..freq_rate_array.dim().1 {
-        ifft_exe.fill(C32::new(0.0, 0.0));
-        for (dst, src) in ifft_exe.iter_mut().zip(freq_rate_array.column(i).iter()) {
+        for (dst, src) in ifft_exe[..freq_bins]
+            .iter_mut()
+            .zip(freq_rate_array.column(i).iter().take(freq_bins))
+        {
             *dst = *src;
         }
+        ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
 
         ifft.process(&mut ifft_exe);
 
-        let (first_half, second_half) = ifft_exe.split_at(fft_point_usize / 2);
+        let half = fft_point_usize / 2;
+        let (first_half, second_half) = ifft_exe.split_at(half);
         let mut row = delay_rate_array.row_mut(i);
-        for (dst, src) in row
-            .iter_mut()
-            .zip(second_half.iter().chain(first_half.iter()).rev())
-        {
-            *dst = *src / fft_point_usize as f32;
+        for (dst, src) in row.iter_mut().take(half).zip(first_half.iter().rev()) {
+            *dst = *src / scale;
+        }
+        for (dst, src) in row.iter_mut().skip(half).zip(second_half.iter().rev()) {
+            *dst = *src / scale;
         }
     }
 
@@ -237,16 +256,23 @@ pub fn perform_ifft_on_vec(input: &[C32], ifft_size: usize) -> Vec<C32> {
     ifft.process(&mut ifft_exe);
 
     let mut shifted_out = vec![C32::new(0.0, 0.0); ifft_size];
-    let (first_half, second_half) = ifft_exe.split_at(ifft_size / 2);
-    // Support odd-length IFFT sizes by copying with the actual slice lengths.
-    shifted_out[..second_half.len()].copy_from_slice(second_half);
-    shifted_out[second_half.len()..].copy_from_slice(first_half);
-
-    for val in &mut shifted_out {
-        *val /= ifft_size as f32;
+    let half = ifft_size / 2;
+    let (first_half, second_half) = ifft_exe.split_at(half);
+    let scale = ifft_size as f32;
+    for (dst, src) in shifted_out
+        .iter_mut()
+        .take(first_half.len())
+        .zip(first_half.iter().rev())
+    {
+        *dst = *src / scale;
     }
-
-    shifted_out.reverse(); // Common reverse operation
+    for (dst, src) in shifted_out
+        .iter_mut()
+        .skip(first_half.len())
+        .zip(second_half.iter().rev())
+    {
+        *dst = *src / scale;
+    }
 
     shifted_out
 }

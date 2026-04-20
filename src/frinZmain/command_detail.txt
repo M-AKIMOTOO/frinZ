@@ -5,8 +5,9 @@
 [基本モード]
   --in-beam                          in-beam VLBI 用の標準 delay-rate 解析フローで実行（出力先: frinZ/inbeamVLBI/ 直下）
                                      --plot 時は全面 delay-rate ヒートマップ表示
-  --search [peak|deep|rate|acel]     デフォルト peak（delay-rate 平面のピーク探索）
-  --iter N                           peak/deep の反復回数（deep は未指定時 4）
+  --search [peak|deep|deep2|rate|acel]
+                                     デフォルト peak（deep2 は coarse 後に rate/delay 軸を交互探索）
+  --iter N                           peak/deep/deep2 の反復回数（deep/deep2 は未指定時 4）
   --frequency                        周波数ドメイン処理（未指定は時間ドメイン）
   --plot                             グラフ出力（--frequency 併用で周波数グラフ）
   --output                           frinZ/fringe_output/... に保存

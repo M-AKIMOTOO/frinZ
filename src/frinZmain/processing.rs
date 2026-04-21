@@ -1643,8 +1643,7 @@ pub(crate) fn run_analysis_pipeline(
             )
         };
 
-    let skip_delay_rate_ifft =
-        base_args.frequency && search_mode.is_none() && base_args.drange.is_empty();
+    let skip_delay_rate_ifft = base_args.frequency && base_args.drange.is_empty();
 
     let pre_bandpass_analysis_results = if keep_pre_bandpass_results && bandpass_data.is_some() {
         let pre_bandpass_delay_rate_2d_data_comp = if skip_delay_rate_ifft {

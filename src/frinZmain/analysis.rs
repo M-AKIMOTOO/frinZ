@@ -194,10 +194,7 @@ pub fn analyze_results(
     let keep_freq_profiles = args.plot && args.frequency;
     let keep_freq_spectrum =
         args.frequency || args.spectrum || args.bandpass_table || !args.multi_sideband.is_empty();
-    let skip_delay_plane_analysis =
-        args.frequency && search_mode.is_none() && args.drange.is_empty();
-    let rate_padding_noise_scale = (args.rate_padding.max(1) as f32).sqrt();
-
+    let skip_delay_plane_analysis = args.frequency && args.drange.is_empty();
     // --- Delay Analysis ---
     let delay_array_mean = if skip_delay_plane_analysis {
         C32::new(0.0, 0.0)
@@ -309,7 +306,7 @@ pub fn analyze_results(
     } else {
         let delay_noise_raw = delay_noise_raw_from_peak_scan
             .unwrap_or_else(|| noise_level(delay_rate_array.view(), delay_array_mean));
-        positive_or_epsilon(delay_noise_raw * rate_padding_noise_scale)
+        positive_or_epsilon(delay_noise_raw)
     };
 
     let delay_max_amp = if skip_delay_plane_analysis {
@@ -347,7 +344,7 @@ pub fn analyze_results(
 
     let mut residual_delay_val: f32 = delay_range[peak_delay_idx];
     let mut delay_offset = 0.0;
-    if search_mode == Some("peak") {
+    if search_mode == Some("peak") && !skip_delay_plane_analysis {
         if let Some((refined_delay, _)) = refined_peak_3x3 {
             delay_offset = refined_delay;
             residual_delay_val = refined_delay;
@@ -566,7 +563,7 @@ pub fn analyze_results(
         }
     }
 
-    let freq_noise = positive_or_epsilon(freq_noise_raw * rate_padding_noise_scale);
+    let freq_noise = positive_or_epsilon(freq_noise_raw);
     let freq_snr = freq_max_amp / freq_noise;
     let freq_rate = if keep_freq_profiles {
         Array1::from_iter(

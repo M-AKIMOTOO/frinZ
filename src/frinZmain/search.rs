@@ -1352,9 +1352,7 @@ mod deep {
         }
 
         let total_cells = padding_length.saturating_mul(fft_point_usize).max(1);
-        let rate_padding_noise_scale = (args.rate_padding.max(1) as f32).sqrt();
-        let delay_noise =
-            positive_or_epsilon((norm_sum / total_cells as f32) * rate_padding_noise_scale);
+        let delay_noise = positive_or_epsilon(norm_sum / total_cells as f32);
         peak_norm / delay_noise
     }
 

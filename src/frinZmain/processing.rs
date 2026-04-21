@@ -1609,13 +1609,9 @@ pub(crate) fn run_analysis_pipeline(
         .into());
     }
 
-    let start_time_offset_sec = if search_mode.is_some() {
-        0.0
-    } else {
-        current_obs_time
-            .signed_duration_since(*file_start_time)
-            .num_seconds() as f32
-    };
+    let start_time_offset_sec = current_obs_time
+        .signed_duration_since(*file_start_time)
+        .num_seconds() as f32;
 
     let (mut freq_rate_array, padding_length) =
         if delay_correct != 0.0 || rate_correct != 0.0 || acel_correct != 0.0 {

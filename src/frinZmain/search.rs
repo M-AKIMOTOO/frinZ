@@ -558,6 +558,7 @@ mod deep {
         AxisThenLocal,
     }
 
+    #[allow(dead_code)]
     impl DeepSearchAlgorithm {
         fn mode_name(self) -> &'static str {
             match self {
@@ -661,10 +662,12 @@ mod deep {
         ) -> Result<(f32, f32), Box<dyn Error>> {
             // drange/rrange が指定されている場合は、その範囲で探索
             if !self.args.drange.is_empty() || !self.args.rrange.is_empty() {
+                /*
                 println!(
                     "[{}] Using specified delay/rate windows for coarse estimation",
                     algorithm.log_name()
                 );
+                */
                 let search_args = self.args;
                 let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
                 self.apply_bandpass(&mut freq_rate_array);
@@ -686,10 +689,12 @@ mod deep {
                     analysis_results.residual_rate,
                 ))
             } else {
+                /*
                 println!(
                     "[{}] No windows specified, running coarse search (no fitting) for initial estimates",
                     algorithm.log_name()
                 );
+                */
                 let mut search_args = self.args.clone();
                 search_args.search = vec![algorithm.mode_name().to_string()];
                 let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
@@ -877,11 +882,13 @@ mod deep {
         previous_solution: Option<(f32, f32)>,
         algorithm: DeepSearchAlgorithm,
     ) -> Result<DeepSearchResult, Box<dyn Error>> {
+        /*
         println!(
             "[{}] Starting {} hierarchical search algorithm",
             algorithm.log_name(),
             algorithm.mode_name()
         );
+        */
 
         // フリンジ補正はファイル開始時刻からの経過時間で行う
         let start_time_offset_sec = 0.0;
@@ -921,28 +928,38 @@ mod deep {
         };
 
         // Step 1: 粗い遅延・レート推定
-        let (coarse_delay, coarse_rate) = if let Some((prev_delay, prev_rate)) = previous_solution {
+        let seed_solution = previous_solution.or_else(|| {
+            (args.delay_correct != 0.0 || args.rate_correct != 0.0)
+                .then_some((args.delay_correct, args.rate_correct))
+        });
+        let (coarse_delay, coarse_rate) = if let Some((prev_delay, prev_rate)) = seed_solution {
+            /*
             println!(
                 "[{}] Seeding from previous solution: delay={:.6}, rate={:.6}",
                 algorithm.log_name(),
                 prev_delay,
                 prev_rate
             );
+            */
             (prev_delay, prev_rate)
         } else {
+            /*
             println!(
                 "[{}] Running coarse grid search for initial estimate",
                 algorithm.log_name()
             );
+            */
             context.coarse_estimates(algorithm)?
         };
 
+        /*
         println!(
             "[{}] Coarse estimates - Delay: {:.6} samples, Rate: {:.6} Hz",
             algorithm.log_name(),
             coarse_delay,
             coarse_rate
         );
+        */
 
         // Step 2: 階層的探索
         let mut search_params = DeepSearchParams::default();
@@ -955,11 +972,13 @@ mod deep {
             .build()?;
 
         for iteration in 0..search_params.max_iterations {
+            /*
             println!(
                 "[{}] Iteration {} starting",
                 algorithm.log_name(),
                 iteration + 1
             );
+            */
 
             // 現在の階層での探索範囲とステップサイズを計算
             let scale_factor = 10.0_f32.powi(iteration as i32);
@@ -969,6 +988,7 @@ mod deep {
             let delay_step = search_params.delay_fine_step / scale_factor;
             let rate_step = search_params.rate_fine_step_factor / (10.0 * pp as f32) / scale_factor;
 
+            /*
             println!(
                 "[{}]   Delay range: +/- {:.6} samples, step: {:.6}",
                 algorithm.log_name(),
@@ -981,6 +1001,7 @@ mod deep {
                 rate_range,
                 rate_step
             );
+            */
 
             let (best_delay, best_rate, best_snr) = match algorithm {
                 DeepSearchAlgorithm::FullGrid => parallel_grid_search(
@@ -1009,6 +1030,8 @@ mod deep {
             current_delay = best_delay;
             current_rate = best_rate;
 
+            let _ = best_snr;
+            /*
             println!(
                 "[{}]   Best result: delay={:.6} samples, rate={:.6} Hz, SNR={:.3}",
                 algorithm.log_name(),
@@ -1016,6 +1039,7 @@ mod deep {
                 current_rate,
                 best_snr
             );
+            */
         }
 
         if algorithm == DeepSearchAlgorithm::AxisThenLocal {
@@ -1035,6 +1059,8 @@ mod deep {
             )?;
             current_delay = best_delay;
             current_rate = best_rate;
+            let _ = best_snr;
+            /*
             println!(
                 "[{}]   Final 3x3 local check: delay={:.6} samples, rate={:.6} Hz, SNR={:.3}",
                 algorithm.log_name(),
@@ -1042,18 +1068,21 @@ mod deep {
                 current_rate,
                 best_snr
             );
+            */
         }
 
         let final_delay = current_delay;
         let final_rate = current_rate;
 
         // Step 3: 最終的な解析を実行
+        /*
         println!(
             "[{}] Final result - Delay: {:.6} samples, Rate: {:.6} Hz",
             algorithm.log_name(),
             final_delay,
             final_rate
         );
+        */
 
         let (
             final_analysis_results,
@@ -1096,6 +1125,7 @@ mod deep {
         let delay_points = generate_search_points(center_delay, delay_range, delay_step);
         let rate_points = generate_search_points(center_rate, rate_range, rate_step);
 
+        /*
         println!(
             "[{}]   Grid: {} delay x {} rate = {} combinations",
             context.args.primary_search_mode().unwrap_or("DEEP SEARCH"),
@@ -1103,6 +1133,7 @@ mod deep {
             rate_points.len(),
             delay_points.len() * rate_points.len()
         );
+        */
 
         let delay_bounds = if context.args.drange.len() == 2 {
             Some((
@@ -1168,10 +1199,12 @@ mod deep {
         pool: &rayon::ThreadPool,
     ) -> Result<(f32, f32, f32), Box<dyn Error>> {
         let rate_points = generate_search_points(center_rate, rate_range, rate_step);
+        /*
         println!(
             "[DEEP2 SEARCH]   Axis grid: {} rate + delay axis",
             rate_points.len()
         );
+        */
 
         let rate_bounds = if context.args.rrange.len() == 2 {
             Some((
@@ -1208,11 +1241,13 @@ mod deep {
         });
 
         let delay_points = generate_search_points(center_delay, delay_range, delay_step);
+        /*
         println!(
             "[DEEP2 SEARCH]   Axis grid: {} delay at rate={:.6}",
             delay_points.len(),
             best_rate_result.1
         );
+        */
 
         let delay_bounds = if context.args.drange.len() == 2 {
             Some((
@@ -1298,7 +1333,9 @@ mod deep {
         let use_window_search = delay_window.is_some() || rate_window.is_some();
         let use_mask_search = !use_window_search && delay_rate_mask.is_some();
         let center_rate_idx = padding_length_half.min(padding_length.saturating_sub(1));
-        let center_delay_idx = fft_point_half.min(fft_point_usize.saturating_sub(1));
+        let center_delay_idx = fft_point_half
+            .saturating_sub(1)
+            .min(fft_point_usize.saturating_sub(1));
 
         let mut planner = FftPlanner::new();
         let ifft = planner.plan_fft_inverse(fft_point_usize);

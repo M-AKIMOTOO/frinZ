@@ -587,8 +587,9 @@ pub fn analyze_results(
     };
 
     if search_mode == Some("peak") {
-        if args.length == 1 {
-            // When length is 1, rate fitting is unstable, so force residual_rate to 0.
+        if length == 1 {
+            // When the actual integration has only one row, rate fitting is unstable,
+            // so force residual_rate to 0 even if the user did not pass --length 1.
             //eprintln!("Warning: Rate fitting is skipped because --length is 1. Residual rate is set to 0.");
             residual_rate_val = 0.0;
             rate_offset = 0.0;

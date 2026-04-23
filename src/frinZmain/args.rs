@@ -211,7 +211,7 @@ pub struct Args {
     #[arg(
         long = "drange",
         num_args = 2,
-        value_name = "MIN MAX",
+        value_names = ["MIN", "MAX"],
         allow_negative_numbers = true
     )]
     pub drange: Vec<f32>,
@@ -220,7 +220,7 @@ pub struct Args {
     #[arg(
         long = "rrange",
         num_args = 2,
-        value_name = "MIN MAX",
+        value_names = ["MIN", "MAX"],
         allow_negative_numbers = true
     )]
     pub rrange: Vec<f32>,
@@ -229,16 +229,16 @@ pub struct Args {
     #[arg(
         long,
         num_args = 4,
-        value_name = "DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX",
+        value_names = ["DELAY_MIN", "DELAY_MAX", "RATE_MIN", "RATE_MAX"],
         allow_negative_numbers = true
     )]
     pub mask: Vec<f32>,
 
     /// Frequency range for --frequency plots/search.
-    #[arg(long = "frange", num_args = 2, value_name = "MIN MAX")]
+    #[arg(long = "frange", num_args = 2, value_names = ["MIN", "MAX"])]
     pub frange: Vec<f32>,
 
-    /// Rate padding factor (1/2/4/8). Deep defaults to 4.
+    /// Rate padding factor (1/2/4/8). --search peak/deep/deep2 forces 8.
     #[arg(long, default_value_t = 1)]
     pub rate_padding: u32,
 

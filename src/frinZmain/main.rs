@@ -88,8 +88,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     };
-    let rate_padding_explicit =
-        matches.value_source("rate_padding") == Some(ValueSource::CommandLine);
     let iter_explicit = matches.value_source("iter") == Some(ValueSource::CommandLine);
 
     let mut args = match Args::from_arg_matches_mut(&mut matches) {
@@ -122,19 +120,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // シンプルな仕様: --cumulate が指定されたら rate_padding は常に 1 にする
-    if args.cumulate != 0 {
+    if matches!(
+        args.primary_search_mode(),
+        Some("peak") | Some("deep") | Some("deep2")
+    ) {
+        args.rate_padding = 8;
+    } else if args.cumulate != 0 {
+        // シンプルな仕様: --cumulate が指定されたら rate_padding は常に 1 にする
         args.rate_padding = 1;
-    } else if matches!(args.primary_search_mode(), Some("deep") | Some("deep2"))
-        && !rate_padding_explicit
-    {
-        if args.rate_padding != 4 {
-            println!(
-                "#INFO: --search deep/deep2 が指定されたため rate-padding を 4 に設定します (旧値 {}).",
-                args.rate_padding
-            );
-        }
-        args.rate_padding = 4;
     }
     if matches!(args.primary_search_mode(), Some("deep") | Some("deep2")) && !iter_explicit {
         args.iter = 4;

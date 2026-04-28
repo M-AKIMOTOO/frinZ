@@ -1,5 +1,6 @@
 use crate::args::Args;
 use crate::header::parse_header;
+use crate::input_support::read_input_bytes;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::read::read_visibility_data;
 use crate::utils::radec2azalt;
@@ -7,8 +8,8 @@ use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use plotters::coord::Shift;
 use plotters::prelude::*;
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{Cursor, Read};
+use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 
 const CANVAS_SIZE: (u32, u32) = (1400, 900);
@@ -21,9 +22,7 @@ pub fn run_uptime_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let mut file = File::open(input_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let buffer = read_input_bytes(input_path)?;
 
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;

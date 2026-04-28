@@ -4,7 +4,7 @@ pub use deep::{run_deep2_search, run_deep_search, DeepSearchParams, DeepSearchRe
 mod acel {
     use std::error::Error;
     use std::fs::{self, File};
-    use std::io::{Cursor, Read, Write};
+    use std::io::{Cursor, Write};
     use std::path::Path;
 
     use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ mod acel {
     use crate::args::Args;
     use crate::fitting;
     use crate::header::{parse_header, CorHeader};
+    use crate::input_support::read_input_bytes;
     use crate::plot::plot_acel_search_result;
     use crate::processing::run_analysis_pipeline;
     use crate::read::read_visibility_data;
@@ -175,9 +176,7 @@ mod acel {
         fs::create_dir_all(&output_dir)?;
         let base_filename = input_path.file_stem().unwrap().to_str().unwrap();
 
-        let mut file = File::open(input_path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        let buffer = read_input_bytes(input_path)?;
         let mut cursor = Cursor::new(buffer.as_slice());
 
         let header = parse_header(&mut cursor)?;

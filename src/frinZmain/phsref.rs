@@ -2,7 +2,7 @@
 // Uses a calibrator scan to estimate phase trends and applies phase-referenced
 // correction to target visibilities, with optional fit models and diagnostics.
 use std::error::Error;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,7 @@ use num_complex::Complex;
 
 use crate::args::Args;
 use crate::fitting;
+use crate::input_support::read_input_bytes;
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::plot::phase_reference_plot;
 use crate::processing::process_cor_file;
@@ -344,9 +345,7 @@ pub fn run_phase_reference_analysis(
                     "\nApplying phase correction to target file and writing to binary output..."
                 );
 
-                let mut target_file = File::open(&target_path)?;
-                let mut target_buffer = Vec::new();
-                target_file.read_to_end(&mut target_buffer)?;
+                let target_buffer = read_input_bytes(&target_path)?;
 
                 let mut file_header = vec![0u8; 256];
                 let mut cursor = Cursor::new(target_buffer.as_slice());

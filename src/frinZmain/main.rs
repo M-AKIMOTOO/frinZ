@@ -24,6 +24,7 @@ mod frmap;
 mod header;
 #[path = "inbeamVLBI.rs"]
 mod inbeam_vlbi;
+mod input_support;
 
 mod earth_rotation_imaging;
 mod logo;
@@ -51,6 +52,7 @@ use crate::earth_rotation_imaging::{
 use crate::folding::run_folding_analysis;
 use crate::frmap::run_fringe_rate_map_analysis;
 use crate::inbeam_vlbi::run_inbeam_vlbi_analysis;
+use crate::input_support::read_input_bytes;
 use crate::maser::run_maser_analysis;
 use crate::multisideband::run_multisideband_analysis;
 use crate::phsref::run_phase_reference_analysis;
@@ -220,18 +222,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let base_filename = input_path.file_stem().unwrap().to_str().unwrap();
 
-        let mut file = match fs::File::open(input_path) {
-            Ok(f) => f,
+        let buffer = match read_input_bytes(input_path) {
+            Ok(buf) => buf,
             Err(e) => {
-                eprintln!("Error opening input file {:?}: {}", input_path, e);
+                eprintln!("Error reading input file {:?}: {}", input_path, e);
                 exit(1);
             }
         };
-        let mut buffer = Vec::new();
-        if let Err(e) = file.read_to_end(&mut buffer) {
-            eprintln!("Error reading input file {:?}: {}", input_path, e);
-            exit(1);
-        }
         let mut cursor = Cursor::new(buffer.as_slice());
 
         let header = match crate::header::parse_header(&mut cursor) {

@@ -1,10 +1,23 @@
 use memmap2::Mmap;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{copy, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 use zstd::stream::read::Decoder;
+
+pub enum InputData {
+    Mmap(Mmap),
+    Buffer(Vec<u8>),
+}
+
+impl InputData {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => &mmap[..],
+            Self::Buffer(buffer) => buffer.as_slice(),
+        }
+    }
+}
 
 fn is_zstd_input(path: &Path) -> bool {
     path.extension()
@@ -38,26 +51,28 @@ pub fn read_input_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     }
 }
 
-pub fn open_input_mmap(path: &Path) -> Result<(Mmap, Option<NamedTempFile>), Box<dyn Error>> {
-    if !is_zstd_input(path) {
+pub fn open_input_data(path: &Path) -> Result<InputData, Box<dyn Error>> {
+    if is_zstd_input(path) {
+        Ok(InputData::Buffer(read_input_bytes(path)?))
+    } else {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        return Ok((mmap, None));
+        Ok(InputData::Mmap(mmap))
     }
-
-    let mut decoder = Decoder::new(File::open(path)?)?;
-    let mut temp = tempfile::Builder::new()
-        .prefix("frinz_input_")
-        .suffix(".cor")
-        .tempfile_in(std::env::temp_dir())?;
-    copy(&mut decoder, &mut temp)?;
-    temp.as_file_mut().flush()?;
-
-    let map_file = temp.reopen()?;
-    let mmap = unsafe { Mmap::map(&map_file)? };
-    Ok((mmap, Some(temp)))
 }
 
+#[allow(dead_code)]
+pub fn open_input_mmap(path: &Path) -> Result<Mmap, Box<dyn Error>> {
+    if is_zstd_input(path) {
+        return Err("zstd-compressed input cannot be memory-mapped directly; use open_input_data or read_input_bytes".into());
+    }
+
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    Ok(mmap)
+}
+
+#[allow(dead_code)]
 pub fn output_stem_from_path(path: &Path) -> Result<String, Box<dyn Error>> {
     let stem = if is_zstd_input(path) {
         PathBuf::from(path.file_stem().ok_or("Invalid input filename")?)

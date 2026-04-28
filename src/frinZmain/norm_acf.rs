@@ -1,14 +1,13 @@
 use std::error::Error;
-use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{DateTime, TimeZone, Utc};
-use memmap2::Mmap;
 use num_complex::Complex;
 
 use crate::header::{parse_header, CorHeader};
+use crate::input_support::{open_input_data, InputData};
 use crate::read::{
     calculate_sector_range, normalize_effective_integration_time, EFFECTIVE_INTEG_TIME_OFFSET,
     FILE_HEADER_SIZE, SECTOR_HEADER_SIZE,
@@ -17,9 +16,7 @@ use crate::read::{
 type C32 = Complex<f32>;
 
 struct AutoCorFile {
-    #[allow(dead_code)]
-    file: File,
-    mmap: Mmap,
+    input: InputData,
     header: CorHeader,
     path: PathBuf,
 }
@@ -133,7 +130,7 @@ fn read_norm_timing(
         return Err("skip/length の指定が利用可能なセクター数を超えています".into());
     }
 
-    let mut cursor = Cursor::new(&auto.mmap[..]);
+    let mut cursor = Cursor::new(auto.input.as_slice());
     let sector_start_pos = FILE_HEADER_SIZE + start as u64 * sector_size as u64;
     cursor.set_position(sector_start_pos);
     let correlation_time_sec = cursor.read_i32::<LittleEndian>()?;
@@ -164,8 +161,8 @@ fn normalize_from_auto_streams(
     let right_sector_size = (8 + right.header.fft_point / 4) * 16;
     let (start, end) = calculate_sector_range(&left.header, length, skip, loop_index, is_cumulate);
 
-    let mut left_cursor = Cursor::new(&left.mmap[..]);
-    let mut right_cursor = Cursor::new(&right.mmap[..]);
+    let mut left_cursor = Cursor::new(left.input.as_slice());
+    let mut right_cursor = Cursor::new(right.input.as_slice());
     let mut sample_idx = 0usize;
 
     for sector in start..end {
@@ -206,13 +203,11 @@ fn normalize_from_auto_streams(
 }
 
 fn load_auto_cor_file(path: &Path) -> Result<AutoCorFile, Box<dyn Error>> {
-    let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut cursor = Cursor::new(&mmap[..]);
+    let input = open_input_data(path)?;
+    let mut cursor = Cursor::new(input.as_slice());
     let header = parse_header(&mut cursor)?;
     Ok(AutoCorFile {
-        file,
-        mmap,
+        input,
         header,
         path: path.to_path_buf(),
     })

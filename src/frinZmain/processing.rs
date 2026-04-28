@@ -18,6 +18,7 @@ use crate::fft::{
     perform_ifft_on_vec, process_fft, process_fft_with_phase_correction, process_ifft,
 };
 use crate::header::{parse_header, CorHeader};
+use crate::input_support::open_input_data;
 use crate::norm_acf::NormAcfContext;
 use crate::output::{
     format_delay_output, format_freq_output, generate_output_names, output_header_info,
@@ -31,8 +32,6 @@ use crate::search;
 use crate::utils::{
     delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg, window_bounds,
 };
-use memmap2::Mmap;
-
 type C32 = Complex<f32>;
 
 #[derive(Debug, Clone)]
@@ -305,9 +304,8 @@ pub fn process_cor_file(
     }
 
     // --- Read .cor File ---
-    let file = File::open(input_path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut cursor = Cursor::new(&mmap[..]);
+    let input_data = open_input_data(input_path)?;
+    let mut cursor = Cursor::new(input_data.as_slice());
 
     // --- Parse Header ---
     let header = parse_header(&mut cursor)?;

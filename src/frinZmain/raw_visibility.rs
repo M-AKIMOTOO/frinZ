@@ -1,14 +1,13 @@
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
-use std::io::Read;
 use std::path::Path;
 
 use crate::args::Args;
 use crate::header::parse_header;
+use crate::input_support::read_input_bytes;
 use crate::plot;
 use crate::read::read_visibility_data;
-use crate::utils::safe_arg;
 use num_complex::Complex;
 type C32 = Complex<f32>;
 
@@ -24,9 +23,7 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&output_dir)?;
     let base_filename = input_path.file_stem().unwrap().to_str().unwrap();
 
-    let mut file = fs::File::open(input_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let buffer = read_input_bytes(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     let header = parse_header(&mut cursor)?;
@@ -57,42 +54,19 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let heatmap_filename = format!("{}_heatmap_amp_phase.png", base_filename);
-    let scatter_filename = format!("{}_scatter_real_imag.png", base_filename);
-    let amp_phase_filename = format!("{}_scatter_amp_phase.png", base_filename);
-    let heatmap_filepath = output_dir.join(&heatmap_filename);
-    let scatter_filepath = output_dir.join(&scatter_filename);
-    let amp_phase_filepath = output_dir.join(&amp_phase_filename);
-
-    // Use a default sigma of 0.0 for blurring, as in the original frinZrawvis.
-    plot::plot_spectrum_heatmaps(&heatmap_filepath, &all_spectra, 0.0)?;
-
-    let mut real_values = Vec::new();
-    let mut imag_values = Vec::new();
-    let mut amp_values = Vec::new();
-    let mut phase_values = Vec::new();
-
-    for spectra in &all_spectra {
-        for value in spectra {
-            real_values.push(value.re);
-            imag_values.push(value.im);
-            amp_values.push(value.norm());
-            phase_values.push(safe_arg(value));
-        }
+    let amp_heatmap_filepath = output_dir.join(format!("{}_heatmap_amp.png", base_filename));
+    let phase_heatmap_filepath = output_dir.join(format!("{}_heatmap_phase.png", base_filename));
+    for legacy_filename in [
+        format!("{}_heatmap_amp_phase.png", base_filename),
+        format!("{}_scatter_real_imag.png", base_filename),
+        format!("{}_scatter_amp_phase.png", base_filename),
+    ] {
+        let _ = fs::remove_file(output_dir.join(legacy_filename));
     }
 
-    plot::plot_complex_scatter(&scatter_filepath, &real_values, &imag_values)?;
-    plot::plot_amp_phase_scatter(&amp_phase_filepath, &amp_values, &phase_values)?;
-    //plot::plot_complex_histograms(
-    //    &hist_filepath,
-    //    &hist_report_filepath,
-    //    &real_values,
-    //    &imag_values,
-    //    &amp_values,
-    //    &phase_values,
-    //)?;
-
-    //println!("#Raw visibility heatmaps saved to {} and {}", amp_filepath.display(), phase_filepath.display());
+    // Use a default sigma of 0.0 for blurring, as in the original frinZrawvis.
+    plot::plot_spectrum_amplitude_heatmap(&amp_heatmap_filepath, &all_spectra, 0.0)?;
+    plot::plot_spectrum_phase_heatmap(&phase_heatmap_filepath, &all_spectra, 0.0)?;
 
     Ok(())
 }

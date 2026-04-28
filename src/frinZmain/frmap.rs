@@ -4,7 +4,7 @@
 use std::error::Error;
 use std::fs;
 use std::fs::File;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::Path;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -14,6 +14,7 @@ use num_complex::Complex;
 use crate::args::Args;
 use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
+use crate::input_support::read_input_bytes;
 use crate::plot::{plot_cross_section, plot_sky_map, plot_uv_coverage};
 use crate::read::read_visibility_data;
 use crate::utils::{rate_cal, uvw_cal};
@@ -229,9 +230,7 @@ pub fn run_fringe_rate_map_analysis(
     let file_stem = input_path.file_stem().unwrap().to_str().unwrap();
 
     // --- Read .cor File ---
-    let mut file = fs::File::open(input_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let buffer = read_input_bytes(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     // --- Parse Header ---
@@ -600,9 +599,7 @@ fn run_frmap_maser(
     fs::create_dir_all(&frinz_dir)?;
     let file_stem = input_path.file_stem().unwrap().to_str().unwrap();
 
-    let mut file = File::open(input_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let buffer = read_input_bytes(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     let header = parse_header(&mut cursor)?;

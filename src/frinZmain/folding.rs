@@ -2,7 +2,6 @@ use astro::ecliptic;
 use astro::planet::{self, Planet};
 use astro::time;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use memmap2::Mmap;
 use nalgebra::{Matrix3, Vector3};
 use num_complex::Complex;
 use plotters::prelude::*;
@@ -15,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
 use crate::header::parse_header;
+use crate::input_support::open_input_data;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
@@ -762,9 +762,8 @@ pub fn run_folding_analysis(
         );
     }
 
-    let file = File::open(input_path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut cursor = Cursor::new(&mmap[..]);
+    let input_data = open_input_data(input_path)?;
+    let mut cursor = Cursor::new(input_data.as_slice());
     let header = parse_header(&mut cursor)?;
 
     let fft_half = (header.fft_point / 2) as usize;

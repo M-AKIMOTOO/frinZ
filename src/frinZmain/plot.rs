@@ -13,21 +13,76 @@ use crate::utils::safe_arg;
 use chrono::{DateTime, TimeZone, Utc};
 use ndarray::Array2; // Added for dynamic spectrum
 use num_complex::Complex;
+use plotters::backend::RGBPixel;
 use plotters::coord::Shift;
 use plotters::prelude::*;
 use plotters::style::colors::colormaps::ViridisRGB;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
+use rayon::prelude::*;
 use std::error::Error;
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::{fs::File, io::Write};
+
+static PLOT_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+const PLOT_MAX_THREADS: usize = 3;
+
+fn plot_pool() -> &'static rayon::ThreadPool {
+    PLOT_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(PLOT_MAX_THREADS)
+            .build()
+            .expect("failed to build plot thread pool")
+    })
+}
+
+fn build_heatmap_rgb_buffer<F>(
+    width: u32,
+    height: u32,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    amplitude_norm: f64,
+    heatmap_func: &F,
+) -> Vec<u8>
+where
+    F: Fn(f64, f64) -> f64 + Sync,
+{
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let x_den = (width_usize.saturating_sub(1)).max(1) as f64;
+    let y_den = (height_usize.saturating_sub(1)).max(1) as f64;
+    let amp = amplitude_norm.max(1e-30);
+    let mut buffer = vec![0u8; width_usize * height_usize * 3];
+
+    plot_pool().install(|| {
+        buffer
+            .par_chunks_mut(3)
+            .enumerate()
+            .for_each(|(idx, pixel)| {
+                let px = idx % width_usize;
+                let py = idx / width_usize;
+                let x = x_min + (x_max - x_min) * px as f64 / x_den;
+                let y = y_max - (y_max - y_min) * py as f64 / y_den;
+                let normalized = (heatmap_func(x, y) / amp).clamp(0.0, 1.0);
+                let (r, g, b) = HSLColor((1.0 - normalized) * 0.7, 1.0, 0.5).rgb();
+                pixel[0] = r;
+                pixel[1] = g;
+                pixel[2] = b;
+            });
+    });
+
+    buffer
+}
 
 pub fn delay_plane(
     delay_profile: &[(f64, f64)],
     delay_profile_pre_bp: Option<&[(f64, f64)]>,
     rate_profile: &[(f64, f64)],
     rate_profile_pre_bp: Option<&[(f64, f64)]>,
-    heatmap_func: impl Fn(f64, f64) -> f64,
+    heatmap_func: impl Fn(f64, f64) -> f64 + Sync,
     stat_keys: &[&str],
     stat_vals: &[&str],
     output_path: &str,
@@ -38,8 +93,8 @@ pub fn delay_plane(
     rrange: &[f32],
     mask: Option<(f32, f32, f32, f32)>,
     max_amplitude: f64,
-    heatmap_res_x: usize,
-    heatmap_res_y: usize,
+    _heatmap_res_x: usize,
+    _heatmap_res_y: usize,
     heatmap_only: bool,
     //cmap_time: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -145,34 +200,31 @@ pub fn delay_plane(
             .y_label_formatter(&|v| format!("{:.2e}", v))
             .draw()?;
 
-        let resolution_x = heatmap_res_x.max(3);
-        let resolution_y = heatmap_res_y.max(3);
         let amplitude_norm = if max_amplitude.is_finite() && max_amplitude > 0.0 {
             max_amplitude
         } else {
             1e-30
         };
-        let x_step = (heatmap_delay_max - heatmap_delay_min) / (resolution_x - 1) as f64;
-        let y_step = (heatmap_rate_max - heatmap_rate_min) / (resolution_y - 1) as f64;
-        for xi in 0..resolution_x {
-            for yi in 0..resolution_y {
-                let x = heatmap_delay_min
-                    + (heatmap_delay_max - heatmap_delay_min) * xi as f64
-                        / (resolution_x - 1) as f64;
-                let y = heatmap_rate_min
-                    + (heatmap_rate_max - heatmap_rate_min) * yi as f64 / (resolution_y - 1) as f64;
-                let val = heatmap_func(x, y);
-                let normalized_val = if amplitude_norm > 0.0 {
-                    (val / amplitude_norm).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                chart.draw_series(std::iter::once(Rectangle::new(
-                    [(x, y), (x + x_step, y + y_step)],
-                    HSLColor((1.0 - normalized_val) * 0.7, 1.0, 0.5).filled(),
-                )))?;
-            }
-        }
+        let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+        let bitmap_width = plot_x.len().max(1) as u32;
+        let bitmap_height = plot_y.len().max(1) as u32;
+        let heatmap_buffer = build_heatmap_rgb_buffer(
+            bitmap_width,
+            bitmap_height,
+            heatmap_delay_min,
+            heatmap_delay_max,
+            heatmap_rate_min,
+            heatmap_rate_max,
+            amplitude_norm,
+            &heatmap_func,
+        );
+        let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+            (heatmap_delay_min, heatmap_rate_max),
+            (bitmap_width, bitmap_height),
+            heatmap_buffer,
+        )
+        .ok_or("failed to create heatmap bitmap")?;
+        chart.draw_series(std::iter::once(bitmap))?;
         if let Some((mask_delay_min, mask_delay_max, mask_rate_min, mask_rate_max)) = mask {
             let x0 = mask_delay_min as f64;
             let x1 = mask_delay_max as f64;
@@ -415,8 +467,6 @@ pub fn delay_plane(
         .y_label_formatter(&|v| format!("{:.2e}", v))
         .draw()?;
 
-    let resolution_x = heatmap_res_x.max(3);
-    let resolution_y = heatmap_res_y.max(3);
     let (delay_min, delay_max_hm) = (heatmap_delay_min, heatmap_delay_max);
     let (rate_min_hm, rate_max_hm) = (heatmap_rate_min, heatmap_rate_max);
 
@@ -426,25 +476,26 @@ pub fn delay_plane(
         1e-30
     };
 
-    let x_step = (delay_max_hm - delay_min) / (resolution_x - 1) as f64;
-    let y_step = (rate_max_hm - rate_min_hm) / (resolution_y - 1) as f64;
-    for xi in 0..resolution_x {
-        for yi in 0..resolution_y {
-            let x = delay_min + (delay_max_hm - delay_min) * xi as f64 / (resolution_x - 1) as f64;
-            let y =
-                rate_min_hm + (rate_max_hm - rate_min_hm) * yi as f64 / (resolution_y - 1) as f64;
-            let val = heatmap_func(x, y);
-            let normalized_val = if amplitude_norm > 0.0 {
-                (val / amplitude_norm).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            chart3.draw_series(std::iter::once(Rectangle::new(
-                [(x, y), (x + x_step, y + y_step)],
-                HSLColor((1.0 - normalized_val) * 0.7, 1.0, 0.5).filled(),
-            )))?;
-        }
-    }
+    let (plot_x, plot_y) = chart3.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = build_heatmap_rgb_buffer(
+        bitmap_width,
+        bitmap_height,
+        delay_min,
+        delay_max_hm,
+        rate_min_hm,
+        rate_max_hm,
+        amplitude_norm,
+        &heatmap_func,
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (delay_min, rate_max_hm),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create heatmap bitmap")?;
+    chart3.draw_series(std::iter::once(bitmap))?;
     if let Some((mask_delay_min, mask_delay_max, mask_rate_min, mask_rate_max)) = mask {
         let x0 = mask_delay_min as f64;
         let x1 = mask_delay_max as f64;
@@ -544,7 +595,7 @@ pub fn frequency_plane(
     freq_phase_profile_pre_bp: Option<&[(f64, f64)]>,
     rate_profile: &[(f64, f64)],
     rate_profile_pre_bp: Option<&[(f64, f64)]>,
-    heatmap_func: impl Fn(f64, f64) -> f64,
+    heatmap_func: impl Fn(f64, f64) -> f64 + Sync,
     stat_keys: &[&str],
     stat_vals: &[&str],
     output_path: &str,
@@ -764,7 +815,7 @@ pub fn frequency_plane(
     for i in 0..resolution_y {
         for j in 0..resolution_x {
             let y = rate_min_x + (rate_max_x - rate_min_x) * i as f64 / (resolution_y - 1) as f64;
-            let x = 0.0 + bw * j as f64 / (resolution_x - 1) as f64;
+            let x = bw * j as f64 / (resolution_x - 1) as f64;
             let val = heatmap_func(x, y);
             heatmap_values.push(val);
             if val > heatmap_data_max_val {
@@ -777,7 +828,7 @@ pub fn frequency_plane(
         let i = idx / resolution_x;
         let j = idx % resolution_x;
         let y = rate_min_x + (rate_max_x - rate_min_x) * i as f64 / (resolution_y - 1) as f64;
-        let x = 0.0 + bw * j as f64 / (resolution_x - 1) as f64;
+        let x = bw * j as f64 / (resolution_x - 1) as f64;
         let x_step = bw / (resolution_x - 1) as f64;
         let y_step = (rate_max_x - rate_min_x) / (resolution_y - 1) as f64;
         let normalized_val = if heatmap_data_max_val > 0.0 {
@@ -1909,7 +1960,7 @@ fn draw_heatmap_with_colorbar(
     let (rows, cols) = (data.len(), data[0].len());
 
     let (area_width, _area_height) = area.dim_in_pixel();
-    let color_bar_area_width: u32 = 110;
+    let color_bar_area_width: u32 = 150;
     let chart_width = area_width.saturating_sub(color_bar_area_width);
 
     area.fill(&WHITE)?;
@@ -1937,6 +1988,8 @@ fn draw_heatmap_with_colorbar(
         .y_desc(y_desc)
         .x_label_style(("sans-serif", 18).into_font())
         .y_label_style(("sans-serif", 18).into_font())
+        .x_label_formatter(&|v| format!("{v}"))
+        .y_label_formatter(&|v| format!("{v}"))
         .draw()?;
 
     chart.draw_series(
@@ -2003,12 +2056,14 @@ fn draw_heatmap_with_colorbar(
         )?;
     }
 
+    let (label_strip_width, _) = label_strip.dim_in_pixel();
+    let title_x = (label_strip_width as i32 - 34).max(24);
     label_strip.draw_text(
         color_bar_title,
         &TextStyle::from(("sans-serif", 18).into_font())
             .color(&BLACK)
             .transform(FontTransform::Rotate270),
-        ((bar_strip_width as i32) + 24, (bar_strip_height / 2) as i32),
+        (title_x, (bar_strip_height / 2) as i32),
     )?;
     Ok(())
 }
@@ -2075,6 +2130,94 @@ pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
 
     draw_heatmap_with_colorbar(
         &right_area,
+        &blurred_phases,
+        "Channels",
+        "PP",
+        "Phase (deg)",
+        -180.0,
+        180.0,
+        9,
+        |v| ((v + 180.0) / 360.0) as f64,
+        |v| format!("{:.0}", v),
+    )?;
+
+    root.present()?;
+    compress_png(output_path.as_ref());
+    Ok(())
+}
+
+pub fn plot_spectrum_amplitude_heatmap<P: AsRef<Path>>(
+    output_path: P,
+    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    sigma: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
+        return Err("Spectrum data for heatmap is empty".into());
+    }
+
+    let root = BitMapBackend::new(output_path.as_ref(), (915, 576)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let amplitudes_2d: Vec<Vec<f32>> = spectrum_data
+        .iter()
+        .map(|row| row.iter().map(|c| c.norm()).collect())
+        .collect();
+    let blurred_amplitudes = gaussian_blur_2d(&amplitudes_2d, sigma);
+    let max_amp = blurred_amplitudes
+        .iter()
+        .flatten()
+        .cloned()
+        .fold(0.0, f32::max);
+    let min_amp = blurred_amplitudes
+        .iter()
+        .flatten()
+        .cloned()
+        .fold(f32::MAX, f32::min);
+
+    draw_heatmap_with_colorbar(
+        &root,
+        &blurred_amplitudes,
+        "Channels",
+        "PP",
+        "Amplitude (a.u.)",
+        min_amp,
+        max_amp,
+        5,
+        |v| {
+            if max_amp > min_amp {
+                ((v - min_amp) / (max_amp - min_amp)) as f64
+            } else {
+                0.0
+            }
+        },
+        |v| format!("{:.1e}", v),
+    )?;
+
+    root.present()?;
+    compress_png(output_path.as_ref());
+    Ok(())
+}
+
+pub fn plot_spectrum_phase_heatmap<P: AsRef<Path>>(
+    output_path: P,
+    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    sigma: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
+        return Err("Spectrum data for heatmap is empty".into());
+    }
+
+    let root = BitMapBackend::new(output_path.as_ref(), (915, 576)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let phases_2d: Vec<Vec<f32>> = spectrum_data
+        .iter()
+        .map(|row| row.iter().map(|c| safe_arg(c).to_degrees()).collect())
+        .collect();
+    let blurred_phases = gaussian_blur_2d(&phases_2d, sigma);
+
+    draw_heatmap_with_colorbar(
+        &root,
         &blurred_phases,
         "Channels",
         "PP",

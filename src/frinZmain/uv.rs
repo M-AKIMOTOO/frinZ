@@ -1,13 +1,14 @@
 use crate::args::Args;
 use crate::header::parse_header;
+use crate::input_support::read_input_bytes;
 use crate::plot::plot_uv_tracks;
 use crate::read::{read_sector_header, read_visibility_data};
 use crate::utils::{radec2azalt, uvw_cal};
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{Duration, TimeZone, Timelike, Utc};
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{Cursor, Read};
+use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 
 const MIN_ELEVATION_DEG: f32 = 5.0;
@@ -21,9 +22,7 @@ pub fn run_uv_plot(args: &Args, uv_mode: i32) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .ok_or("Error: --uv requires an --input file.")?;
 
-    let mut file = File::open(input_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let buffer = read_input_bytes(input_path)?;
 
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;

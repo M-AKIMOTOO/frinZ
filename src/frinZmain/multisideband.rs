@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, Cursor, ErrorKind, Read, Write};
+use std::io::{self, Cursor, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use num_complex::Complex;
@@ -10,6 +10,7 @@ use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
 use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
+use crate::input_support::read_input_bytes;
 use crate::plot::frequency_plane_msb;
 use crate::read::{read_sector_header, read_visibility_data};
 use crate::rfi::parse_rfi_ranges;
@@ -192,9 +193,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     writeln!(tee_writer, "  X-Band Input Delay: {} s", x_band_input_delay)?;
 
     // --- Process C-band data ---
-    let mut c_band_file = File::open(&c_band_path)?;
-    let mut c_band_buffer = Vec::new();
-    c_band_file.read_to_end(&mut c_band_buffer)?;
+    let c_band_buffer = read_input_bytes(&c_band_path)?;
     let mut c_band_cursor = Cursor::new(c_band_buffer.as_slice());
 
     let c_band_header = parse_header(&mut c_band_cursor)?;
@@ -217,9 +216,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     )?;
 
     // --- Process X-band data ---
-    let mut x_band_file = File::open(&x_band_path)?;
-    let mut x_band_buffer = Vec::new();
-    x_band_file.read_to_end(&mut x_band_buffer)?;
+    let x_band_buffer = read_input_bytes(&x_band_path)?;
     let mut x_band_cursor = Cursor::new(x_band_buffer.as_slice());
 
     let x_band_header = parse_header(&mut x_band_cursor)?;

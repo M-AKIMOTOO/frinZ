@@ -9,6 +9,7 @@ pub mod fitting;
 pub mod folding;
 pub mod frmap;
 pub mod header;
+pub mod input_support;
 pub mod maser;
 pub mod search;
 

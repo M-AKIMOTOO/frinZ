@@ -3,13 +3,14 @@ use ndarray::{Array1, Axis};
 use plotters::prelude::*;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::args::Args;
 use crate::fft::process_fft;
 use crate::header::{parse_header, CorHeader};
+use crate::input_support::read_input_bytes;
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 
@@ -883,9 +884,7 @@ fn get_spectrum_segment(
     loop_index: i32,
     log_lines: &mut Vec<String>,
 ) -> Result<Option<SpectrumData>, Box<dyn Error>> {
-    let mut file = File::open(file_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    let buffer = read_input_bytes(file_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     let header = parse_header(&mut cursor)?;

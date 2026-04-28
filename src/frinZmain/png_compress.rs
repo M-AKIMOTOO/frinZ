@@ -1,10 +1,16 @@
 use png::{AdaptiveFilterType, BitDepth, ColorType, Encoder, FilterType};
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    OnceLock,
+};
 
 static WARNED: AtomicBool = AtomicBool::new(false);
+static PNG_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+const PNG_MAX_THREADS: usize = 3;
 
 #[derive(Clone, Copy)]
 pub enum CompressQuality {
@@ -79,7 +85,8 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
 
     let mut best_png: Option<Vec<u8>> = None;
 
-    if let Some(candidate) = encode_best_lossless_png(rgba_bytes, width, height, PixelLayout::Rgba)
+    if let Some(candidate) =
+        encode_best_lossless_png(rgba_bytes, width, height, PixelLayout::Rgba, mode)
     {
         update_best(&mut best_png, candidate);
     }
@@ -87,7 +94,7 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
     if analysis.opaque {
         let rgb_bytes = rgba_to_rgb(rgba_bytes);
         if let Some(candidate) =
-            encode_best_lossless_png(&rgb_bytes, width, height, PixelLayout::Rgb)
+            encode_best_lossless_png(&rgb_bytes, width, height, PixelLayout::Rgb, mode)
         {
             update_best(&mut best_png, candidate);
         }
@@ -95,7 +102,7 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
         if analysis.grayscale {
             let gray_bytes = rgba_to_gray(rgba_bytes);
             if let Some(candidate) =
-                encode_best_lossless_png(&gray_bytes, width, height, PixelLayout::Grayscale)
+                encode_best_lossless_png(&gray_bytes, width, height, PixelLayout::Grayscale, mode)
             {
                 update_best(&mut best_png, candidate);
             }
@@ -107,6 +114,7 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
             width,
             height,
             PixelLayout::GrayscaleAlpha,
+            mode,
         ) {
             update_best(&mut best_png, candidate);
         }
@@ -120,11 +128,10 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
 }
 
 fn try_pngquant(path: &Path, original_size: usize, mode: CompressQuality) -> bool {
-    let (quality_min, quality_max) = match mode {
-        CompressQuality::High => ("60", "80"),
-        CompressQuality::Low => ("50", "70"),
+    let (quality_arg, speed_arg) = match mode {
+        CompressQuality::High => ("60-80", "3"),
+        CompressQuality::Low => ("50-70", "5"),
     };
-    let quality_arg = format!("{}-{}", quality_min, quality_max);
     let output_path = path.with_extension("pngquant.tmp.png");
 
     let status = Command::new("pngquant")
@@ -132,9 +139,9 @@ fn try_pngquant(path: &Path, original_size: usize, mode: CompressQuality) -> boo
         .arg("--skip-if-larger")
         .arg("--strip")
         .arg("--speed")
-        .arg("1")
+        .arg(speed_arg)
         .arg("--quality")
-        .arg(&quality_arg)
+        .arg(quality_arg)
         .arg("--output")
         .arg(&output_path)
         .arg("--")
@@ -228,17 +235,51 @@ fn encode_best_lossless_png(
     width: u32,
     height: u32,
     layout: PixelLayout,
+    mode: CompressQuality,
 ) -> Option<Vec<u8>> {
-    let strategies = [
-        (FilterType::NoFilter, AdaptiveFilterType::NonAdaptive),
-        (FilterType::Sub, AdaptiveFilterType::NonAdaptive),
-        (FilterType::Paeth, AdaptiveFilterType::NonAdaptive),
-        (FilterType::Avg, AdaptiveFilterType::NonAdaptive),
-        (FilterType::Sub, AdaptiveFilterType::Adaptive),
-    ];
+    let strategies: &[(FilterType, AdaptiveFilterType)] = match mode {
+        CompressQuality::High => &[
+            (FilterType::NoFilter, AdaptiveFilterType::NonAdaptive),
+            (FilterType::Sub, AdaptiveFilterType::NonAdaptive),
+            (FilterType::Up, AdaptiveFilterType::NonAdaptive),
+            (FilterType::Avg, AdaptiveFilterType::NonAdaptive),
+            (FilterType::Paeth, AdaptiveFilterType::NonAdaptive),
+            (FilterType::Sub, AdaptiveFilterType::Adaptive),
+            (FilterType::Paeth, AdaptiveFilterType::Adaptive),
+        ],
+        CompressQuality::Low => &[
+            (FilterType::Sub, AdaptiveFilterType::NonAdaptive),
+            (FilterType::Paeth, AdaptiveFilterType::NonAdaptive),
+        ],
+    };
+
+    if matches!(mode, CompressQuality::High) && strategies.len() > 1 {
+        let pool = PNG_POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(PNG_MAX_THREADS)
+                .build()
+                .expect("failed to build PNG compression thread pool")
+        });
+        return pool.install(|| {
+            strategies
+                .par_iter()
+                .filter_map(|&(filter, adaptive)| {
+                    encode_raw_png(
+                        raw,
+                        width,
+                        height,
+                        layout,
+                        BitDepth::Eight,
+                        filter,
+                        adaptive,
+                    )
+                })
+                .min_by_key(|candidate| candidate.len())
+        });
+    }
 
     let mut best: Option<Vec<u8>> = None;
-    for (filter, adaptive) in strategies {
+    for &(filter, adaptive) in strategies {
         if let Some(candidate) = encode_raw_png(
             raw,
             width,
@@ -251,6 +292,7 @@ fn encode_best_lossless_png(
             update_best(&mut best, candidate);
         }
     }
+
     best
 }
 

@@ -1,10 +1,10 @@
 use clap::{ArgAction, Command, CommandFactory, Parser};
 use std::error::Error;
-use std::fs::File;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use crate::header::parse_header;
+use crate::input_support::read_input_prefix;
 
 #[derive(Clone, Copy)]
 struct PrefixAliasSpec {
@@ -363,9 +363,7 @@ impl Args {
 }
 
 pub fn check_memory_usage(args: &Args, input_path: &Path) -> Result<bool, Box<dyn Error>> {
-    let mut file = File::open(input_path)?;
-    let mut buffer = vec![0; 256];
-    file.read_exact(&mut buffer)?;
+    let buffer = read_input_prefix(input_path, 256)?;
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
 

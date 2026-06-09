@@ -892,16 +892,23 @@ mod deep {
         );
         */
 
-        // Fringe phase correction must use the elapsed time from the file
-        // start/reference epoch. Do not reset this to zero for each short
-        // segment. Resetting it does not strongly affect SNR, because it is
-        // mostly a constant phase factor within one segment, but it changes
-        // the reported fringe phase whenever the fitted residual rate changes.
-        // This can produce apparent phase steps in add-plot time series.
-        let start_time_offset_sec = current_obs_time
-            .signed_duration_since(*obs_time)
-            .num_milliseconds() as f32
-            * 1.0e-3;
+        // Use the midpoint of each analyzed segment as the phase reference
+        // for residual rate correction.
+        //
+        // process_fft_with_phase_correction() evaluates the time for row_idx as
+        //
+        //   t = row_idx * effective_integ_time + start_time_offset_sec.
+        //
+        // Therefore, choosing
+        //
+        //   start_time_offset_sec = -0.5 * (physical_length - 1) * dt
+        //
+        // makes the segment midpoint t=0. This keeps the displayed fringe
+        // phase local to each 2-s segment, which matches the conventional
+        // fringe output more closely than using the absolute time from the
+        // beginning of the file.
+        let start_time_offset_sec =
+            -0.5_f32 * (physical_length.saturating_sub(1) as f32) * effective_integ_time;
 
         if current_length <= 0 {
             return Err("有効なセクター長が 0 以下です".into());

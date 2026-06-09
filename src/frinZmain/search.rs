@@ -809,7 +809,7 @@ mod deep {
         physical_length: i32,
         effective_integ_time: f32,
         current_obs_time: &DateTime<Utc>,
-        _obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
         rfi_ranges: &[(usize, usize)],
         bandpass_data: &Option<Vec<C32>>,
         args: &Args,
@@ -824,6 +824,7 @@ mod deep {
             physical_length,
             effective_integ_time,
             current_obs_time,
+            obs_time,
             rfi_ranges,
             bandpass_data,
             args,
@@ -841,7 +842,7 @@ mod deep {
         physical_length: i32,
         effective_integ_time: f32,
         current_obs_time: &DateTime<Utc>,
-        _obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
         rfi_ranges: &[(usize, usize)],
         bandpass_data: &Option<Vec<C32>>,
         args: &Args,
@@ -856,6 +857,7 @@ mod deep {
             physical_length,
             effective_integ_time,
             current_obs_time,
+            obs_time,
             rfi_ranges,
             bandpass_data,
             args,
@@ -873,6 +875,7 @@ mod deep {
         physical_length: i32,
         effective_integ_time: f32,
         current_obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
         rfi_ranges: &[(usize, usize)],
         bandpass_data: &Option<Vec<C32>>,
         args: &Args,
@@ -889,8 +892,16 @@ mod deep {
         );
         */
 
-        // フリンジ補正はファイル開始時刻からの経過時間で行う
-        let start_time_offset_sec = 0.0;
+        // Fringe phase correction must use the elapsed time from the file
+        // start/reference epoch. Do not reset this to zero for each short
+        // segment. Resetting it does not strongly affect SNR, because it is
+        // mostly a constant phase factor within one segment, but it changes
+        // the reported fringe phase whenever the fitted residual rate changes.
+        // This can produce apparent phase steps in add-plot time series.
+        let start_time_offset_sec = current_obs_time
+            .signed_duration_since(*obs_time)
+            .num_milliseconds() as f32
+            * 1.0e-3;
 
         if current_length <= 0 {
             return Err("有効なセクター長が 0 以下です".into());

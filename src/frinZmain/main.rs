@@ -115,6 +115,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.search.push("peak".to_string());
     }
 
+    // deep2 is now integrated into peak. Keep this alias for older command lines
+    // so that --search deep2 does not silently fall back to non-search mode.
+    if args.primary_search_mode() == Some("deep2") {
+        eprintln!("#INFO: --search deep2 is deprecated; using --search peak instead.");
+        if let Some(first) = args.search.first_mut() {
+            *first = "peak".to_string();
+        }
+    }
+
     if args.scan_correct.is_some() {
         if !args.search.is_empty() {
             eprintln!("Error: --scan-correct cannot be used with --search.");
@@ -122,16 +131,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if matches!(
-        args.primary_search_mode(),
-        Some("peak") | Some("deep") | Some("deep2")
-    ) {
+    if matches!(args.primary_search_mode(), Some("peak") | Some("deep")) {
         args.rate_padding = 8;
     } else if args.cumulate != 0 {
         // シンプルな仕様: --cumulate が指定されたら rate_padding は常に 1 にする
         args.rate_padding = 1;
     }
-    if matches!(args.primary_search_mode(), Some("deep") | Some("deep2")) && !iter_explicit {
+    if matches!(args.primary_search_mode(), Some("peak") | Some("deep")) && !iter_explicit {
         args.iter = 4;
     }
 

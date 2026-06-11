@@ -29,3 +29,7 @@ Thumbs.db
 
 # Keep source docs, but ignore old scratch notes
 /memo.txt
+
+# Patches and original source backups
+*.patch
+*.orig

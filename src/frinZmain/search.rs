@@ -1,5 +1,5 @@
 pub use acel::run_acel_search_analysis;
-pub use deep::{run_deep2_search, run_deep_search, DeepSearchParams, DeepSearchResult};
+pub use deep::{run_deep_search, run_deep2_search, run_peak_search, DeepSearchParams, DeepSearchResult};
 
 mod acel {
     use std::error::Error;
@@ -111,6 +111,19 @@ mod acel {
         let mut residual_rates_hz: Vec<f32> = Vec::new();
         let mut residual_delays_samples: Vec<f32> = Vec::new();
 
+        // --search acel estimates acceleration from a time series of fringe phases.
+        // Therefore each phase/delay/rate measurement must use the same accurate
+        // peak search settings as the normal `--search peak` mode.
+        //
+        // The top-level `--search acel` path bypasses the usual primary-search
+        // normalization in main.rs, so set the peak parameters explicitly here.
+        let mut peak_args = args.clone();
+        peak_args.search = vec!["peak".to_string()];
+        peak_args.rate_padding = 8;
+        if peak_args.iter < 4 {
+            peak_args.iter = 4;
+        }
+
         for data_point in collected_data {
             let start_time_offset_sec = (data_point.obs_time - obs_time_start).num_seconds() as f32;
 
@@ -127,7 +140,7 @@ mod acel {
             let (analysis_results, _, _, _) = run_analysis_pipeline(
                 &data_point.complex_vec,
                 header,
-                args,
+                &peak_args,
                 Some("peak"),
                 args.delay_correct,
                 current_total_rate_correct,
@@ -555,6 +568,7 @@ mod deep {
     enum DeepSearchAlgorithm {
         FullGrid,
         AxisThenLocal,
+        PeakPolish,
     }
 
     #[allow(dead_code)]
@@ -563,6 +577,7 @@ mod deep {
             match self {
                 Self::FullGrid => "deep",
                 Self::AxisThenLocal => "deep2",
+                Self::PeakPolish => "peak",
             }
         }
 
@@ -570,6 +585,7 @@ mod deep {
             match self {
                 Self::FullGrid => "DEEP SEARCH",
                 Self::AxisThenLocal => "DEEP2 SEARCH",
+                Self::PeakPolish => "PEAK SEARCH",
             }
         }
     }
@@ -623,7 +639,12 @@ mod deep {
 
     impl<'a> DeepSearchContext<'a> {
         fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
-            if rate == 0.0 && delay == 0.0 && self.args.acel_correct == 0.0 {
+            if rate == 0.0
+                && delay == 0.0
+                && self.args.acel_correct == 0.0
+                && self.args.jerk_correct == 0.0
+                && self.args.snap_correct == 0.0
+            {
                 process_fft(
                     self.complex_vec,
                     self.physical_length,
@@ -643,6 +664,8 @@ mod deep {
                     rate,
                     delay,
                     self.args.acel_correct,
+                    self.args.jerk_correct,
+                    self.args.snap_correct,
                     self.effective_integ_time,
                     self.start_time_offset_sec,
                 )
@@ -835,6 +858,45 @@ mod deep {
         )
     }
 
+
+    pub fn run_peak_search(
+        complex_vec: &[C32],
+        header: &CorHeader,
+        current_length: i32,
+        physical_length: i32,
+        effective_integ_time: f32,
+        current_obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
+        rfi_ranges: &[(usize, usize)],
+        bandpass_data: &Option<Vec<C32>>,
+        args: &Args,
+        pp: i32,
+        cpu_count_arg: u32,
+        previous_solution: Option<(f32, f32)>,
+    ) -> Result<DeepSearchResult, Box<dyn Error>> {
+        run_deep_search_impl(
+            complex_vec,
+            header,
+            current_length,
+            physical_length,
+            effective_integ_time,
+            current_obs_time,
+            obs_time,
+            rfi_ranges,
+            bandpass_data,
+            args,
+            pp,
+            cpu_count_arg,
+            previous_solution,
+            DeepSearchAlgorithm::PeakPolish,
+        )
+    }
+
+    // Deprecated internal compatibility path.
+    // Keep this around for a while as a comparison target, but the public
+    // --search peak mode now uses the same AxisThenLocal + final local polish
+    // algorithm via run_peak_search().
+    #[allow(dead_code)]
     pub fn run_deep2_search(
         complex_vec: &[C32],
         header: &CorHeader,
@@ -1031,16 +1093,18 @@ mod deep {
                     rate_step,
                     &pool,
                 )?,
-                DeepSearchAlgorithm::AxisThenLocal => parallel_axis_search(
-                    &context,
-                    current_delay,
-                    current_rate,
-                    delay_range,
-                    rate_range,
-                    delay_step,
-                    rate_step,
-                    &pool,
-                )?,
+                DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish => {
+                    parallel_axis_search(
+                        &context,
+                        current_delay,
+                        current_rate,
+                        delay_range,
+                        rate_range,
+                        delay_step,
+                        rate_step,
+                        &pool,
+                    )?
+                }
             };
 
             // 結果を更新
@@ -1059,7 +1123,7 @@ mod deep {
             */
         }
 
-        if algorithm == DeepSearchAlgorithm::AxisThenLocal {
+        if matches!(algorithm, DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish) {
             let final_scale = 10.0_f32.powi(search_params.max_iterations.saturating_sub(1) as i32);
             let final_delay_step = search_params.delay_fine_step / final_scale;
             let final_rate_step =

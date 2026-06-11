@@ -154,6 +154,8 @@ pub struct AnalysisResults {
     // Add new fields here
     // pub residual_acel: f32,
     pub corrected_acel: f32,
+    pub corrected_jerk: f32,
+    pub corrected_snap: f32,
     // Ranges
     pub rate_range: Vec<f32>,
     // Sky Coordinates
@@ -739,6 +741,8 @@ pub fn analyze_results(
         // Initialize new fields
         // residual_acel: 0.0, // Placeholder
         corrected_acel: args.acel_correct,
+        corrected_jerk: args.jerk_correct,
+        corrected_snap: args.snap_correct,
         rate_range,
         l_coord,
         m_coord,

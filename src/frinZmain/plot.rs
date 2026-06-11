@@ -1501,6 +1501,7 @@ pub fn plot_acel_search_result<P: AsRef<Path>>(
         println!("Warning: No data to plot for {}.", title);
         return Ok(());
     }
+
     let mut min_time = f64::INFINITY;
     let mut max_time = f64::NEG_INFINITY;
     let mut min_val = f64::INFINITY;
@@ -1509,21 +1510,14 @@ pub fn plot_acel_search_result<P: AsRef<Path>>(
     for (&t, &y) in times.iter().zip(observed.iter()) {
         min_time = min_time.min(t);
         max_time = max_time.max(t);
-        min_val = min_val.min(y as f64);
-        max_val = max_val.max(y as f64);
+        min_val = min_val.min(y);
+        max_val = max_val.max(y);
     }
 
     if let Some(fit) = fitted {
         for &y in fit {
-            min_val = min_val.min(y as f64);
-            max_val = max_val.max(y as f64);
-        }
-    }
-
-    if let Some(res) = residuals {
-        for &y in res {
-            min_val = min_val.min(y as f64);
-            max_val = max_val.max(y as f64);
+            min_val = min_val.min(y);
+            max_val = max_val.max(y);
         }
     }
 
@@ -1533,71 +1527,158 @@ pub fn plot_acel_search_result<P: AsRef<Path>>(
     if (max_val - min_val).abs() < f64::EPSILON {
         max_val += 1.0;
         min_val -= 1.0;
+    } else {
+        let pad = (max_val - min_val).abs() * 0.08;
+        max_val += pad;
+        min_val -= pad;
     }
+
+    let rate_like = y_label.contains("Rate");
+    let left_formatter = move |v: &f64| {
+        if rate_like {
+            format!("{:.2e}", v)
+        } else {
+            format!("{:.2}", v)
+        }
+    };
+    let right_formatter = move |v: &f64| {
+        if rate_like {
+            format!("{:.2e}", v)
+        } else {
+            format!("{:.2}", v)
+        }
+    };
 
     let root = BitMapBackend::new(output_path.as_ref(), (900, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(title, ("sans-serif", 25).into_font())
-        .margin(10)
-        .x_label_area_size(60)
-        .y_label_area_size(100)
-        .build_cartesian_2d(min_time..max_time, min_val..max_val)?;
-
-    chart
-        .configure_mesh()
-        .x_desc("Time [s]")
-        .y_desc(y_label)
-        .x_label_formatter(&|v| format!("{:.0}", v))
-        .y_label_formatter(if y_label.contains("Rate") {
-            &|v| format!("{:.2e}", v)
+    if let Some(res) = residuals.filter(|r| !r.is_empty()) {
+        let mut min_res = f64::INFINITY;
+        let mut max_res = f64::NEG_INFINITY;
+        for &y in res {
+            min_res = min_res.min(y);
+            max_res = max_res.max(y);
+        }
+        if (max_res - min_res).abs() < f64::EPSILON {
+            max_res += 1.0;
+            min_res -= 1.0;
         } else {
-            &|v| format!("{:.2}", v)
-        })
-        .x_labels(10)
-        .y_labels(10)
-        .x_max_light_lines(0)
-        .y_max_light_lines(0)
-        .label_style(("sans-serif", 20).into_font())
-        .draw()?;
+            let pad = (max_res - min_res).abs() * 0.12;
+            max_res += pad;
+            min_res -= pad;
+        }
 
-    chart
-        .draw_series(PointSeries::of_element(
-            times.iter().zip(observed.iter()).map(|(&t, &y)| (t, y)),
-            3,
-            &BLUE,
-            &|c, s, st| Circle::new(c, s, st.filled()),
-        ))?
-        .label("Observed")
-        .legend(|(x, y)| Circle::new((x, y), 4, BLUE.filled()));
+        let mut chart = ChartBuilder::on(&root)
+            .caption(title, ("sans-serif", 25).into_font())
+            .margin(10)
+            .x_label_area_size(60)
+            .y_label_area_size(100)
+            .right_y_label_area_size(100)
+            .build_cartesian_2d(min_time..max_time, min_val..max_val)?
+            .set_secondary_coord(min_time..max_time, min_res..max_res);
 
-    if let Some(fit) = fitted {
         chart
-            .draw_series(LineSeries::new(
-                times.iter().zip(fit.iter()).map(|(&t, &y)| (t, y)),
-                &RED,
+            .configure_mesh()
+            .x_desc("Time [s]")
+            .y_desc(y_label)
+            .x_label_formatter(&|v| format!("{:.0}", v))
+            .y_label_formatter(&left_formatter)
+            .x_labels(10)
+            .y_labels(10)
+            .x_max_light_lines(0)
+            .y_max_light_lines(0)
+            .label_style(("sans-serif", 20).into_font())
+            .draw()?;
+
+        chart
+            .configure_secondary_axes()
+            .y_desc(format!("Residual ({})", y_label))
+            .y_label_formatter(&right_formatter)
+            .label_style(("sans-serif", 20).into_font())
+            .draw()?;
+
+        chart
+            .draw_series(PointSeries::of_element(
+                times.iter().zip(observed.iter()).map(|(&t, &y)| (t, y)),
+                3,
+                &BLUE,
+                &|c, s, st| Circle::new(c, s, st.filled()),
             ))?
-            .label("Fitted")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
-    }
+            .label("Observed")
+            .legend(|(x, y)| Circle::new((x, y), 4, BLUE.filled()));
 
-    if let Some(res) = residuals {
+        if let Some(fit) = fitted {
+            chart
+                .draw_series(LineSeries::new(
+                    times.iter().zip(fit.iter()).map(|(&t, &y)| (t, y)),
+                    &RED,
+                ))?
+                .label("Fitted")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
+        }
+
         chart
-            .draw_series(LineSeries::new(
+            .draw_secondary_series(LineSeries::new(
                 times.iter().zip(res.iter()).map(|(&t, &y)| (t, y)),
                 &GREEN,
             ))?
-            .label("Residual")
+            .label("Residual (right)")
             .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
-    }
 
-    chart
-        .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
-        .label_font(("sans-serif", 18).into_font())
-        .draw()?;
+        chart
+            .configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .label_font(("sans-serif", 18).into_font())
+            .draw()?;
+    } else {
+        let mut chart = ChartBuilder::on(&root)
+            .caption(title, ("sans-serif", 25).into_font())
+            .margin(10)
+            .x_label_area_size(60)
+            .y_label_area_size(100)
+            .build_cartesian_2d(min_time..max_time, min_val..max_val)?;
+
+        chart
+            .configure_mesh()
+            .x_desc("Time [s]")
+            .y_desc(y_label)
+            .x_label_formatter(&|v| format!("{:.0}", v))
+            .y_label_formatter(&left_formatter)
+            .x_labels(10)
+            .y_labels(10)
+            .x_max_light_lines(0)
+            .y_max_light_lines(0)
+            .label_style(("sans-serif", 20).into_font())
+            .draw()?;
+
+        chart
+            .draw_series(PointSeries::of_element(
+                times.iter().zip(observed.iter()).map(|(&t, &y)| (t, y)),
+                3,
+                &BLUE,
+                &|c, s, st| Circle::new(c, s, st.filled()),
+            ))?
+            .label("Observed")
+            .legend(|(x, y)| Circle::new((x, y), 4, BLUE.filled()));
+
+        if let Some(fit) = fitted {
+            chart
+                .draw_series(LineSeries::new(
+                    times.iter().zip(fit.iter()).map(|(&t, &y)| (t, y)),
+                    &RED,
+                ))?
+                .label("Fitted")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
+        }
+
+        chart
+            .configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .label_font(("sans-serif", 18).into_font())
+            .draw()?;
+    }
 
     root.present()?;
     compress_png_with_mode(output_path.as_ref(), CompressQuality::Low);

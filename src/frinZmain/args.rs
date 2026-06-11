@@ -97,6 +97,8 @@ const EXPLICIT_ALIASES: &[(&str, &[&str])] = &[
     ("delay_correct", &["delay", "delay-corr"]),
     ("rate_correct", &["rate", "rate-corr"]),
     ("acel_correct", &["acel", "acel-corr"]),
+    ("jerk_correct", &["jerk", "jerk-corr"]),
+    ("snap_correct", &["snap", "snap-corr"]),
     ("drange", &["delay-w", "delay-win"]),
     ("rrange", &["rate-w", "rate-win"]),
     ("in_beam", &["inbeam", "in-beam-vlbi"]),
@@ -195,13 +197,21 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub delay_correct: f32,
 
-    /// Rate correction value.
+    /// Rate correction value [Hz]. Scientific notation is accepted, e.g. 1.234e-13.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub rate_correct: f32,
 
-    /// Acceleration correction value.
+    /// Acceleration correction value [Hz/s]. Scientific notation is accepted, e.g. 1.234e-13.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub acel_correct: f32,
+
+    /// Jerk correction value [Hz/s^2]. Scientific notation is accepted, e.g. 1.234e-13.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    pub jerk_correct: f32,
+
+    /// Snap correction value [Hz/s^3]. Scientific notation is accepted, e.g. 1.234e-13.
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    pub snap_correct: f32,
 
     /// Apply scan table corrections (CSV: start, integ, delay[samp], rate[Hz]).
     #[arg(long, value_name = "FILE")]

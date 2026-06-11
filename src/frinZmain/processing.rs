@@ -15,7 +15,8 @@ use crate::bandpass::{
     apply_bandpass_correction, read_bandpass_file, write_complex_spectrum_binary,
 };
 use crate::fft::{
-    perform_ifft_on_vec, process_fft, process_fft_with_phase_correction, process_ifft,
+    apply_phase_correction_in_place, perform_ifft_on_vec, process_fft,
+    process_fft_with_phase_correction, process_ifft,
 };
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
@@ -30,7 +31,7 @@ use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
 use crate::utils::{
-    delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg, window_bounds,
+    delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg,
 };
 type C32 = Complex<f32>;
 
@@ -545,6 +546,35 @@ pub fn process_cor_file(
             break;
         }
 
+        let (manual_delay_correct, manual_rate_correct) = resolve_delay_rate(
+            args.delay_correct,
+            args.rate_correct,
+            scan_corrections.as_deref(),
+            &current_obs_time,
+        );
+        let manual_acel_correct = args.acel_correct;
+
+        if manual_delay_correct != 0.0 || manual_rate_correct != 0.0 || manual_acel_correct != 0.0 {
+            let start_time_offset_sec = current_obs_time
+                .signed_duration_since(file_start_time)
+                .num_milliseconds() as f32
+                / 1000.0;
+
+            apply_phase_correction_in_place(
+                &mut complex_vec,
+                fft_point_half_used,
+                manual_rate_correct,
+                manual_delay_correct,
+                manual_acel_correct,
+                args.jerk_correct,
+                args.snap_correct,
+                effective_integ_time,
+                header.sampling_speed as u32,
+                effective_fft_point as u32,
+                start_time_offset_sec,
+            );
+        }
+
         let current_length =
             pad_time_rows_to_power_of_two(&mut complex_vec, actual_length, fft_point_half_used);
 
@@ -560,52 +590,66 @@ pub fn process_cor_file(
             continue;
         }
 
-        let (delay_correct_to_use, rate_correct_to_use) = resolve_delay_rate(
-            args.delay_correct,
-            args.rate_correct,
-            scan_corrections.as_deref(),
-            &current_obs_time,
-        );
         let mut loop_args = args.clone();
-        loop_args.delay_correct = delay_correct_to_use;
-        loop_args.rate_correct = rate_correct_to_use;
+        loop_args.delay_correct = 0.0;
+        loop_args.rate_correct = 0.0;
+        loop_args.acel_correct = 0.0;
 
         let primary_search_mode = args.primary_search_mode();
 
         let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp, pre_bandpass_results) =
             match primary_search_mode {
-                Some("deep") | Some("deep2") => {
-                    let run_deep = if primary_search_mode == Some("deep2") {
-                        search::run_deep2_search
+                Some("peak") | Some("deep") => {
+                    // Unified fringe search path:
+                    //   peak = fast AxisThenLocal search + final local polish
+                    //   deep = full-grid hierarchical search
+                    //
+                    // Do not feed the previous solution into rate_correct/delay_correct.
+                    // It is only used as the next search seed inside run_*_search().
+                    let mut search_result = if primary_search_mode == Some("deep") {
+                        search::run_deep_search(
+                            &complex_vec,
+                            &processing_header,
+                            current_length,
+                            physical_length,
+                            effective_integ_time,
+                            &current_obs_time,
+                            &file_start_time,
+                            &rfi_ranges,
+                            &bandpass_data,
+                            &loop_args,
+                            pp,
+                            loop_args.cpu,
+                            prev_deep_solution,
+                        )?
                     } else {
-                        search::run_deep_search
+                        search::run_peak_search(
+                            &complex_vec,
+                            &processing_header,
+                            current_length,
+                            physical_length,
+                            effective_integ_time,
+                            &current_obs_time,
+                            &file_start_time,
+                            &rfi_ranges,
+                            &bandpass_data,
+                            &loop_args,
+                            pp,
+                            loop_args.cpu,
+                            prev_deep_solution,
+                        )?
                     };
-                    let mut deep_search_result = run_deep(
-                        &complex_vec,
-                        &processing_header,
-                        current_length,
-                        physical_length,
-                        effective_integ_time,
-                        &current_obs_time,
-                        &file_start_time,
-                        &rfi_ranges,
-                        &bandpass_data,
-                        &loop_args,
-                        pp,
-                        loop_args.cpu,
-                        prev_deep_solution,
-                    )?;
-                    deep_search_result.analysis_results.residual_delay -= loop_args.delay_correct;
-                    deep_search_result.analysis_results.residual_rate -= loop_args.rate_correct;
+                    search_result.analysis_results.residual_delay -= loop_args.delay_correct;
+                    search_result.analysis_results.residual_rate -= loop_args.rate_correct;
                     // corrected_* should represent user-provided/static correction values
                     // (e.g. --delay/--rate or scan-correct), not search-updated totals.
-                    deep_search_result.analysis_results.corrected_delay = loop_args.delay_correct;
-                    deep_search_result.analysis_results.corrected_rate = loop_args.rate_correct;
+                    search_result.analysis_results.corrected_delay = loop_args.delay_correct;
+                    search_result.analysis_results.corrected_rate = loop_args.rate_correct;
                     let result_tuple = (
-                        deep_search_result.analysis_results,
-                        deep_search_result.freq_rate_array,
-                        deep_search_result.delay_rate_2d_data,
-                        deep_search_result.pre_bandpass_analysis_results,
+                        search_result.analysis_results,
+                        search_result.freq_rate_array,
+                        search_result.delay_rate_2d_data,
+                        search_result.pre_bandpass_analysis_results,
                     );
 
                     prev_deep_solution = Some((
@@ -614,97 +658,6 @@ pub fn process_cor_file(
                     ));
 
                     result_tuple
-                }
-                Some("peak") => {
-                    let mut total_delay_correct = loop_args.delay_correct;
-                    let mut total_rate_correct = loop_args.rate_correct;
-                    let delay_bounds = window_bounds(&args.drange);
-                    let rate_bounds = window_bounds(&args.rrange);
-
-                    for _ in 0..args.iter {
-                        let (iter_results, _, _, _) = run_analysis_pipeline(
-                            &complex_vec,
-                            &processing_header,
-                            &loop_args,
-                            Some("peak"),
-                            total_delay_correct,
-                            total_rate_correct,
-                            args.acel_correct,
-                            current_length,
-                            physical_length,
-                            effective_integ_time,
-                            &current_obs_time,
-                            &file_start_time,
-                            &rfi_ranges,
-                            &bandpass_data,
-                            false,
-                            effective_fft_point,
-                        )?;
-                        total_delay_correct += iter_results.delay_offset;
-                        total_rate_correct += iter_results.rate_offset;
-
-                        // Keep iterative updates inside user-specified absolute windows.
-                        if let Some((low, high)) = delay_bounds {
-                            total_delay_correct = total_delay_correct.clamp(low, high);
-                        }
-                        if let Some((low, high)) = rate_bounds {
-                            total_rate_correct = total_rate_correct.clamp(low, high);
-                        }
-                    }
-
-                    let (
-                        mut final_analysis_results,
-                        final_freq_rate_array,
-                        final_delay_rate_array,
-                        pre_bandpass_results,
-                    ) = run_analysis_pipeline(
-                        &complex_vec,
-                        &processing_header,
-                        &loop_args,
-                        Some("peak"),
-                        total_delay_correct,
-                        total_rate_correct,
-                        args.acel_correct,
-                        current_length,
-                        physical_length,
-                        effective_integ_time,
-                        &current_obs_time,
-                        &file_start_time,
-                        &rfi_ranges,
-                        &bandpass_data,
-                        args.plot,
-                        effective_fft_point,
-                    )?;
-
-                    // Reflect the final residual re-evaluation so the reported value
-                    // corresponds to the last constrained peak estimate.
-                    let mut final_delay_abs =
-                        total_delay_correct + final_analysis_results.residual_delay;
-                    let mut final_rate_abs =
-                        total_rate_correct + final_analysis_results.residual_rate;
-
-                    if let Some((low, high)) = delay_bounds {
-                        final_delay_abs = final_delay_abs.clamp(low, high);
-                    }
-                    if let Some((low, high)) = rate_bounds {
-                        final_rate_abs = final_rate_abs.clamp(low, high);
-                    }
-
-                    final_analysis_results.length_f32 =
-                        physical_length as f32 * effective_integ_time;
-                    // corrected_* should remain the externally given correction values.
-                    final_analysis_results.corrected_delay = loop_args.delay_correct;
-                    final_analysis_results.corrected_rate = loop_args.rate_correct;
-                    final_analysis_results.corrected_acel = args.acel_correct;
-                    final_analysis_results.residual_delay =
-                        final_delay_abs - loop_args.delay_correct;
-                    final_analysis_results.residual_rate = final_rate_abs - loop_args.rate_correct;
-                    (
-                        final_analysis_results,
-                        final_freq_rate_array,
-                        final_delay_rate_array,
-                        pre_bandpass_results,
-                    )
                 }
                 _ => {
                     // No search or other modes not handled here
@@ -718,9 +671,9 @@ pub fn process_cor_file(
                         &processing_header,
                         &loop_args,
                         None,
-                        delay_correct_to_use,
-                        rate_correct_to_use,
-                        args.acel_correct,
+                        loop_args.delay_correct,
+                        loop_args.rate_correct,
+                        loop_args.acel_correct,
                         current_length,
                         physical_length,
                         effective_integ_time,
@@ -1550,6 +1503,8 @@ pub(crate) fn run_analysis_pipeline(
     temp_args.delay_correct = delay_correct;
     temp_args.rate_correct = rate_correct;
     temp_args.acel_correct = acel_correct;
+    temp_args.jerk_correct = base_args.jerk_correct;
+    temp_args.snap_correct = base_args.snap_correct;
     temp_args.search = search_mode
         .map(|mode| vec![mode.to_string()])
         .unwrap_or_default();
@@ -1607,12 +1562,30 @@ pub(crate) fn run_analysis_pipeline(
         .into());
     }
 
-    let start_time_offset_sec = current_obs_time
-        .signed_duration_since(*file_start_time)
-        .num_seconds() as f32;
+    // For peak fringe-search, use the midpoint of the analyzed segment as the
+    // phase reference for residual rate correction, just like deep/deep2.
+    //
+    // If the absolute file-start time is used here, a tiny error in the peak
+    // residual-rate estimate is multiplied by the elapsed time from the file
+    // start and appears as a large, non-physical phase jump between loops.
+    // The midpoint reference keeps the reported phase local to each segment.
+    let use_midpoint_phase_reference =
+        search_mode == Some("peak") || base_args.primary_search_mode() == Some("peak");
+    let start_time_offset_sec = if use_midpoint_phase_reference {
+        -0.5_f32 * (physical_length.saturating_sub(1) as f32) * effective_integ_time
+    } else {
+        current_obs_time
+            .signed_duration_since(*file_start_time)
+            .num_seconds() as f32
+    };
 
     let (mut freq_rate_array, padding_length) =
-        if delay_correct != 0.0 || rate_correct != 0.0 || acel_correct != 0.0 {
+        if delay_correct != 0.0
+            || rate_correct != 0.0
+            || acel_correct != 0.0
+            || base_args.jerk_correct != 0.0
+            || base_args.snap_correct != 0.0
+        {
             process_fft_with_phase_correction(
                 complex_vec,
                 physical_length,
@@ -1623,6 +1596,8 @@ pub(crate) fn run_analysis_pipeline(
                 rate_correct,
                 delay_correct,
                 acel_correct,
+                base_args.jerk_correct,
+                base_args.snap_correct,
                 effective_integ_time,
                 start_time_offset_sec,
             )

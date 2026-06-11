@@ -400,13 +400,19 @@ fn apply_phase_solution(
     delay_samples: f32,
     rate_hz: f32,
     acel_hz: f32,
+    jerk_hz_per_s2: f32,
+    snap_hz_per_s3: f32,
     effective_integ_time: f32,
     start_time_offset_sec: f32,
 ) -> Vec<C32> {
     if fft_half == 0
         || complex_vec.is_empty()
         || complex_vec.len() % fft_half != 0
-        || (delay_samples == 0.0 && rate_hz == 0.0 && acel_hz == 0.0)
+        || (delay_samples == 0.0
+            && rate_hz == 0.0
+            && acel_hz == 0.0
+            && jerk_hz_per_s2 == 0.0
+            && snap_hz_per_s3 == 0.0)
     {
         return complex_vec.to_vec();
     }
@@ -418,6 +424,8 @@ fn apply_phase_solution(
         rate_hz,
         delay_samples,
         acel_hz,
+        jerk_hz_per_s2,
+        snap_hz_per_s3,
         effective_integ_time,
         header.sampling_speed as u32,
         header.fft_point as u32,
@@ -467,7 +475,11 @@ fn collect_baseline_visibility(
 
     let search_mode = args.primary_search_mode();
     let has_manual_correction =
-        args.delay_correct != 0.0 || args.rate_correct != 0.0 || args.acel_correct != 0.0;
+        args.delay_correct != 0.0
+            || args.rate_correct != 0.0
+            || args.acel_correct != 0.0
+            || args.jerk_correct != 0.0
+            || args.snap_correct != 0.0;
 
     let mut file_start_time: Option<DateTime<Utc>> = None;
     let mut prev_deep_solution: Option<(f32, f32)> = None;
@@ -511,11 +523,11 @@ fn collect_baseline_visibility(
             continue;
         }
 
-        let (solve_delay, solve_rate, solve_acel) = match search_mode {
+        let (solve_delay, solve_rate, solve_acel, solve_jerk, solve_snap) = match search_mode {
             Some("deep") | Some("deep2") => {
                 let start_ref = file_start_time.unwrap_or(current_obs_time);
                 let run_deep = if search_mode == Some("deep2") {
-                    search::run_deep2_search
+                    search::run_peak_search
                 } else {
                     search::run_deep_search
                 };
@@ -543,7 +555,7 @@ fn collect_baseline_visibility(
                 let d = deep_result.analysis_results.corrected_delay;
                 let r = deep_result.analysis_results.corrected_rate;
                 prev_deep_solution = Some((d, r));
-                (d, r, args.acel_correct)
+                (d, r, args.acel_correct, args.jerk_correct, args.snap_correct)
             }
             Some("peak") => {
                 let start_ref = file_start_time.unwrap_or(current_obs_time);
@@ -571,9 +583,15 @@ fn collect_baseline_visibility(
                     total_delay += iter_results.delay_offset;
                     total_rate += iter_results.rate_offset;
                 }
-                (total_delay, total_rate, args.acel_correct)
+                (total_delay, total_rate, args.acel_correct, args.jerk_correct, args.snap_correct)
             }
-            _ => (args.delay_correct, args.rate_correct, args.acel_correct),
+            _ => (
+                args.delay_correct,
+                args.rate_correct,
+                args.acel_correct,
+                args.jerk_correct,
+                args.snap_correct,
+            ),
         };
 
         if search_mode.is_some() || has_manual_correction {
@@ -608,6 +626,8 @@ fn collect_baseline_visibility(
                 solve_delay,
                 solve_rate,
                 solve_acel,
+                solve_jerk,
+                solve_snap,
                 effective_integ_time,
                 start_time_offset_sec,
             )
@@ -1079,7 +1099,7 @@ fn write_closure_tsv(
     let mut file = File::create(path)?;
     writeln!(
         file,
-        "epoch\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe(B)\tIm(B)\t|B|\t|B|^(1/3)\tclosure[arg(B)][deg]\tclosure[from phases][deg]\tI_norm",
+        "yyyydddhhmmss\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe(B)\tIm(B)\t|B|\t|B|^(1'/'3)\tclosure[arg(B)][deg]\tclosure[from_phases][deg]\tI_norm",
         labels[0],
         labels[0],
         labels[0],
@@ -1098,7 +1118,7 @@ fn write_closure_tsv(
         writeln!(
             file,
             "{}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.3}\t{:.9e}",
-            row.timestamp.format("%Y/%j %H:%M:%S"),
+            row.timestamp.format("%Y%j%H%M%S"),
             row.raw_complex[0].re,
             row.raw_complex[0].im,
             row.baseline_amp[0],

@@ -1128,6 +1128,8 @@ fn collect_visibilities_from_cor(
             correction.rate,
             correction.delay,
             correction.acel,
+            args.jerk_correct,
+            args.snap_correct,
             segment_integ_time,
             header.sampling_speed as u32,
             effective_fft_point as u32,
@@ -1218,7 +1220,7 @@ fn determine_segment_correction(
     match search_mode {
         Some("deep") | Some("deep2") => {
             let run_deep = if search_mode == Some("deep2") {
-                search::run_deep2_search
+                search::run_peak_search
             } else {
                 search::run_deep_search
             };

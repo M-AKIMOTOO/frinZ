@@ -10,13 +10,19 @@ struct PhaseCorrection {
     rate_hz: f32,
     delay_samples: f32,
     acel_hz: f32,
+    jerk_hz_per_s2: f32,
+    snap_hz_per_s3: f32,
     effective_integration_length: f32,
     start_time_offset_sec: f32,
 }
 
 impl PhaseCorrection {
     fn is_enabled(self) -> bool {
-        self.rate_hz != 0.0 || self.delay_samples != 0.0 || self.acel_hz != 0.0
+        self.rate_hz != 0.0
+            || self.delay_samples != 0.0
+            || self.acel_hz != 0.0
+            || self.jerk_hz_per_s2 != 0.0
+            || self.snap_hz_per_s3 != 0.0
     }
 
     fn is_valid_for(self, sampling_speed: u32, fft_point: u32) -> bool {
@@ -56,6 +62,8 @@ pub fn process_fft_with_phase_correction(
     rate_hz_for_correction: f32,
     delay_samples_for_correction: f32,
     acel_hz_for_correction: f32,
+    jerk_hz_per_s2_for_correction: f32,
+    snap_hz_per_s3_for_correction: f32,
     effective_integration_length: f32,
     start_time_offset_sec: f32,
 ) -> (Array2<C32>, usize) {
@@ -63,6 +71,8 @@ pub fn process_fft_with_phase_correction(
         rate_hz: rate_hz_for_correction,
         delay_samples: delay_samples_for_correction,
         acel_hz: acel_hz_for_correction,
+        jerk_hz_per_s2: jerk_hz_per_s2_for_correction,
+        snap_hz_per_s3: snap_hz_per_s3_for_correction,
         effective_integration_length,
         start_time_offset_sec,
     };
@@ -199,8 +209,12 @@ fn build_phase_factors(
         .map(|row_idx| {
             let time_sec = row_idx as f64 * phase.effective_integration_length as f64
                 + phase.start_time_offset_sec as f64;
-            let angle = -2.0 * PI * phase.rate_hz as f64 * time_sec
-                - PI * phase.acel_hz as f64 * time_sec.powi(2);
+            let angle = -2.0
+                * PI
+                * (phase.rate_hz as f64 * time_sec
+                    + 0.5 * phase.acel_hz as f64 * time_sec.powi(2)
+                    + (phase.jerk_hz_per_s2 as f64 / 6.0) * time_sec.powi(3)
+                    + (phase.snap_hz_per_s3 as f64 / 24.0) * time_sec.powi(4));
             C32::new(angle.cos() as f32, angle.sin() as f32)
         })
         .collect();
@@ -283,6 +297,8 @@ pub fn apply_phase_correction_in_place(
     rate_hz_for_correction: f32,
     delay_samples_for_correction: f32,
     acel_hz_for_correction: f32,
+    jerk_hz_per_s2_for_correction: f32,
+    snap_hz_per_s3_for_correction: f32,
     effective_integration_length: f32,
     sampling_speed: u32,
     fft_point: u32,
@@ -297,6 +313,8 @@ pub fn apply_phase_correction_in_place(
         rate_hz: rate_hz_for_correction,
         delay_samples: delay_samples_for_correction,
         acel_hz: acel_hz_for_correction,
+        jerk_hz_per_s2: jerk_hz_per_s2_for_correction,
+        snap_hz_per_s3: snap_hz_per_s3_for_correction,
         effective_integration_length,
         start_time_offset_sec,
     };
@@ -332,6 +350,8 @@ mod tests {
             0.03,
             0.2,
             0.001,
+            0.0,
+            0.0,
             0.5,
             32_000_000,
             fft_point as u32,
@@ -350,6 +370,8 @@ mod tests {
             0.03,
             0.2,
             0.001,
+            0.0,
+            0.0,
             0.5,
             0.25,
         );

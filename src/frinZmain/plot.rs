@@ -1059,11 +1059,7 @@ pub fn add_plot(
         let mut y_min = data.iter().cloned().fold(f32::INFINITY, f32::min);
         let mut y_max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        if filename_suffix == "amp" {
-            y_min = 0.0;
-        } else if filename_suffix == "snr" {
-            y_min = 0.0;
-        } else if filename_suffix == "phase" {
+        if filename_suffix == "phase" {
             y_min = -180.0;
             y_max = 180.0;
         }

@@ -12,6 +12,7 @@ use num_complex::Complex;
 use crate::args::Args;
 use crate::fitting;
 use crate::input_support::read_input_bytes;
+use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::plot::phase_reference_plot;
 use crate::processing::process_cor_file;
@@ -456,6 +457,58 @@ pub fn run_phase_reference_analysis(
         &target_results.add_plot_phase,
         output_filepath.to_str().unwrap(),
     )?;
+    let write_phase_npy = |flag: &str,
+                           times: &[chrono::DateTime<chrono::Utc>],
+                           values: &[f32],
+                           fft: u32,
+                           pp: u32|
+     -> Result<(), Box<dyn Error>> {
+        if times.len() != values.len() || times.is_empty() {
+            return Ok(());
+        }
+        let epoch = times[0];
+        let axis: Vec<f64> = times
+            .iter()
+            .map(|time| time.signed_duration_since(epoch).num_milliseconds() as f64 / 1000.0)
+            .collect();
+        write_real_1d(
+            &npz_sidecar_path(&output_filepath, flag),
+            NpyMeta::new(flag, fft, pp).axes("elapsed_time", "s", "phase", "deg"),
+            values,
+            &axis,
+        )?;
+        Ok(())
+    };
+    if args.npz {
+        write_phase_npy(
+            "phase_reference_calibrator",
+            &cal_results.add_plot_times,
+            &original_cal_phases,
+            cal_results.header.fft_point as u32,
+            cal_results.header.number_of_sector as u32,
+        )?;
+        write_phase_npy(
+            "phase_reference_calibrator_fit",
+            &cal_results.add_plot_times,
+            &fitted_cal_phases,
+            cal_results.header.fft_point as u32,
+            cal_results.header.number_of_sector as u32,
+        )?;
+        write_phase_npy(
+            "phase_reference_target",
+            &target_results.add_plot_times,
+            &original_target_phases,
+            target_results.header.fft_point as u32,
+            target_results.header.number_of_sector as u32,
+        )?;
+        write_phase_npy(
+            "phase_reference_target_corrected",
+            &target_results.add_plot_times,
+            &target_results.add_plot_phase,
+            target_results.header.fft_point as u32,
+            target_results.header.number_of_sector as u32,
+        )?;
+    }
 
     println!("Phase reference plot saved to: {:?}\n", output_filepath);
 

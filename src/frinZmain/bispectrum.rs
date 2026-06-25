@@ -5,6 +5,7 @@ use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
 use crate::fft;
 use crate::header::{parse_header, CorHeader};
+use crate::npy_output::{npz_sidecar_path, write_complex_1d, NpyMeta};
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::run_analysis_pipeline;
@@ -474,12 +475,11 @@ fn collect_baseline_visibility(
     }
 
     let search_mode = args.primary_search_mode();
-    let has_manual_correction =
-        args.delay_correct != 0.0
-            || args.rate_correct != 0.0
-            || args.acel_correct != 0.0
-            || args.jerk_correct != 0.0
-            || args.snap_correct != 0.0;
+    let has_manual_correction = args.delay_correct != 0.0
+        || args.rate_correct != 0.0
+        || args.acel_correct != 0.0
+        || args.jerk_correct != 0.0
+        || args.snap_correct != 0.0;
 
     let mut file_start_time: Option<DateTime<Utc>> = None;
     let mut prev_deep_solution: Option<(f32, f32)> = None;
@@ -555,7 +555,13 @@ fn collect_baseline_visibility(
                 let d = deep_result.analysis_results.corrected_delay;
                 let r = deep_result.analysis_results.corrected_rate;
                 prev_deep_solution = Some((d, r));
-                (d, r, args.acel_correct, args.jerk_correct, args.snap_correct)
+                (
+                    d,
+                    r,
+                    args.acel_correct,
+                    args.jerk_correct,
+                    args.snap_correct,
+                )
             }
             Some("peak") => {
                 let start_ref = file_start_time.unwrap_or(current_obs_time);
@@ -583,7 +589,13 @@ fn collect_baseline_visibility(
                     total_delay += iter_results.delay_offset;
                     total_rate += iter_results.rate_offset;
                 }
-                (total_delay, total_rate, args.acel_correct, args.jerk_correct, args.snap_correct)
+                (
+                    total_delay,
+                    total_rate,
+                    args.acel_correct,
+                    args.jerk_correct,
+                    args.snap_correct,
+                )
             }
             _ => (
                 args.delay_correct,
@@ -1089,59 +1101,6 @@ fn compute_closure_stats(rows: &[ClosureSample]) -> ClosureStats {
         intensity_std: i_std,
         intensity_frac_rms: i_frac,
     }
-}
-
-fn write_closure_tsv(
-    path: &Path,
-    labels: &[String],
-    rows: &[ClosureSample],
-) -> Result<(), Box<dyn Error>> {
-    let mut file = File::create(path)?;
-    writeln!(
-        file,
-        "yyyydddhhmmss\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe({})\tIm({})\t|{}|\tphase_{}[deg]\tRe(B)\tIm(B)\t|B|\t|B|^(1'/'3)\tclosure[arg(B)][deg]\tclosure[from_phases][deg]\tI_norm",
-        labels[0],
-        labels[0],
-        labels[0],
-        labels[0],
-        labels[1],
-        labels[1],
-        labels[1],
-        labels[1],
-        labels[2],
-        labels[2],
-        labels[2],
-        labels[2],
-    )?;
-
-    for row in rows {
-        writeln!(
-            file,
-            "{}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.3}\t{:.3}\t{:.9e}",
-            row.timestamp.format("%Y%j%H%M%S"),
-            row.raw_complex[0].re,
-            row.raw_complex[0].im,
-            row.baseline_amp[0],
-            row.baseline_phase_deg[0],
-            row.raw_complex[1].re,
-            row.raw_complex[1].im,
-            row.baseline_amp[1],
-            row.baseline_phase_deg[1],
-            row.raw_complex[2].re,
-            row.raw_complex[2].im,
-            row.baseline_amp[2],
-            row.baseline_phase_deg[2],
-            row.bispectrum.re,
-            row.bispectrum.im,
-            row.bispectrum_amp,
-            row.bispectrum_amp_cuberoot,
-            row.closure_phase_deg,
-            row.closure_from_baselines_deg,
-            row.normalized_intensity,
-        )?;
-    }
-
-    Ok(())
 }
 
 fn write_summary(
@@ -1706,16 +1665,56 @@ pub fn run_closure_phase_analysis(
         sanitized_ref, sanitized_mid, sanitized_third, suffix_token
     );
 
-    let tsv_path = closure_dir.join(format!("{}_complex.tsv", base_name));
     let summary_path = closure_dir.join(format!("{}_summary.txt", base_name));
     let closure_png = closure_dir.join(format!("{}_closurephase.png", base_name));
     let bis_png = closure_dir.join(format!("{}_bispectrum.png", base_name));
     let bis_cor = parent_dir.join(format!("{}_bispectrum.cor", base_name));
 
-    write_closure_tsv(&tsv_path, &labels, &rows)?;
+    let _ = fs::remove_file(closure_dir.join(format!("{}_complex.tsv", base_name)));
     write_summary(&summary_path, &labels, &pair_labels, &stats)?;
     plot_closure_phase(&closure_png, &labels, &rows)?;
     plot_bispectrum(&bis_png, &rows)?;
+    let first_epoch = rows.first().map(|row| row.timestamp);
+    let time_axis: Vec<f64> = rows
+        .iter()
+        .map(|row| {
+            first_epoch.map_or(0.0, |epoch| {
+                row.timestamp
+                    .signed_duration_since(epoch)
+                    .num_milliseconds() as f64
+                    / 1000.0
+            })
+        })
+        .collect();
+    let meta_fft = loaded1.info.header.fft_point as u32;
+    let meta_pp = loaded1.info.header.number_of_sector as u32;
+    if args.npz {
+        for baseline_index in 0..3 {
+            let flag = format!("closure_baseline{}", baseline_index + 1);
+            let values: Vec<C32> = rows
+                .iter()
+                .map(|row| row.raw_complex[baseline_index])
+                .collect();
+            write_complex_1d(
+                &npz_sidecar_path(&closure_png, &flag),
+                NpyMeta::new(&flag, meta_fft, meta_pp).axes("elapsed_time", "s", "visibility", ""),
+                &values,
+                &time_axis,
+            )?;
+        }
+        let bispectrum_values: Vec<C32> = rows.iter().map(|row| row.bispectrum).collect();
+        write_complex_1d(
+            &npz_sidecar_path(&bis_png, "bispectrum"),
+            NpyMeta::new("bispectrum", meta_fft, meta_pp).axes(
+                "elapsed_time",
+                "s",
+                "bispectrum",
+                "",
+            ),
+            &bispectrum_values,
+            &time_axis,
+        )?;
+    }
     compress_png_with_mode(&closure_png, CompressQuality::Low);
     compress_png_with_mode(&bis_png, CompressQuality::Low);
 
@@ -1733,7 +1732,6 @@ pub fn run_closure_phase_analysis(
         &bispec_spectra,
     )?;
 
-    println!("#Saved TSV to {}", tsv_path.display());
     println!("#Saved summary to {}", summary_path.display());
     println!("#Saved closure plot to {}", closure_png.display());
     println!("#Saved bispectrum plot to {}", bis_png.display());

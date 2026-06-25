@@ -1,5 +1,7 @@
 pub use acel::run_acel_search_analysis;
-pub use deep::{run_deep_search, run_deep2_search, run_peak_search, DeepSearchParams, DeepSearchResult};
+pub use deep::{
+    run_deep2_search, run_deep_search, run_peak_search, DeepSearchParams, DeepSearchResult,
+};
 
 mod acel {
     use std::error::Error;
@@ -635,6 +637,7 @@ mod deep {
         args: &'a Args,
         start_time_offset_sec: f32,
         effective_fft_point: i32,
+        algorithm: DeepSearchAlgorithm,
     }
 
     impl<'a> DeepSearchContext<'a> {
@@ -744,14 +747,22 @@ mod deep {
         fn evaluate_candidate_snr(&self, delay: f32, rate: f32) -> f32 {
             let (mut freq_rate_array, padding_length) = self.fft_for_correction(delay, rate);
             self.apply_bandpass(&mut freq_rate_array);
-            let temp_args = create_corrected_args(self.args, delay, rate);
-            evaluate_delay_snr_streaming(
-                &freq_rate_array,
-                self.effective_integ_time,
-                padding_length,
-                self.effective_fft_point,
-                &temp_args,
-            )
+            if self.algorithm == DeepSearchAlgorithm::PeakPolish {
+                evaluate_center_coherent_amplitude(
+                    &freq_rate_array,
+                    padding_length,
+                    self.effective_fft_point,
+                )
+            } else {
+                let temp_args = create_corrected_args(self.args, delay, rate);
+                evaluate_delay_snr_streaming(
+                    &freq_rate_array,
+                    self.effective_integ_time,
+                    padding_length,
+                    self.effective_fft_point,
+                    &temp_args,
+                )
+            }
         }
 
         fn final_analysis(
@@ -857,7 +868,6 @@ mod deep {
             DeepSearchAlgorithm::FullGrid,
         )
     }
-
 
     pub fn run_peak_search(
         complex_vec: &[C32],
@@ -1004,6 +1014,7 @@ mod deep {
             args,
             start_time_offset_sec,
             effective_fft_point,
+            algorithm,
         };
 
         // Step 1: 粗い遅延・レート推定
@@ -1123,7 +1134,10 @@ mod deep {
             */
         }
 
-        if matches!(algorithm, DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish) {
+        if matches!(
+            algorithm,
+            DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish
+        ) {
             let final_scale = 10.0_f32.powi(search_params.max_iterations.saturating_sub(1) as i32);
             let final_delay_step = search_params.delay_fine_step / final_scale;
             let final_rate_step =
@@ -1365,6 +1379,27 @@ mod deep {
         });
 
         Ok(best_delay_result)
+    }
+
+    fn evaluate_center_coherent_amplitude(
+        freq_rate_array: &Array2<C32>,
+        padding_length: usize,
+        effective_fft_point: i32,
+    ) -> f32 {
+        let fft_point_usize = effective_fft_point as usize;
+        if fft_point_usize == 0 || padding_length == 0 {
+            return 0.0;
+        }
+        let center_rate_idx = (padding_length / 2).min(freq_rate_array.dim().1.saturating_sub(1));
+        if freq_rate_array.dim().0 == 0 {
+            return 0.0;
+        }
+        let coherent_sum: C32 = freq_rate_array
+            .column(center_rate_idx)
+            .iter()
+            .copied()
+            .sum();
+        (coherent_sum / fft_point_usize as f32).norm()
     }
 
     fn evaluate_delay_snr_streaming(

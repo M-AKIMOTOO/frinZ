@@ -185,13 +185,17 @@ pub struct Args {
     #[arg(long)]
     pub cor2bin: bool,
 
-    /// Output cross spectrum to binary.
+    /// Output cross spectrum to compressed NPZ.
     #[arg(long)]
     pub spectrum: bool,
 
     /// Output analysis results to .txt.
     #[arg(long)]
     pub output: bool,
+
+    /// Write compressed NPZ sidecar data for plots and analysis products.
+    #[arg(long)]
+    pub npz: bool,
 
     /// Delay correction value.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
@@ -295,7 +299,7 @@ pub struct Args {
     #[arg(long)]
     pub dynamic_spectrum: bool,
 
-    /// Bandpass calibration file.
+    /// Bandpass calibration NPZ file (legacy BIN is also readable).
     #[arg(long)]
     pub bandpass: Option<PathBuf>,
 
@@ -303,7 +307,7 @@ pub struct Args {
     #[arg(long = "norm-acf")]
     pub norm_acf: bool,
 
-    /// Write bandpass-corrected spectrum to binary.
+    /// Write bandpass-corrected spectrum to compressed NPZ.
     #[arg(long)]
     pub bandpass_table: bool,
 

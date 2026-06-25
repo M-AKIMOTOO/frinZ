@@ -5,7 +5,7 @@
 // - UV-related plots
 // - multi-sideband summary plot (merged from former plot_msb.rs)
 use crate::args::Args;
-use crate::output;
+use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
 use crate::output::generate_output_names;
 use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
@@ -958,6 +958,28 @@ pub fn write_cumulate_outputs(
         args.cumulate,
         args.in_beam,
     )?;
+    if args.npz
+        && !result.cumulate_len.is_empty()
+        && result.cumulate_len.len() == result.cumulate_snr.len()
+    {
+        let axis: Vec<f64> = result
+            .cumulate_len
+            .iter()
+            .map(|&value| value as f64)
+            .collect();
+        let npy_path = path.join(format!("{}_cumulate.npz", make_base_filename(args, result)));
+        write_real_1d(
+            &npy_path,
+            NpyMeta::new(
+                "cumulate",
+                result.header.fft_point as u32,
+                result.header.number_of_sector as u32,
+            )
+            .axes("integration_time", "s", "snr", ""),
+            &result.cumulate_snr,
+            &axis,
+        )?;
+    }
     Ok(())
 }
 
@@ -978,6 +1000,7 @@ pub fn write_add_plot_outputs(
     };
     std::fs::create_dir_all(&path)?;
     let add_plot_filepath = path.join(&base_filename);
+    let _ = std::fs::remove_file(path.join(format!("{}_add_plot_data.tsv", base_filename)));
 
     if !result.add_plot_times.is_empty() {
         let first_time = result.add_plot_times[0];
@@ -1001,17 +1024,46 @@ pub fn write_add_plot_outputs(
             &result.obs_time,
         )?;
 
-        output::write_add_plot_data_to_file(
-            &path,
-            &base_filename,
-            &elapsed_times_f32,
-            &result.add_plot_amp,
-            &result.add_plot_snr,
-            &result.add_plot_phase,
-            &result.add_plot_noise,
-            &result.add_plot_res_delay,
-            &result.add_plot_res_rate,
-        )?;
+        let axis: Vec<f64> = elapsed_times_f32
+            .iter()
+            .map(|&value| value as f64)
+            .collect();
+        let npy_series = [
+            ("add_plot_amp", "amplitude", "%", &result.add_plot_amp),
+            ("add_plot_snr", "snr", "", &result.add_plot_snr),
+            ("add_plot_phase", "phase", "deg", &result.add_plot_phase),
+            ("add_plot_noise", "noise", "%", &result.add_plot_noise),
+            (
+                "add_plot_resdelay",
+                "residual_delay",
+                "sample",
+                &result.add_plot_res_delay,
+            ),
+            (
+                "add_plot_resrate",
+                "residual_rate",
+                "Hz",
+                &result.add_plot_res_rate,
+            ),
+        ];
+        if args.npz {
+            for (flag, value_name, value_unit, values) in npy_series {
+                if values.len() != axis.len() {
+                    continue;
+                }
+                write_real_1d(
+                    &npz_sidecar_path(&add_plot_filepath, flag),
+                    NpyMeta::new(
+                        flag,
+                        result.header.fft_point as u32,
+                        result.header.number_of_sector as u32,
+                    )
+                    .axes("elapsed_time", "s", value_name, value_unit),
+                    values,
+                    &axis,
+                )?;
+            }
+        }
     }
 
     Ok(base_filename)
@@ -1701,12 +1753,11 @@ pub fn plot_sky_map<P: AsRef<Path>>(
     let max_val = map_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let min_val = map_data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
 
-    let rad_to_arcsec = 180.0 / PI * 3600.0;
-    // Define coordinate ranges in arcseconds for the chart
-    let l_arcsec_max = (width as f64 / 2.0) * cell_size_rad * rad_to_arcsec;
-    let m_arcsec_max = (height as f64 / 2.0) * cell_size_rad * rad_to_arcsec;
-    let l_range = l_arcsec_max..-l_arcsec_max; // Invert RA axis
-    let m_range = -m_arcsec_max..m_arcsec_max;
+    let rad_to_mas = 180.0 / PI * 3600.0 * 1_000.0;
+    let l_mas_max = (width as f64 / 2.0) * cell_size_rad * rad_to_mas;
+    let m_mas_max = (height as f64 / 2.0) * cell_size_rad * rad_to_mas;
+    let l_range = l_mas_max..-l_mas_max; // Invert RA axis
+    let m_range = -m_mas_max..m_mas_max;
 
     let mut chart = ChartBuilder::on(&main_area)
         .x_label_area_size(65)
@@ -1717,8 +1768,8 @@ pub fn plot_sky_map<P: AsRef<Path>>(
 
     chart
         .configure_mesh()
-        .x_desc("ΔRA (arcsec)")
-        .y_desc("ΔDec (arcsec)")
+        .x_desc("ΔRA (mas)")
+        .y_desc("ΔDec (mas)")
         .x_label_formatter(&|x| format!("{:.0}", x))
         .y_label_formatter(&|y| format!("{:.0}", y))
         .label_style(("sans-serif", 30))
@@ -1726,10 +1777,10 @@ pub fn plot_sky_map<P: AsRef<Path>>(
 
     // Draw the heatmap
     chart.draw_series(map_data.indexed_iter().map(|((y, x), &val)| {
-        let l_arcsec = ((x as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_arcsec;
-        let m_arcsec = ((height as f64 / 2.0) - y as f64) * cell_size_rad * rad_to_arcsec;
-        let cell_l_arcsec = cell_size_rad * rad_to_arcsec;
-        let cell_m_arcsec = cell_size_rad * rad_to_arcsec;
+        let l_mas = ((x as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_mas;
+        let m_mas = ((height as f64 / 2.0) - y as f64) * cell_size_rad * rad_to_mas;
+        let cell_l_mas = cell_size_rad * rad_to_mas;
+        let cell_m_mas = cell_size_rad * rad_to_mas;
 
         let mut norm_val = if max_val > min_val {
             (val - min_val) / (max_val - min_val)
@@ -1743,10 +1794,7 @@ pub fn plot_sky_map<P: AsRef<Path>>(
         let color = ViridisRGB.get_color(norm_val as f64);
 
         Rectangle::new(
-            [
-                (l_arcsec, m_arcsec),
-                (l_arcsec + cell_l_arcsec, m_arcsec + cell_m_arcsec),
-            ],
+            [(l_mas, m_mas), (l_mas + cell_l_mas, m_mas + cell_m_mas)],
             color.filled(),
         )
     }))?;
@@ -1761,16 +1809,13 @@ pub fn plot_sky_map<P: AsRef<Path>>(
 
     // Add a red 'X' mark at the maximum value position
     let (height, width) = map_data.dim(); // Get dimensions for calculation
-    let rad_to_arcsec: f64 = 180.0 / PI * 3600.0; // Re-define rad_to_arcsec for local use
-    let l_arcsec_max_val =
-        ((max_x_idx as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_arcsec;
-    let m_arcsec_max_val =
-        ((height as f64 / 2.0) - max_y_idx as f64) * cell_size_rad * rad_to_arcsec;
+    let l_mas_max_val = ((max_x_idx as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_mas;
+    let m_mas_max_val = ((height as f64 / 2.0) - max_y_idx as f64) * cell_size_rad * rad_to_mas;
 
     chart.draw_series(PointSeries::of_element(
-        vec![(l_arcsec_max_val, m_arcsec_max_val)], // Center of the 'X'
-        10,                                         // Size of the 'X'
-        &RED,                                       // Color of the 'X'
+        vec![(l_mas_max_val, m_mas_max_val)], // Center of the 'X'
+        10,                                   // Size of the 'X'
+        &RED,                                 // Color of the 'X'
         &|c, s, st| Cross::new(c, s, st.stroke_width(2)), // Draw a cross
     ))?;
 
@@ -2631,8 +2676,8 @@ pub fn plot_cross_section(
     horizontal_data: &[(f64, f32)], // (RA offset, Intensity)
     vertical_data: &[(f64, f32)],   // (Dec offset, Intensity)
     max_intensity: f32,
-    delta_ra_arcsec: f64,
-    delta_dec_arcsec: f64,
+    delta_ra_mas: f64,
+    delta_dec_mas: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = BitMapBackend::new(output_path, (1000, 700)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -2662,7 +2707,7 @@ pub fn plot_cross_section(
 
     chart
         .configure_mesh()
-        .x_desc("Offset (arcsec)")
+        .x_desc("Offset (mas)")
         .y_desc("Normalized Intensity")
         .x_label_formatter(&|v| format!("{:.0}", v))
         .y_label_formatter(&|v| format!("{:.1}", v))
@@ -2701,13 +2746,13 @@ pub fn plot_cross_section(
     let mut y_pos = root.get_pixel_range().1.start as i32 + 20;
 
     root.draw(&Text::new(
-        format!("ΔRA: {:.3} arcsec", delta_ra_arcsec),
+        format!("ΔRA: {:.3} mas", delta_ra_mas),
         (x_pos, y_pos),
         text_style.clone(),
     ))?;
     y_pos += 25;
     root.draw(&Text::new(
-        format!("ΔDec: {:.3} arcsec", delta_dec_arcsec),
+        format!("ΔDec: {:.3} mas", delta_dec_mas),
         (x_pos, y_pos),
         text_style.clone(),
     ))?;

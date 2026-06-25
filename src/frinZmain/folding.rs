@@ -15,6 +15,7 @@ use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
 use crate::header::parse_header;
 use crate::input_support::open_input_data;
+use crate::npy_output::{npz_sidecar_path, write_complex_1d, write_real_1d, NpyMeta};
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
@@ -62,7 +63,6 @@ struct FoldBin {
     phase_center: f64,
     mean_complex: Complex<f64>,
     amp: f64,
-    phase_deg: f64,
     count: usize,
     on_bin: bool,
 }
@@ -971,12 +971,10 @@ pub fn run_folding_analysis(
             } else {
                 Complex::<f64>::new(0.0, 0.0)
             };
-            let phase_deg = mean_complex.arg().to_degrees();
             FoldBin {
                 phase_center: (idx as f64 + 0.5) / cfg.bins as f64,
                 amp: mean_complex.norm(),
                 mean_complex,
-                phase_deg,
                 count,
                 on_bin: false,
             }
@@ -1030,26 +1028,7 @@ pub fn run_folding_analysis(
         .and_then(|s| s.to_str())
         .unwrap_or("folding");
 
-    let profile_path = output_dir.join(format!("{stem}_folding_profile.tsv"));
-    let mut profile_file = File::create(&profile_path)?;
-    writeln!(
-        profile_file,
-        "bin\tphase\tamp\treal\timag\tphase_deg\tcount\ton_bin"
-    )?;
-    for (idx, bin) in profile.iter().enumerate() {
-        writeln!(
-            profile_file,
-            "{}\t{:.9}\t{:.9}\t{:.9}\t{:.9}\t{:.6}\t{}\t{}",
-            idx,
-            bin.phase_center,
-            bin.amp,
-            bin.mean_complex.re,
-            bin.mean_complex.im,
-            bin.phase_deg,
-            bin.count,
-            if bin.on_bin { 1 } else { 0 }
-        )?;
-    }
+    let _ = fs::remove_file(output_dir.join(format!("{stem}_folding_profile.tsv")));
 
     let profile_png_path = output_dir.join(format!("{stem}_folding_profile.png"));
     plot_folding_profile(
@@ -1060,6 +1039,53 @@ pub fn run_folding_analysis(
         off_std,
         cfg.spin.period_sec,
     )?;
+    if args.npz {
+        let profile_complex: Vec<C32> = profile
+            .iter()
+            .map(|bin| C32::new(bin.mean_complex.re as f32, bin.mean_complex.im as f32))
+            .collect();
+        let phase_axis: Vec<f64> = profile.iter().map(|bin| bin.phase_center).collect();
+        let profile_npy_path = npz_sidecar_path(&profile_png_path, "folding");
+        write_complex_1d(
+            &profile_npy_path,
+            NpyMeta::new(
+                "folding",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("pulse_phase", "turn", "complex_visibility", ""),
+            &profile_complex,
+            &phase_axis,
+        )?;
+        let count_values: Vec<f32> = profile.iter().map(|bin| bin.count as f32).collect();
+        write_real_1d(
+            &output_dir.join(format!("{stem}_folding_count.npz")),
+            NpyMeta::new(
+                "folding_count",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("pulse_phase", "turn", "count", "sample"),
+            &count_values,
+            &phase_axis,
+        )?;
+        let on_bin_values: Vec<f32> = profile
+            .iter()
+            .map(|bin| if bin.on_bin { 1.0 } else { 0.0 })
+            .collect();
+        write_real_1d(
+            &output_dir.join(format!("{stem}_folding_on_bin.npz")),
+            NpyMeta::new(
+                "folding_on_bin",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("pulse_phase", "turn", "on_bin", "bool"),
+            &on_bin_values,
+            &phase_axis,
+        )?;
+        println!("Folding NPZ data saved to {}", profile_npy_path.display());
+    }
 
     let summary_path = output_dir.join(format!("{stem}_folding_summary.txt"));
     let mut summary_file = File::create(&summary_path)?;
@@ -1242,7 +1268,6 @@ pub fn run_folding_analysis(
         profile[peak_idx].phase_center, peak_amp, snr
     );
     println!("  Fold profile PNG: {}", profile_png_path.display());
-    println!("  Fold profile TSV: {}", profile_path.display());
     println!("  Summary: {}", summary_path.display());
 
     Ok(())

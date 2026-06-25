@@ -31,6 +31,7 @@ mod logo;
 mod maser;
 mod multisideband;
 mod norm_acf;
+mod npy_output;
 mod output;
 mod phsref;
 mod plot;
@@ -648,6 +649,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &result.header.source_name,
                 &base_filename,
                 &frinz_dir,
+                args.npz,
             )?;
         }
 

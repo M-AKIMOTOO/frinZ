@@ -11,6 +11,7 @@ use crate::args::Args;
 use crate::fft::process_fft;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
+use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 
@@ -65,12 +66,6 @@ fn format_with_precision(value: f64, digits: usize) -> String {
     } else {
         format!("{:.*}", digits, value)
     }
-}
-
-fn format_f32_precision(value: f64, digits: usize) -> String {
-    let digits = digits.min(6);
-    let value_f32 = value as f32;
-    format_with_precision(value_f32 as f64, digits)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -968,6 +963,7 @@ fn get_spectrum_segment(
 
 fn plot_maser_spectrum(
     output_path: &Path,
+    write_npz: bool,
     data: &[(f64, f32)],
     x_label: &str,
     title: &str,
@@ -1111,11 +1107,37 @@ fn plot_maser_spectrum(
 
     root.present()?;
     compress_png_with_mode(output_path, CompressQuality::Low);
+    if write_npz {
+        let axis: Vec<f64> = data.iter().map(|point| point.0).collect();
+        let values: Vec<f32> = data.iter().map(|point| point.1).collect();
+        let (axis_name, axis_unit) = if x_label.contains("Velocity") {
+            ("velocity", "km/s")
+        } else {
+            ("frequency", "MHz")
+        };
+        write_real_1d(
+            &output_path.with_extension("npz"),
+            NpyMeta::new("maser", 0, 0).axes(axis_name, axis_unit, "intensity", ""),
+            &values,
+            &axis,
+        )?;
+        if let Some(fit_data) = gaussian_fit {
+            let fit_axis: Vec<f64> = fit_data.iter().map(|point| point.0).collect();
+            let fit_values: Vec<f32> = fit_data.iter().map(|point| point.1).collect();
+            write_real_1d(
+                &npz_sidecar_path(output_path, "maser_fit"),
+                NpyMeta::new("maser_fit", 0, 0).axes(axis_name, axis_unit, "intensity", ""),
+                &fit_values,
+                &fit_axis,
+            )?;
+        }
+    }
     Ok(())
 }
 
 fn plot_on_off_spectra(
     output_path: &Path,
+    write_npz: bool,
     on_data: &[(f64, f32)],
     off_data: &[(f64, f32)],
     x_label: &str,
@@ -1210,6 +1232,18 @@ fn plot_on_off_spectra(
 
     root.present()?;
     compress_png_with_mode(output_path, CompressQuality::Low);
+    if write_npz {
+        for (flag, data) in [("maser_on", on_data), ("maser_off", off_data)] {
+            let axis: Vec<f64> = data.iter().map(|point| point.0).collect();
+            let values: Vec<f32> = data.iter().map(|point| point.1).collect();
+            write_real_1d(
+                &npz_sidecar_path(output_path, flag),
+                NpyMeta::new(flag, 0, 0).axes("frequency", "MHz", "amplitude", ""),
+                &values,
+                &axis,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1739,6 +1773,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             on_stem,
             integration_state.as_mut(),
             write_segment_outputs,
+            args.npz,
             freq_precision,
             vel_precision,
             &mut log_lines,
@@ -1836,34 +1871,9 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             );
 
             let stacked_suffix = "_stacked";
-            let integ_tsv =
-                output_dir.join(format!("{}{}_maser_data.tsv", on_stem, stacked_suffix));
-            let mut integ_file = File::create(&integ_tsv)?;
-            writeln!(
-                integ_file,
-                "# Frequency_Offset_MHz\tVelocity_km/s\tNormalized_Intensity"
-            )?;
-            let freq_reference = integration
-                .frequency_axis_mhz
-                .first()
-                .copied()
-                .unwrap_or(0.0);
-            for ((&freq, &vel), &power) in integration
-                .frequency_axis_mhz
-                .iter()
-                .zip(velocity_axis.iter())
-                .zip(integration.averaged_spec.iter())
-            {
-                let freq_offset = freq - freq_reference;
-                let freq_offset_str = format_f32_precision(freq_offset, freq_precision);
-                let vel_str = format_f32_precision(vel, vel_precision);
-                let power_str = format!("{:.6}", power);
-                writeln!(
-                    integ_file,
-                    "{}\t{}\t{}",
-                    freq_offset_str, vel_str, power_str
-                )?;
-            }
+            let _ = fs::remove_file(
+                output_dir.join(format!("{}{}_maser_data.tsv", on_stem, stacked_suffix)),
+            );
 
             let normalized_plot_data_freq: Vec<(f64, f32)> = integration
                 .frequency_axis_mhz
@@ -1882,6 +1892,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                 output_dir.join(format!("{}{}_maser_subt.png", on_stem, stacked_suffix));
             plot_maser_spectrum(
                 &stacked_freq_plot,
+                args.npz,
                 &normalized_plot_data_freq,
                 "Frequency [MHz]",
                 &stacked_title,
@@ -1908,6 +1919,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                 output_dir.join(format!("{}{}_maser_Vlsr1.png", on_stem, stacked_suffix));
             plot_maser_spectrum(
                 &stacked_vel_plot,
+                args.npz,
                 &normalized_plot_data_vel,
                 "LSR Velocity [km/s]",
                 &stacked_title,
@@ -1943,6 +1955,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                     output_dir.join(format!("{}{}_maser_Vlsr2.png", on_stem, stacked_suffix));
                 plot_maser_spectrum(
                     &stacked_zoom_plot,
+                    args.npz,
                     &zoomed_plot_data,
                     "LSR Velocity [km/s]",
                     &stacked_title,
@@ -2001,6 +2014,7 @@ fn analyze_segment(
     on_stem: &str,
     integration_state: Option<&mut IntegrationState>,
     write_outputs: bool,
+    write_npz: bool,
     freq_precision: usize,
     vel_precision: usize,
     log_lines: &mut Vec<String>,
@@ -2221,23 +2235,22 @@ fn analyze_segment(
     };
 
     if write_outputs {
-        let tsv_filename = output_dir.join(format!("{}{}_maser_data.tsv", on_stem, suffix));
-        let mut file = File::create(&tsv_filename)?;
-        writeln!(
-            file,
-            "# Frequency_Offset_MHz\tVelocity_km/s\tonsourc\toffsource\tbaseline_mask"
-        )?;
-        for (idx, &freq_mhz) in analysis_freq_mhz.iter().enumerate() {
-            let freq_offset_mhz = freq_mhz - base_freq_mhz;
-            let freq_offset_str = format_f32_precision(freq_offset_mhz, freq_precision);
-            let vel_str = format_f32_precision(analysis_velocity_kms[idx], vel_precision);
-            let on_str = format!("{:.6}", analysis_spec_on[idx]);
-            let off_str = format!("{:.6}", analysis_spec_off[idx]);
-            let mask_flag = if baseline_mask[idx] { 1 } else { 0 };
-            writeln!(
-                file,
-                "{}\t{}\t{}\t{}\t{}",
-                freq_offset_str, vel_str, on_str, off_str, mask_flag
+        let _ = fs::remove_file(output_dir.join(format!("{}{}_maser_data.tsv", on_stem, suffix)));
+        let mask_values: Vec<f32> = baseline_mask
+            .iter()
+            .map(|&masked| if masked { 1.0 } else { 0.0 })
+            .collect();
+        if write_npz {
+            write_real_1d(
+                &output_dir.join(format!("{}{}_maser_baseline_mask.npz", on_stem, suffix)),
+                NpyMeta::new("maser_baseline_mask", 0, 0).axes(
+                    "frequency",
+                    "MHz",
+                    "masked",
+                    "bool",
+                ),
+                &mask_values,
+                &analysis_freq_mhz,
             )?;
         }
 
@@ -2293,6 +2306,7 @@ fn analyze_segment(
             output_dir.join(format!("{}{}_maser_onoff.png", on_stem, suffix));
         plot_on_off_spectra(
             &on_off_freq_plot_filename,
+            write_npz,
             &on_plot_data_freq,
             &off_plot_data_freq,
             "Frequency [MHz]",
@@ -2313,6 +2327,7 @@ fn analyze_segment(
             output_dir.join(format!("{}{}_maser_subt.png", on_stem, suffix));
         plot_maser_spectrum(
             &maser_freq_plot_filename,
+            write_npz,
             &normalized_plot_data_freq,
             "Frequency [MHz]",
             spec_title,
@@ -2344,6 +2359,7 @@ fn analyze_segment(
             output_dir.join(format!("{}{}_maser_Vlsr1.png", on_stem, suffix));
         plot_maser_spectrum(
             &maser_vel_plot_filename,
+            write_npz,
             &normalized_plot_data_vel,
             "LSR Velocity [km/s]",
             spec_title,
@@ -2391,6 +2407,7 @@ fn analyze_segment(
                 output_dir.join(format!("{}{}_maser_Vlsr2.png", on_stem, suffix));
             plot_maser_spectrum(
                 &maser_zoom_plot_filename,
+                write_npz,
                 &zoomed_plot_data,
                 "LSR Velocity [km/s]",
                 spec_title,

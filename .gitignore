@@ -4,6 +4,7 @@
 *.crate
 
 # Local VCS / editor junk
+__pycache__/
 .DS_Store
 Thumbs.db
 *.swp
@@ -18,6 +19,7 @@ Thumbs.db
 /*.csv
 /*.tsv
 /*.py
+!/npy_open.py
 *.log
 
 # Observation data and generated analysis outputs

@@ -1,6 +1,7 @@
 use crate::args::Args;
 use crate::header::parse_header;
 use crate::input_support::read_input_bytes;
+use crate::npy_output::{npz_sidecar_path, write_complex_1d, NpyMeta};
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::read::read_visibility_data;
 use crate::utils::radec2azalt;
@@ -98,6 +99,33 @@ pub fn run_uptime_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         header.station1_name.trim(),
         header.station2_name.trim(),
     )?;
+    let write_uptime_npy = |flag: &str, series: &UptimeSeries| -> Result<(), Box<dyn Error>> {
+        let values: Vec<num_complex::Complex<f32>> = series
+            .az
+            .iter()
+            .zip(series.el.iter())
+            .map(|(az, el)| num_complex::Complex::new(az.1 as f32, el.1 as f32))
+            .collect();
+        let time_axis: Vec<f64> = series.az.iter().map(|point| point.0).collect();
+        write_complex_1d(
+            &npz_sidecar_path(&plot_path, flag),
+            NpyMeta::new(
+                flag,
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("ut", "hour", "azimuth_real_elevation_imag", "deg"),
+            &values,
+            &time_axis,
+        )?;
+        Ok(())
+    };
+    if args.npz {
+        write_uptime_npy("uptime_station1_observed", &observation_points_station1)?;
+        write_uptime_npy("uptime_station2_observed", &observation_points_station2)?;
+        write_uptime_npy("uptime_station1_day", &day_points_station1)?;
+        write_uptime_npy("uptime_station2_day", &day_points_station2)?;
+    }
 
     println!("Generated uptime plot at {:?}", plot_path);
 

@@ -16,6 +16,7 @@ pub mod search;
 pub mod earth_rotation_imaging;
 pub mod multisideband;
 pub mod norm_acf;
+pub mod npy_output;
 pub mod output;
 pub mod phsref;
 pub mod plot;

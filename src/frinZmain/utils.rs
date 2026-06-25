@@ -1,6 +1,5 @@
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::Path;
 
 use astro::coords;
@@ -11,6 +10,7 @@ use ndarray::prelude::*;
 use num_complex::Complex;
 
 use crate::header::CorHeader;
+use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
 use crate::plot;
 
 const C: f64 = 299792458.0; // Speed of light in m/s
@@ -265,6 +265,7 @@ pub fn write_allan_deviation_outputs(
     source_name: &str,
     base_filename: &str,
     frinz_dir: &Path,
+    write_npz: bool,
 ) -> Result<(), Box<dyn Error>> {
     if phases.len() < 3 {
         eprintln!(
@@ -281,15 +282,20 @@ pub fn write_allan_deviation_outputs(
     let adev_data = calculate_allan_deviation(phases, tau0, obs_freq_hz);
     let adev_basename = format!("{}_{}_allan", base_filename, source_name);
 
-    let txt_path = allan_dir.join(format!("{}.txt", adev_basename));
-    let mut writer = BufWriter::new(File::create(txt_path)?);
-    writeln!(writer, "# Tau[s] Allan_Deviation")?;
-    for (tau, adev) in &adev_data {
-        writeln!(writer, "{} {:.6e}", tau, adev)?;
-    }
+    let _ = fs::remove_file(allan_dir.join(format!("{}.txt", adev_basename)));
 
     let plot_path = allan_dir.join(format!("{}.png", adev_basename));
     plot::plot_allan_deviation(plot_path.to_str().unwrap(), &adev_data, source_name)?;
+    if write_npz {
+        let tau_axis: Vec<f64> = adev_data.iter().map(|&(tau, _)| tau as f64).collect();
+        let values: Vec<f32> = adev_data.iter().map(|&(_, value)| value).collect();
+        write_real_1d(
+            &npz_sidecar_path(&plot_path, "allan_deviance"),
+            NpyMeta::new("allan_deviance", 0, 0).axes("tau", "s", "allan_deviation", ""),
+            &values,
+            &tau_axis,
+        )?;
+    }
     println!("Allan deviation plot and data saved in {:?}", allan_dir);
 
     Ok(())

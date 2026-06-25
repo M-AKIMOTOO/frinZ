@@ -7,6 +7,7 @@ use crate::bandpass::read_bandpass_file;
 use crate::fft::apply_phase_correction_in_place;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
+use crate::npy_output::{npz_sidecar_path, write_real_2d, NpyMeta};
 use crate::processing::run_analysis_pipeline;
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
@@ -819,6 +820,31 @@ pub fn run_earth_rotation_imaging(
         .and_then(|s| s.to_str())
         .unwrap_or("imaging");
 
+    let center = result.image_size as f64 / 2.0;
+    let ra_axis: Vec<f64> = (0..result.image_size)
+        .map(|index| (index as f64 - center) * result.cell_size_arcsec)
+        .collect();
+    let dec_axis: Vec<f64> = (0..result.image_size)
+        .map(|index| (center - index as f64) * result.cell_size_arcsec)
+        .collect();
+    let write_image_npy = |path: &Path, flag: &str, values: &[f64]| -> Result<(), Box<dyn Error>> {
+        let values_f32: Vec<f32> = values.iter().map(|&value| value as f32).collect();
+        write_real_2d(
+            &npz_sidecar_path(path, flag),
+            NpyMeta::new(
+                flag,
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("dec_offset", "arcsec", "ra_offset", "arcsec"),
+            (result.image_size, result.image_size),
+            values_f32,
+            &dec_axis,
+            &ra_axis,
+        )?;
+        Ok(())
+    };
+
     let dirty_path = output_dir.join(format!("{}_dirty.png", base_name));
     render_scalar_field_plot(
         &dirty_path,
@@ -829,6 +855,9 @@ pub fn run_earth_rotation_imaging(
         true,
         "Dirty Image",
     )?;
+    if args.npz {
+        write_image_npy(&dirty_path, "imaging_dirty", &result.dirty_image)?;
+    }
     println!("Dirty image saved to {}", dirty_path.display());
 
     let beam_path = output_dir.join(format!("{}_dirty_beam.png", base_name));
@@ -841,6 +870,9 @@ pub fn run_earth_rotation_imaging(
         false,
         "Dirty Beam",
     )?;
+    if args.npz {
+        write_image_npy(&beam_path, "imaging_dirty_beam", &result.dirty_beam)?;
+    }
     println!("Dirty beam saved to {}", beam_path.display());
 
     if let Some(ref clean) = result.clean_image {
@@ -854,6 +886,9 @@ pub fn run_earth_rotation_imaging(
             true,
             "Clean Image",
         )?;
+        if args.npz {
+            write_image_npy(&clean_path, "imaging_clean", clean)?;
+        }
         println!("Clean image saved to {}", clean_path.display());
     }
 
@@ -868,6 +903,9 @@ pub fn run_earth_rotation_imaging(
             true,
             "Residual Image",
         )?;
+        if args.npz {
+            write_image_npy(&residual_path, "imaging_residual", residual)?;
+        }
         println!("Residual image saved to {}", residual_path.display());
     }
 

@@ -15,9 +15,9 @@ frinZ is a Rust implementation of the frinZ fringe-fitting tool for processing V
 - **Phase reference calibration** with polynomial fitting
 - **Precise search mode** with iterative refinement
 - **RFI mitigation** with frequency range exclusion
-- **Bandpass calibration** with binary file support
+- **Bandpass calibration** with compressed NPZ support
 - **Visualization** with delay/rate plots and cumulative SNR plots
-- **Multiple output formats** (text, binary, plots)
+- **Multiple output formats** (text, compressed NPZ, plots)
 - **Cross-power spectrum analysis**
 - **Pulsar gating analysis** with dedispersion, folding, and gating reports
 
@@ -152,7 +152,7 @@ frinZ --input data.cor --rfi "100,120" "400,500"
 frinZ --input cal.cor --bandpass-table
 
 # Apply existing bandpass calibration
-frinZ --input data.cor --bandpass /path/to/bandpass_table.bin
+frinZ --input data.cor --bandpass /path/to/bandpass_table.npz
 ```
 
 ### Output Options
@@ -188,7 +188,7 @@ frinZ --input data.cor \
   --delay-window -20 20 --rate-window -0.05 0.05 \
   --rfi "150,200" \
   --plot --add-plot --output \
-  --bandpass cal_bandpass.bin
+  --bandpass cal_bandpass.npz
 ```
 
 #### Phase Reference with Custom Parameters
@@ -315,6 +315,15 @@ In stdout and `*_summary.txt`, these appear as:
 
 ## Output Files
 
+With `--npz`, analysis/plot modes also write compressed self-describing NumPy sidecars (`*.npz`) containing a primitive `complex64` `data` array plus `flag`, coordinate axes and units, `fft_point`, `pp`, and array shape. Inspect or export one file with:
+
+```bash
+python3 npy_open.py --npy result_bptable.npz
+python3 npy_open.py --npy result_bptable.npz --output --ext pdf --nofig
+```
+
+`--output` writes `result_bptable.tsv` and the selected figure format (default `png`). Analysis modes no longer emit duplicate BIN/TSV data files when the same arrays are present in requested NPZ sidecars; text summaries, `.cor` products, and model metadata remain separate. Without `--nofig`, the figure is also shown with `plt.show()`.
+
 frinZ creates organized output directories:
 
 ```
@@ -333,7 +342,8 @@ frinZ/
 ### Output File Formats
 
 - **Text files (`.txt`)**: Analysis results with delay, rate, SNR, and statistics
-- **Binary files (`.bin`, `.cor`)**: Complex spectra and calibrated data
+- **Compressed NPZ (`.npz`)**: `--spectrum`, `--bptable`, and optional `--npz` analysis/plot arrays with axes and metadata
+- **Correlation files (`.cor`)**: Calibrated or combined visibility data
 - **Plot files (`.png`)**: Visualization of fringe patterns and time series
 
 ## File Naming Convention
@@ -389,7 +399,7 @@ frinZ provides significant performance improvements over the Python version:
 
 The minor numerical differences (≤0.1%) compared to frinZ.py arise from:
 - Different FFT library implementations (rustfft vs scipy.fft)
-- Precision differences in binary decoding (Rust: 7-8 digits, Python: 6 digits)
+- Precision differences in correlation-data decoding (Rust: 7-8 digits, Python: 6 digits)
 - DC component handling in FFT processing
 
 ## License

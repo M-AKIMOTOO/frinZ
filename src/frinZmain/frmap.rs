@@ -12,13 +12,19 @@ use ndarray::{Array, Array2, ArrayView1, Axis};
 use num_complex::Complex;
 
 use crate::args::Args;
-use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
+use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
+use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft_with_delay_padding};
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
+use crate::npy_output::{
+    npz_sidecar_path, write_complex_1d, write_complex_2d, write_real_1d, NpyMeta,
+};
 use crate::plot::{plot_cross_section, plot_sky_map, plot_uv_coverage};
 use crate::read::read_visibility_data;
+use crate::rfi::parse_rfi_ranges;
 use crate::utils::{rate_cal, uvw_cal};
 use plotters::prelude::*;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::f64::consts::PI;
 
@@ -205,6 +211,41 @@ fn compute_weighted_stats(intersections: &[FringeIntersection]) -> Option<Centro
     })
 }
 
+fn quadratic_peak_offset(left: f32, center: f32, right: f32) -> f64 {
+    let denom = left as f64 - 2.0 * center as f64 + right as f64;
+    if !denom.is_finite() || denom >= -f64::EPSILON {
+        return 0.0;
+    }
+    (0.5 * (left as f64 - right as f64) / denom).clamp(-1.0, 1.0)
+}
+
+fn find_map_peak(map: &Array2<f32>) -> (f32, (usize, usize)) {
+    let mut max_value = f32::NEG_INFINITY;
+    let mut max_index = (0, 0);
+    for (index, &value) in map.indexed_iter() {
+        if value.is_finite() && value > max_value {
+            max_value = value;
+            max_index = index;
+        }
+    }
+    (max_value, max_index)
+}
+
+fn refine_map_peak(map: &Array2<f32>, row: usize, col: usize) -> (f64, f64) {
+    let (height, width) = map.dim();
+    let dx = if col > 0 && col + 1 < width {
+        quadratic_peak_offset(map[[row, col - 1]], map[[row, col]], map[[row, col + 1]])
+    } else {
+        0.0
+    };
+    let dy = if row > 0 && row + 1 < height {
+        quadratic_peak_offset(map[[row - 1, col]], map[[row, col]], map[[row + 1, col]])
+    } else {
+        0.0
+    };
+    (col as f64 + dx, row as f64 + dy)
+}
+
 #[allow(unused_variables)]
 #[allow(unused_mut)]
 pub fn run_fringe_rate_map_analysis(
@@ -239,6 +280,7 @@ pub fn run_fringe_rate_map_analysis(
     // --- Pre-computation for UV coverage and B_max ---
     println!("Pre-calculating UV coverage to determine optimal cell size...");
     let mut max_b = 0.0f64;
+    let mut min_b = f64::INFINITY;
     let mut all_uv_data: Vec<(f32, f32)> = Vec::new(); // New vector for all UV data
     let mut temp_cursor = cursor.clone();
     temp_cursor.set_position(256);
@@ -277,37 +319,44 @@ pub fn run_fringe_rate_map_analysis(
         if b > max_b {
             max_b = b;
         }
+        if b.is_finite() && b > 0.0 && b < min_b {
+            min_b = b;
+        }
         all_uv_data.push((u as f32, v as f32)); // Collect all UV data
     }
-    println!("Max baseline: {:.2} m", max_b);
+    if !min_b.is_finite() {
+        min_b = max_b;
+    }
+    println!("Projected baseline range: {:.2} .. {:.2} m", min_b, max_b);
 
     // --- Image Parameters ---
     let lambda = 299792458.0 / header.observing_frequency;
     let desired_map_range_arcsec = match config.range_spec {
         RangeSpec::Auto => {
-            let auto_range = auto_range_arcsec(lambda, max_b);
-            let res_arcsec = if max_b > 0.0 {
-                (lambda / max_b).to_degrees() * 3600.0
+            let angular_scale_arcsec = if min_b > 0.0 {
+                (lambda / min_b).to_degrees() * 3600.0
             } else {
-                f64::INFINITY
+                return Err("Unable to determine a positive projected baseline".into());
             };
+            let half_range_arcsec = 3.0 * angular_scale_arcsec;
             println!(
-                "Auto fringe-rate map width: {:.2} arcsec (λ/B_max = {:.2} arcsec)",
-                auto_range, res_arcsec
+                "Auto display range: +/-{:.3} mas (3 lambda/B_proj,min; B_proj,min={:.2} m)",
+                half_range_arcsec * 1_000.0,
+                min_b
             );
-            auto_range
+            2.0 * half_range_arcsec
         }
-        RangeSpec::Value(v) => v.max(10.0),
+        RangeSpec::Value(v) => v,
     };
     let rad_to_arcsec: f64 = 180.0 / PI * 3600.0;
     let arcsec_to_rad = PI / (180.0 * 3600.0);
     let desired_map_range_rad = desired_map_range_arcsec * arcsec_to_rad;
-    let image_size: usize = 1024; // Directly set desired image size
+    let image_size = config.grid_size;
     let cell_size_rad = desired_map_range_rad / image_size as f64; // Calculate cell size based on desired image size
 
     println!(
-        "Angular resolution (lambda/B_max): {:.2} arcsec",
-        (lambda / max_b).to_degrees() * 3600.0
+        "Angular resolution (lambda/B_max): {:.3} mas",
+        (lambda / max_b).to_degrees() * 3600.0 * 1_000.0
     );
     println!(
         "Calculated cell size: {:.4e} rad ({:.4} mas)",
@@ -315,18 +364,39 @@ pub fn run_fringe_rate_map_analysis(
         cell_size_rad.to_degrees() * 3600e3
     );
     println!(
-        "Setting map range to ~{} arcsec with image size {}x{}",
-        desired_map_range_arcsec, image_size, image_size
+        "Setting map range to ~{:.3} mas with image size {}x{}",
+        desired_map_range_arcsec * 1_000.0,
+        image_size,
+        image_size
     );
 
-    // --- Map Accumulator ---
-    let mut total_map = ndarray::Array2::<f32>::zeros((image_size, image_size));
-    let mut total_beam_map = ndarray::Array2::<f32>::zeros((image_size, image_size));
+    // Complex accumulation preserves phase across segments.  The magnitude is
+    // evaluated only after every segment has been mapped to the common sky grid.
+    let mut total_complex_map = ndarray::Array2::<Complex<f32>>::zeros((image_size, image_size));
+    let mut total_complex_beam = ndarray::Array2::<Complex<f32>>::zeros((image_size, image_size));
     let mut uv_data: Vec<(f32, f32)> = Vec::new();
 
     let _obs_start_time = obs_start_time.expect("Failed to get observation start time");
     let effective_integ_time =
         effective_integ_time.expect("Failed to get effective integration time");
+
+    // Match the sub-bin fringe-rate resolution used by --search peak. Delay
+    // padding performs the corresponding interpolation on the frequency axis.
+    let rate_padding = args.rate_padding.max(8);
+    let delay_padding = config.delay_padding;
+    println!(
+        "High-accuracy delay/rate grid: rate padding {}x, delay padding {}x",
+        rate_padding, delay_padding
+    );
+
+    let bandwidth_mhz = header.sampling_speed as f32 / 2.0 / 1_000_000.0;
+    let rbw_mhz = bandwidth_mhz / (header.fft_point as f32 / 2.0);
+    let rfi_ranges = parse_rfi_ranges(&args.rfi, rbw_mhz)?;
+    let bandpass_data = if let Some(bp_path) = &args.bandpass {
+        Some(read_bandpass_file(bp_path)?)
+    } else {
+        None
+    };
 
     // --- Loop Setup ---
     cursor.set_position(0);
@@ -335,8 +405,12 @@ pub fn run_fringe_rate_map_analysis(
     cursor.set_position(256);
 
     let pp = header.number_of_sector;
+    // A short transform keeps delay and fringe rate approximately constant.
+    // Segment spectra are subsequently added coherently on the common sky grid.
+    // Thirty seconds is also small enough for the high-resolution padded grid
+    // to remain memory bounded.
     let length_in_sectors = if args.length == 0 {
-        pp.max(1)
+        ((30.0 / effective_integ_time.max(1.0e-6)).round() as i32).clamp(1, pp.max(1))
     } else {
         args.length.max(1).min(pp)
     };
@@ -348,13 +422,35 @@ pub fn run_fringe_rate_map_analysis(
 
     let total_segments_available = (pp - args.skip) / length_in_sectors;
     let loop_count = if args.loop_ == 1 {
-        // Default loop is 1, so if user doesn't specify, process all
+        // Default loop is 1, so if user does not specify, process all.
         total_segments_available
     } else {
         total_segments_available.min(args.loop_)
     };
 
+    // Build the response of a unit source at delay=rate=0 using exactly the
+    // same finite time/frequency sampling and RFI mask as the data.  A single
+    // delta bin would make the reported beam artificially padding-dependent.
+    let fft_point_half = (header.fft_point / 2) as usize;
+    let unit_visibility =
+        vec![Complex::new(1.0_f32, 0.0_f32); length_in_sectors as usize * fft_point_half];
+    let (beam_freq_rate_array, beam_padding_length) = process_fft(
+        &unit_visibility,
+        length_in_sectors,
+        header.fft_point,
+        header.sampling_speed,
+        &rfi_ranges,
+        rate_padding,
+    );
+    let beam_delay_rate_array = process_ifft_with_delay_padding(
+        &beam_freq_rate_array,
+        header.fft_point,
+        beam_padding_length,
+        delay_padding,
+    );
+
     // --- Main Processing Loop ---
+    let mut processed_segments = 0usize;
     for l1 in 0..loop_count {
         let (mut complex_vec, current_obs_time, effective_integ_time) = match read_visibility_data(
             &mut cursor,
@@ -387,6 +483,8 @@ pub fn run_fringe_rate_map_analysis(
                 args.delay_correct, args.rate_correct, args.acel_correct
             );
 
+            // Keep the phase origin at the first sample.  The complex sky-map
+            // rephasing below uses the same epoch when combining segments.
             let start_time_offset_sec = 0.0;
             apply_phase_correction_in_place(
                 &mut complex_vec,
@@ -403,29 +501,36 @@ pub fn run_fringe_rate_map_analysis(
             );
         }
 
-        let (freq_rate_array, padding_length) = process_fft(
+        let (mut freq_rate_array, padding_length) = process_fft(
             &complex_vec,
             length_in_sectors,
             header.fft_point,
             header.sampling_speed,
-            &[],
-            args.rate_padding,
+            &rfi_ranges,
+            rate_padding,
         );
-        let delay_rate_array = process_ifft(&freq_rate_array, header.fft_point, padding_length);
+        if let Some(bp_data) = &bandpass_data {
+            apply_bandpass_correction(&mut freq_rate_array, bp_data);
+        }
+        let delay_rate_array = process_ifft_with_delay_padding(
+            &freq_rate_array,
+            header.fft_point,
+            padding_length,
+            delay_padding,
+        );
 
         let rate_range_vec = rate_cal(padding_length as f32, effective_integ_time);
         let rate_range = Array::from_vec(rate_range_vec);
         let delay_range = Array::linspace(
-            -(header.fft_point as f32 / 2.0) + 1.0,
+            -(header.fft_point as f32 / 2.0) + 1.0 / delay_padding as f32,
             header.fft_point as f32 / 2.0,
-            header.fft_point as usize,
+            header.fft_point as usize * delay_padding,
         );
 
+        let midpoint_offset_sec =
+            0.5 * length_in_sectors.saturating_sub(1) as f64 * effective_integ_time as f64;
         let segment_center_time = current_obs_time
-            + chrono::Duration::microseconds(
-                ((length_in_sectors as f64 * effective_integ_time as f64 * 1_000_000.0) / 2.0)
-                    as i64,
-            );
+            + chrono::Duration::microseconds((midpoint_offset_sec * 1_000_000.0) as i64);
         let (u, v, _w, du_dt, dv_dt) = uvw_cal(
             header.station1_position,
             header.station2_position,
@@ -442,86 +547,89 @@ pub fn run_fringe_rate_map_analysis(
         }
         uv_data.push((u as f32, v as f32));
 
-        let segment_map = create_map(
+        // The delay/rate FFT is referenced to the first sample of the
+        // segment. Remove that samples geometric phase before combining
+        // segments on the common sky grid.
+        let (phase_u, phase_v, _phase_w, _, _) = uvw_cal(
+            header.station1_position,
+            header.station2_position,
+            current_obs_time,
+            header.source_position_ra,
+            header.source_position_dec,
+            true,
+        );
+        let segment_map = create_complex_map(
             &delay_rate_array,
             u,
             v,
             du_dt,
             dv_dt,
+            phase_u,
+            phase_v,
             &header,
             &rate_range.view(),
             &delay_range.view(),
             image_size,
             cell_size_rad,
         );
-        total_map = total_map + segment_map;
+        total_complex_map += &segment_map;
 
-        let mut beam_delay_rate_array = Array2::zeros(delay_rate_array.dim());
-        let rate_center_idx = rate_range
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
-            .map(|(idx, _)| idx)
-            .unwrap_or(rate_range.len() / 2);
-        let delay_center_idx = delay_range
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
-            .map(|(idx, _)| idx)
-            .unwrap_or(delay_range.len() / 2);
-
-        beam_delay_rate_array[[rate_center_idx, delay_center_idx]] = Complex::new(1.0, 0.0);
-
-        let segment_beam_map = create_map(
+        let segment_beam_map = create_complex_map(
             &beam_delay_rate_array,
             u,
             v,
             du_dt,
             dv_dt,
+            phase_u,
+            phase_v,
             &header,
             &rate_range.view(),
             &delay_range.view(),
             image_size,
             cell_size_rad,
         );
-        total_beam_map = total_beam_map + segment_beam_map;
+        total_complex_beam += &segment_beam_map;
+        processed_segments += 1;
 
-        println!("Processed segment {}/{}", l1 + 1, loop_count);
-    }
-
-    // --- Save Final Maps and Data ---
-    println!("Finished processing. Saving outputs...");
-
-    let mut max_val = 0.0;
-    let mut max_idx = (0, 0);
-    for ((y, x), &val) in total_map.indexed_iter() {
-        if val > max_val {
-            max_val = val;
-            max_idx = (y, x);
+        if (l1 + 1) % 10 == 0 || l1 + 1 == loop_count {
+            println!("Processed segment {}/{}", l1 + 1, loop_count);
         }
     }
-    let (max_y, max_x) = max_idx;
+
+    if processed_segments == 0 {
+        return Err("No unflagged segments were available for fringe-rate mapping".into());
+    }
+
+    // Complex thermal noise averages toward zero. Convert to amplitude only
+    // once, after all segment phases have been placed on the same reference.
+    let inv_segments = 1.0_f32 / processed_segments as f32;
+    let total_map = total_complex_map.mapv(|value| (value * inv_segments).norm());
+    let total_beam_map = total_complex_beam.mapv(|value| (value * inv_segments).norm());
+    println!(
+        "Coherently averaged {} segments ({:.1} seconds)",
+        processed_segments,
+        processed_segments as f64 * length_in_sectors as f64 * effective_integ_time as f64
+    );
+
+    // --- Save Final Maps and Data ---
+    println!("Finished coherent processing. Saving outputs...");
+
+    let (max_val, (max_y, max_x)) = find_map_peak(&total_map);
+    let (_beam_max, (beam_max_y, beam_max_x)) = find_map_peak(&total_beam_map);
 
     let map_filename = frinz_dir.join(format!("{}_frmap.png", file_stem));
     plot_sky_map(&map_filename, &total_map, cell_size_rad, max_x, max_y)?;
     println!("Fringe rate map saved to: {:?}", map_filename);
 
-    let map_bin_filename = frinz_dir.join(format!("{}_frmap.bin", file_stem));
-    let mut map_file = File::create(&map_bin_filename)?;
-    map_file.write_all(&(image_size as u32).to_le_bytes())?;
-    map_file.write_all(&(image_size as u32).to_le_bytes())?;
-    for val in total_map.iter() {
-        map_file.write_all(&val.to_le_bytes())?;
-    }
-    println!("Fringe rate map data saved to: {:?}", map_bin_filename);
+    let _ = fs::remove_file(frinz_dir.join(format!("{}_frmap.bin", file_stem)));
 
     let beam_map_filename = frinz_dir.join(format!("{}_beam.png", file_stem));
     plot_sky_map(
         &beam_map_filename,
         &total_beam_map,
         cell_size_rad,
-        max_x,
-        max_y,
+        beam_max_x,
+        beam_max_y,
     )?;
     println!("Beam map saved to: {:?}", beam_map_filename);
 
@@ -529,23 +637,67 @@ pub fn run_fringe_rate_map_analysis(
     plot_uv_coverage(&uv_coverage_filename, &all_uv_data)?;
     println!("UV coverage plot saved to: {:?}", uv_coverage_filename);
 
-    let uv_bin_filename = frinz_dir.join(format!("{}_uv.bin", file_stem));
-    let mut uv_file = File::create(&uv_bin_filename)?;
-    for (u, v) in &all_uv_data {
-        uv_file.write_all(&u.to_le_bytes())?;
-        uv_file.write_all(&v.to_le_bytes())?;
-    }
-    println!("UV coverage data saved to: {:?}", uv_bin_filename);
+    let _ = fs::remove_file(frinz_dir.join(format!("{}_uv.bin", file_stem)));
 
     let horizontal_profile = total_map.row(max_y);
     let vertical_profile = total_map.column(max_x);
     let (height, width) = total_map.dim();
     let ra_offsets: Vec<f64> = (0..width)
-        .map(|i| ((i as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_arcsec)
+        .map(|i| ((i as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_arcsec * 1_000.0)
         .collect();
     let dec_offsets: Vec<f64> = (0..height)
-        .map(|i| ((height as f64 / 2.0) - i as f64) * cell_size_rad * rad_to_arcsec)
+        .map(|i| ((height as f64 / 2.0) - i as f64) * cell_size_rad * rad_to_arcsec * 1_000.0)
         .collect();
+
+    let npy_meta = |flag| {
+        NpyMeta::new(
+            flag,
+            header.fft_point as u32,
+            header.number_of_sector as u32,
+        )
+        .axes("dec_offset", "mas", "ra_offset", "mas")
+    };
+    if args.npz {
+        let map_npy = npz_sidecar_path(&map_filename, "frmap");
+        write_complex_2d(
+            &map_npy,
+            npy_meta("frmap"),
+            (height, width),
+            total_complex_map.iter().map(|&value| value * inv_segments),
+            &dec_offsets,
+            &ra_offsets,
+        )?;
+        let beam_npy = npz_sidecar_path(&beam_map_filename, "beam");
+        write_complex_2d(
+            &beam_npy,
+            npy_meta("beam"),
+            (height, width),
+            total_complex_beam.iter().map(|&value| value * inv_segments),
+            &dec_offsets,
+            &ra_offsets,
+        )?;
+        let uv_values: Vec<Complex<f32>> = all_uv_data
+            .iter()
+            .map(|&(u, v)| Complex::new(u as f32, v as f32))
+            .collect();
+        let uv_index: Vec<f64> = (0..uv_values.len()).map(|index| index as f64).collect();
+        let uv_npy = npz_sidecar_path(&uv_coverage_filename, "uv");
+        write_complex_1d(
+            &uv_npy,
+            NpyMeta::new(
+                "uv",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("sample", "", "u_real_v_imag", "wavelength"),
+            &uv_values,
+            &uv_index,
+        )?;
+        println!(
+            "NumPy map data saved to: {:?}, {:?}, {:?}",
+            map_npy, beam_npy, uv_npy
+        );
+    }
     let horizontal_data: Vec<(f64, f32)> = ra_offsets
         .iter()
         .zip(horizontal_profile.iter())
@@ -558,10 +710,11 @@ pub fn run_fringe_rate_map_analysis(
         .collect();
 
     let center = (image_size / 2) as f64;
-    let l_rad = ((max_x as f64) - center) * cell_size_rad;
-    let m_rad = (center - (max_y as f64)) * cell_size_rad;
-    let l_arcsec = l_rad * rad_to_arcsec;
-    let m_arcsec = m_rad * rad_to_arcsec;
+    let (refined_x, refined_y) = refine_map_peak(&total_map, max_y, max_x);
+    let l_rad = (refined_x - center) * cell_size_rad;
+    let m_rad = (center - refined_y) * cell_size_rad;
+    let l_mas = l_rad * rad_to_arcsec * 1_000.0;
+    let m_mas = m_rad * rad_to_arcsec * 1_000.0;
 
     let cross_section_filename = frinz_dir.join(format!("{}_frmap_peak.png", file_stem));
     plot_cross_section(
@@ -569,14 +722,40 @@ pub fn run_fringe_rate_map_analysis(
         &horizontal_data,
         &vertical_data,
         max_val,
-        l_arcsec,
-        m_arcsec,
+        l_mas,
+        m_mas,
     )?;
+    let horizontal_values: Vec<f32> = horizontal_profile.iter().copied().collect();
+    let vertical_values: Vec<f32> = vertical_profile.iter().copied().collect();
+    if args.npz {
+        write_real_1d(
+            &npz_sidecar_path(&cross_section_filename, "frmap_peak_ra"),
+            NpyMeta::new(
+                "frmap_peak_ra",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("ra_offset", "mas", "amplitude", ""),
+            &horizontal_values,
+            &ra_offsets,
+        )?;
+        write_real_1d(
+            &npz_sidecar_path(&cross_section_filename, "frmap_peak_dec"),
+            NpyMeta::new(
+                "frmap_peak_dec",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("dec_offset", "mas", "amplitude", ""),
+            &vertical_values,
+            &dec_offsets,
+        )?;
+    }
     println!("Cross-section plot saved to: {:?}", cross_section_filename);
 
-    println!("Estimated source position (relative to phase center):");
-    println!("  Delta RA: {:.3} arcsec", l_arcsec);
-    println!("  Delta Dec: {:.3} arcsec", m_arcsec);
+    println!("Estimated source position (relative to phase center, sub-pixel fit):");
+    println!("  Delta RA: {:.3} mas", l_mas);
+    println!("  Delta Dec: {:.3} mas", m_mas);
 
     Ok(())
 }
@@ -989,19 +1168,53 @@ fn run_frmap_maser(
         lambda,
         final_range_arcsec,
     )?;
+    if args.npz {
+        let line_values: Vec<Complex<f32>> = lines
+            .iter()
+            .map(|line| Complex::new(line.du_dt as f32, line.dv_dt as f32))
+            .collect();
+        let line_rates: Vec<f64> = lines.iter().map(|line| line.rate_hz).collect();
+        write_complex_1d(
+            &npz_sidecar_path(&plot_path, "frmap_maser_lines"),
+            NpyMeta::new(
+                "frmap_maser_lines",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("fringe_rate", "Hz", "du_dt_real_dv_dt_imag", "m/s"),
+            &line_values,
+            &line_rates,
+        )?;
+        let intersection_values: Vec<Complex<f32>> = intersections
+            .iter()
+            .map(|point| {
+                Complex::new(
+                    (point.l * rad_to_arcsec) as f32,
+                    (point.m * rad_to_arcsec) as f32,
+                )
+            })
+            .collect();
+        let intersection_weights: Vec<f64> =
+            intersections.iter().map(|point| point.weight).collect();
+        write_complex_1d(
+            &npz_sidecar_path(&plot_path, "frmap_maser_intersections"),
+            NpyMeta::new(
+                "frmap_maser_intersections",
+                header.fft_point as u32,
+                header.number_of_sector as u32,
+            )
+            .axes("weight", "", "ra_real_dec_imag", "arcsec"),
+            &intersection_values,
+            &intersection_weights,
+        )?;
+    }
     println!("Fringe-rate line plot saved to {:?}", plot_path);
 
     let uv_coverage_filename = frinz_dir.join(format!("{}_uv.png", file_stem));
     plot_uv_coverage(&uv_coverage_filename, &all_uv_data)?;
     println!("UV coverage plot saved to {:?}", uv_coverage_filename);
 
-    let uv_bin_filename = frinz_dir.join(format!("{}_uv.bin", file_stem));
-    let mut uv_file = File::create(&uv_bin_filename)?;
-    for (u, v) in &all_uv_data {
-        uv_file.write_all(&u.to_le_bytes())?;
-        uv_file.write_all(&v.to_le_bytes())?;
-    }
-    println!("UV coverage data saved to {:?}", uv_bin_filename);
+    let _ = fs::remove_file(frinz_dir.join(format!("{}_uv.bin", file_stem)));
 
     Ok(())
 }
@@ -1167,6 +1380,100 @@ fn plot_fringe_rate_lines(
     Ok(())
 }
 
+fn geometric_phase_correction(
+    phase_u: f64,
+    phase_v: f64,
+    l: f64,
+    m: f64,
+    lambda: f64,
+) -> Complex<f32> {
+    let angle = -2.0 * PI * (phase_u * l + phase_v * m) / lambda;
+    Complex::new(angle.cos() as f32, angle.sin() as f32)
+}
+
+fn create_complex_map(
+    delay_rate_array: &Array2<Complex<f32>>,
+    u: f64,
+    v: f64,
+    du_dt: f64,
+    dv_dt: f64,
+    phase_u: f64,
+    phase_v: f64,
+    header: &CorHeader,
+    rate_range: &ArrayView1<f32>,
+    delay_range: &ArrayView1<f32>,
+    image_size: usize,
+    cell_size_rad: f64,
+) -> Array2<Complex<f32>> {
+    let mut image = Array2::<Complex<f32>>::zeros((image_size, image_size));
+    if rate_range.len() < 2 || delay_range.len() < 2 {
+        return image;
+    }
+
+    let center = (image_size / 2) as f64;
+    let lambda = C / header.observing_frequency;
+    let rate_min = rate_range[0] as f64;
+    let rate_max = rate_range[rate_range.len() - 1] as f64;
+    let rate_step = (rate_max - rate_min) / (rate_range.len() - 1) as f64;
+    let delay_min = delay_range[0] as f64;
+    let delay_max = delay_range[delay_range.len() - 1] as f64;
+    let delay_step = (delay_max - delay_min) / (delay_range.len() - 1) as f64;
+
+    if rate_step == 0.0 || delay_step == 0.0 {
+        return image;
+    }
+
+    let l_start = -center * cell_size_rad;
+    let phase_step = geometric_phase_correction(phase_u, 0.0, cell_size_rad, 0.0, lambda);
+
+    image
+        .as_slice_mut()
+        .expect("newly allocated sky map must be contiguous")
+        .par_chunks_mut(image_size)
+        .enumerate()
+        .for_each(|(iy, row)| {
+            let m = (center - iy as f64) * cell_size_rad;
+            let mut phase = geometric_phase_correction(phase_u, phase_v, l_start, m, lambda);
+
+            for (ix, pixel) in row.iter_mut().enumerate() {
+                let l = (ix as f64 - center) * cell_size_rad;
+                let delay_s = (u * l + v * m) / C;
+                let rate_hz = (du_dt * l + dv_dt * m) / lambda;
+                let delay_sample = delay_s * header.sampling_speed as f64;
+                let delay_idx_f = (delay_sample - delay_min) / delay_step;
+                let rate_idx_f = (rate_hz - rate_min) / rate_step;
+
+                if delay_idx_f.is_finite()
+                    && rate_idx_f.is_finite()
+                    && delay_idx_f >= 0.0
+                    && rate_idx_f >= 0.0
+                {
+                    let x1 = delay_idx_f.floor() as usize;
+                    let y1 = rate_idx_f.floor() as usize;
+                    let x2 = x1 + 1;
+                    let y2 = y1 + 1;
+
+                    if x2 < delay_rate_array.dim().1 && y2 < delay_rate_array.dim().0 {
+                        let xf = (delay_idx_f - x1 as f64) as f32;
+                        let yf = (rate_idx_f - y1 as f64) as f32;
+                        let p11 = delay_rate_array[[y1, x1]];
+                        let p12 = delay_rate_array[[y2, x1]];
+                        let p21 = delay_rate_array[[y1, x2]];
+                        let p22 = delay_rate_array[[y2, x2]];
+                        let value = p11 * (1.0 - xf) * (1.0 - yf)
+                            + p21 * xf * (1.0 - yf)
+                            + p12 * (1.0 - xf) * yf
+                            + p22 * xf * yf;
+                        *pixel = value * phase;
+                    }
+                }
+                phase *= phase_step;
+            }
+        });
+
+    image
+}
+
 /// Creates a sky image (l, m) from a delay-rate map.
 ///
 /// # Arguments
@@ -1181,6 +1488,7 @@ fn plot_fringe_rate_lines(
 ///
 /// # Returns
 /// A 2D array representing the sky brightness map.
+#[allow(dead_code)]
 pub fn create_map(
     delay_rate_array: &Array2<Complex<f32>>,
     u: f64,
@@ -1270,6 +1578,8 @@ struct FrMapConfig {
     snr_threshold: f64,
     range_spec: RangeSpec,
     max_peaks_per_segment: usize,
+    grid_size: usize,
+    delay_padding: usize,
 }
 
 impl Default for FrMapConfig {
@@ -1279,6 +1589,8 @@ impl Default for FrMapConfig {
             snr_threshold: 5.0,
             range_spec: RangeSpec::Auto,
             max_peaks_per_segment: 12,
+            grid_size: 1024,
+            delay_padding: 4,
         }
     }
 }
@@ -1370,9 +1682,31 @@ impl FrMapConfig {
                     }
                     config.max_peaks_per_segment = parsed;
                 }
+                "grid" | "size" => {
+                    let val =
+                        value_str.ok_or_else(|| "grid option requires a value".to_string())?;
+                    let parsed = val
+                        .parse::<usize>()
+                        .map_err(|_| format!("Failed to parse grid size {}", val))?;
+                    if !(64..=4096).contains(&parsed) {
+                        return Err("grid must be between 64 and 4096".into());
+                    }
+                    config.grid_size = parsed;
+                }
+                "delay-padding" | "delay-pad" | "dpad" => {
+                    let val = value_str
+                        .ok_or_else(|| "delay-padding option requires a value".to_string())?;
+                    let parsed = val
+                        .parse::<usize>()
+                        .map_err(|_| format!("Failed to parse delay-padding value {}", val))?;
+                    if !matches!(parsed, 1 | 2 | 4 | 8) {
+                        return Err("delay-padding must be one of 1, 2, 4, or 8".into());
+                    }
+                    config.delay_padding = parsed;
+                }
                 other => {
                     return Err(format!(
-                        "Unknown --frmap option '{}'. Expected keys: mode, snr, range, max-peaks.",
+                        "Unknown --frmap option '{}'. Expected keys: mode, snr, range, max-peaks, grid, delay-padding.",
                         other
                     )
                     .into());
@@ -1381,5 +1715,112 @@ impl FrMapConfig {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_peak_refinement_recovers_fractional_pixel() {
+        let expected_x = 3.25_f64;
+        let expected_y = 2.6_f64;
+        let mut map = Array2::<f32>::zeros((7, 7));
+        for ((row, col), value) in map.indexed_iter_mut() {
+            let dx = col as f64 - expected_x;
+            let dy = row as f64 - expected_y;
+            *value = (10.0 - dx * dx - 2.0 * dy * dy) as f32;
+        }
+        let (x, y) = refine_map_peak(&map, 3, 3);
+        assert!((x - expected_x).abs() < 1.0e-6);
+        assert!((y - expected_y).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn geometric_rephasing_aligns_segment_phases() {
+        let lambda = 0.045;
+        let l = 2.0e-6;
+        let m = -1.0e-6;
+        let mut coherent_sum = Complex::new(0.0_f32, 0.0_f32);
+        for (u, v) in [(120_000.0, -30_000.0), (-450_000.0, 210_000.0)] {
+            let source_phase = 2.0 * PI * (u * l + v * m) / lambda;
+            let visibility = Complex::new(source_phase.cos() as f32, source_phase.sin() as f32);
+            coherent_sum += visibility * geometric_phase_correction(u, v, l, m, lambda);
+        }
+        assert!((coherent_sum.re - 2.0).abs() < 1.0e-5);
+        assert!(coherent_sum.im.abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn synthetic_fringe_is_real_after_complex_sky_rephasing() {
+        let fft_point = 16_i32;
+        let rows = 16_i32;
+        let sampling_speed = 16_000_i32;
+        let observing_frequency = 1.0e9_f64;
+        let integration_time = 1.0_f32;
+        let l = 1.0e-6_f64;
+        let delay_samples = 1.0_f64;
+        let fringe_rate = 0.125_f64;
+        let lambda = C / observing_frequency;
+        let phase_u = C * delay_samples / (sampling_speed as f64 * l);
+        let du_dt = fringe_rate * lambda / l;
+        let midpoint = 0.5 * (rows - 1) as f64 * integration_time as f64;
+        let u_mid = phase_u + du_dt * midpoint;
+        let phase0 = 2.0 * PI * phase_u * l / lambda;
+        let channels = (fft_point / 2) as usize;
+        let mut samples = Vec::with_capacity(rows as usize * channels);
+        for row in 0..rows as usize {
+            for channel in 0..channels {
+                let phase = phase0
+                    + 2.0
+                        * PI
+                        * (fringe_rate * row as f64 * integration_time as f64
+                            + delay_samples * channel as f64 / fft_point as f64);
+                samples.push(Complex::new(phase.cos() as f32, phase.sin() as f32));
+            }
+        }
+
+        let (freq_rate, padding) = process_fft(&samples, rows, fft_point, sampling_speed, &[], 1);
+        let delay_rate = process_ifft_with_delay_padding(&freq_rate, fft_point, padding, 1);
+        let rate_range = Array::from_vec(rate_cal(padding as f32, integration_time));
+        let delay_range = Array::linspace(
+            -(fft_point as f32 / 2.0) + 1.0,
+            fft_point as f32 / 2.0,
+            fft_point as usize,
+        );
+        let mut header = CorHeader::default();
+        header.observing_frequency = observing_frequency;
+        header.sampling_speed = sampling_speed;
+        header.fft_point = fft_point;
+        let map = create_complex_map(
+            &delay_rate,
+            u_mid,
+            0.0,
+            du_dt,
+            0.0,
+            phase_u,
+            0.0,
+            &header,
+            &rate_range.view(),
+            &delay_range.view(),
+            3,
+            l,
+        );
+        let recovered = map[[1, 2]];
+        assert!(recovered.norm() > 0.0);
+        assert!(recovered.re > 0.0, "recovered={recovered:?}");
+        assert!(
+            recovered.im.abs() < recovered.re.abs() * 0.02,
+            "recovered={recovered:?}"
+        );
+    }
+
+    #[test]
+    fn frmap_precision_options_are_parsed() {
+        let tokens = vec!["grid:2048".to_string(), "delay-padding:8".to_string()];
+        let config = FrMapConfig::from_tokens(&tokens).unwrap();
+        assert_eq!(config.grid_size, 2048);
+        assert_eq!(config.delay_padding, 8);
     }
 }

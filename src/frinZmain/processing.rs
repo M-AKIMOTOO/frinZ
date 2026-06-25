@@ -11,9 +11,7 @@ use num_complex::Complex;
 
 use crate::analysis::analyze_results;
 use crate::args::Args;
-use crate::bandpass::{
-    apply_bandpass_correction, read_bandpass_file, write_complex_spectrum_binary,
-};
+use crate::bandpass::{apply_bandpass_correction, plot_bandpass_spectrum, read_bandpass_file};
 use crate::fft::{
     apply_phase_correction_in_place, perform_ifft_on_vec, process_fft,
     process_fft_with_phase_correction, process_ifft,
@@ -21,6 +19,9 @@ use crate::fft::{
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
 use crate::norm_acf::NormAcfContext;
+use crate::npy_output::{
+    npz_sidecar_path, write_complex_1d, write_complex_2d, write_real_2d, NpyMeta,
+};
 use crate::output::{
     format_delay_output, format_freq_output, generate_output_names, output_header_info,
 };
@@ -30,9 +31,7 @@ use crate::plot::{
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
-use crate::utils::{
-    delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg,
-};
+use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg};
 type C32 = Complex<f32>;
 
 #[derive(Debug, Clone)]
@@ -41,6 +40,36 @@ struct ScanCorrection {
     end_time: DateTime<Utc>,
     delay: f32,
     rate: f32,
+}
+
+fn write_spectrum_npz(
+    output_path: &Path,
+    flag: &str,
+    results: &AnalysisResults,
+    fft_point: u32,
+    pp: u32,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let spectrum = results
+        .freq_rate_spectrum
+        .as_slice()
+        .ok_or("freq_rate_spectrum is not contiguous")?;
+    let axis: Vec<f64> = if results.freq_range.len() == spectrum.len() {
+        results
+            .freq_range
+            .iter()
+            .map(|value| *value as f64)
+            .collect()
+    } else {
+        (0..spectrum.len()).map(|index| index as f64).collect()
+    };
+    let npz_path = npz_sidecar_path(output_path, flag);
+    write_complex_1d(
+        &npz_path,
+        NpyMeta::new(flag, fft_point, pp).axes("frequency", "MHz", "", ""),
+        spectrum,
+        &axis,
+    )?;
+    Ok(npz_path)
 }
 
 fn parse_scan_correct_file(path: &Path) -> Result<Vec<ScanCorrection>, Box<dyn Error>> {
@@ -721,8 +750,16 @@ pub fn process_cor_file(
 
         if args.spectrum {
             if let Some(path) = &spectrum_output_path {
-                let output_file_path = path.join(format!("{}_cross.spec", base_filename));
-                write_complex_spectrum_binary(
+                let output_file_path = path.join(format!("{}_spectrum.npz", base_filename));
+                let _ = fs::remove_file(path.join(format!("{}_cross.spec", base_filename)));
+                let npz_path = write_spectrum_npz(
+                    &output_file_path,
+                    "spectrum",
+                    &analysis_results,
+                    effective_fft_point as u32,
+                    processing_header.number_of_sector as u32,
+                )?;
+                plot_bandpass_spectrum(
                     &output_file_path,
                     analysis_results
                         .freq_rate_spectrum
@@ -731,17 +768,23 @@ pub fn process_cor_file(
                     effective_fft_point,
                     1,
                 )?;
-                println!(
-                    "Cross-power spectrum file written to {:?}",
-                    output_file_path
-                );
+                println!("Spectrum NPZ written to {:?}", npz_path);
+                println!("Spectrum NPZ written to {:?}", output_file_path);
             }
         }
 
         if args.bandpass_table {
             if let Some(path) = &bandpass_output_path {
-                let output_file_path = path.join(format!("{}_bptable.bin", base_filename));
-                write_complex_spectrum_binary(
+                let output_file_path = path.join(format!("{}_bptable.npz", base_filename));
+                let _ = fs::remove_file(path.join(format!("{}_bptable.bin", base_filename)));
+                let npz_path = write_spectrum_npz(
+                    &output_file_path,
+                    "bptable",
+                    &analysis_results,
+                    effective_fft_point as u32,
+                    processing_header.number_of_sector as u32,
+                )?;
+                plot_bandpass_spectrum(
                     &output_file_path,
                     analysis_results
                         .freq_rate_spectrum
@@ -750,7 +793,8 @@ pub fn process_cor_file(
                     effective_fft_point,
                     0,
                 )?;
-                println!("Bandpass binary file written to {:?}", output_file_path);
+                println!("Bandpass NPZ written to {:?}", npz_path);
+                println!("Bandpass NPZ written to {:?}", output_file_path);
             }
         }
 
@@ -792,6 +836,33 @@ pub fn process_cor_file(
                 current_length,
                 effective_integ_time,
             )?;
+            let time_axis: Vec<f64> = (0..usable_rows)
+                .map(|row| row as f64 * effective_integ_time as f64)
+                .collect();
+            let channel_width_mhz =
+                processing_header.sampling_speed as f64 / effective_fft_point as f64 / 1.0e6;
+            let frequency_axis: Vec<f64> = (0..fft_point_half)
+                .map(|channel| {
+                    processing_header.observing_frequency / 1.0e6
+                        + channel as f64 * channel_width_mhz
+                })
+                .collect();
+            if args.npz {
+                let freq_npy = output_path_freq.with_extension("npz");
+                write_complex_2d(
+                    &freq_npy,
+                    NpyMeta::new(
+                        "dynamic_spectrum",
+                        effective_fft_point as u32,
+                        processing_header.number_of_sector as u32,
+                    )
+                    .axes("time", "s", "frequency", "MHz"),
+                    spectrum_array.dim(),
+                    spectrum_array.iter().copied(),
+                    &time_axis,
+                    &frequency_axis,
+                )?;
+            }
             let mut lag_data = Array::zeros((usable_rows, effective_fft_point as usize));
             let fft_point_usize = effective_fft_point as usize;
             for (i, row) in spectrum_array.rows().into_iter().enumerate() {
@@ -810,6 +881,25 @@ pub fn process_cor_file(
                 current_length,
                 effective_integ_time,
             )?;
+            let delay_axis: Vec<f64> = (0..fft_point_usize)
+                .map(|index| -(fft_point_usize as f64 / 2.0) + 1.0 + index as f64)
+                .collect();
+            if args.npz {
+                let lag_npy = output_path_lag.with_extension("npz");
+                write_real_2d(
+                    &lag_npy,
+                    NpyMeta::new(
+                        "dynamic_spectrum_lag",
+                        effective_fft_point as u32,
+                        processing_header.number_of_sector as u32,
+                    )
+                    .axes("time", "s", "delay", "sample"),
+                    lag_data.dim(),
+                    lag_data.iter().copied(),
+                    &time_axis,
+                    &delay_axis,
+                )?;
+            }
         }
 
         if !args.frequency {
@@ -1003,6 +1093,65 @@ pub fn process_cor_file(
                         plot_dir.join(format!("{}_freq_rate_search.png", base_for_plot))
                     }
                 };
+
+                if args.npz && !args.frequency {
+                    let rate_axis: Vec<f64> = analysis_results
+                        .rate_range
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect();
+                    let delay_axis: Vec<f64> = analysis_results
+                        .delay_range
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect();
+                    let npz_path = npz_sidecar_path(&output_filename, "plot_delay_rate");
+                    write_complex_2d(
+                        &npz_path,
+                        NpyMeta::new(
+                            "plot_delay_rate",
+                            effective_fft_point as u32,
+                            processing_header.number_of_sector as u32,
+                        )
+                        .axes("fringe_rate", "Hz", "delay", "sample"),
+                        delay_rate_2d_data_comp.dim(),
+                        delay_rate_2d_data_comp.iter().copied(),
+                        &rate_axis,
+                        &delay_axis,
+                    )?;
+                } else if args.npz {
+                    if let Some(freq_rate) = freq_rate_array.as_ref() {
+                        let frequency_axis: Vec<f64> = analysis_results
+                            .freq_range
+                            .iter()
+                            .map(|&v| v as f64)
+                            .collect();
+                        let rate_axis: Vec<f64> = analysis_results
+                            .rate_range
+                            .iter()
+                            .map(|&v| v as f64)
+                            .collect();
+                        let npz_path = npz_sidecar_path(&output_filename, "plot_freq_rate");
+                        write_complex_2d(
+                            &npz_path,
+                            NpyMeta::new(
+                                "plot_freq_rate",
+                                effective_fft_point as u32,
+                                processing_header.number_of_sector as u32,
+                            )
+                            .axes(
+                                "frequency",
+                                "MHz",
+                                "fringe_rate",
+                                "Hz",
+                            ),
+                            freq_rate.dim(),
+                            freq_rate.iter().copied(),
+                            &frequency_axis,
+                            &rate_axis,
+                        )?;
+                    }
+                }
 
                 if !args.frequency {
                     let mask_bounds = delay_rate_mask_bounds(&args.mask);
@@ -1579,38 +1728,37 @@ pub(crate) fn run_analysis_pipeline(
             .num_seconds() as f32
     };
 
-    let (mut freq_rate_array, padding_length) =
-        if delay_correct != 0.0
-            || rate_correct != 0.0
-            || acel_correct != 0.0
-            || base_args.jerk_correct != 0.0
-            || base_args.snap_correct != 0.0
-        {
-            process_fft_with_phase_correction(
-                complex_vec,
-                physical_length,
-                effective_fft_point,
-                header.sampling_speed,
-                rfi_ranges,
-                base_args.rate_padding,
-                rate_correct,
-                delay_correct,
-                acel_correct,
-                base_args.jerk_correct,
-                base_args.snap_correct,
-                effective_integ_time,
-                start_time_offset_sec,
-            )
-        } else {
-            process_fft(
-                complex_vec,
-                physical_length,
-                effective_fft_point,
-                header.sampling_speed,
-                rfi_ranges,
-                base_args.rate_padding,
-            )
-        };
+    let (mut freq_rate_array, padding_length) = if delay_correct != 0.0
+        || rate_correct != 0.0
+        || acel_correct != 0.0
+        || base_args.jerk_correct != 0.0
+        || base_args.snap_correct != 0.0
+    {
+        process_fft_with_phase_correction(
+            complex_vec,
+            physical_length,
+            effective_fft_point,
+            header.sampling_speed,
+            rfi_ranges,
+            base_args.rate_padding,
+            rate_correct,
+            delay_correct,
+            acel_correct,
+            base_args.jerk_correct,
+            base_args.snap_correct,
+            effective_integ_time,
+            start_time_offset_sec,
+        )
+    } else {
+        process_fft(
+            complex_vec,
+            physical_length,
+            effective_fft_point,
+            header.sampling_speed,
+            rfi_ranges,
+            base_args.rate_padding,
+        )
+    };
 
     let skip_delay_rate_ifft = base_args.frequency && base_args.drange.is_empty();
 

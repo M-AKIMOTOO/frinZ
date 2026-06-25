@@ -11,6 +11,7 @@ use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
 use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
+use crate::npy_output::{npz_sidecar_path, write_complex_2d, NpyMeta};
 use crate::plot::frequency_plane_msb;
 use crate::read::{read_sector_header, read_visibility_data};
 use crate::rfi::parse_rfi_ranges;
@@ -701,6 +702,55 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         rate_cal(c_band_padding_length as f32, c_band_effective_integ_time);
     let x_band_rate_values_f32 =
         rate_cal(x_band_padding_length as f32, x_band_effective_integ_time);
+
+    if args.npz {
+        let c_frequency_axis: Vec<f64> = c_band_analysis_results
+            .freq_range
+            .iter()
+            .map(|&value| value as f64)
+            .collect();
+        let c_rate_axis: Vec<f64> = c_band_analysis_results
+            .rate_range
+            .iter()
+            .map(|&value| value as f64)
+            .collect();
+        write_complex_2d(
+            &npz_sidecar_path(&freq_plot_filename, "multi_sideband_c"),
+            NpyMeta::new(
+                "multi_sideband_c",
+                c_band_header.fft_point as u32,
+                c_band_header.number_of_sector as u32,
+            )
+            .axes("frequency", "MHz", "fringe_rate", "Hz"),
+            c_band_freq_rate_array.dim(),
+            c_band_freq_rate_array.iter().copied(),
+            &c_frequency_axis,
+            &c_rate_axis,
+        )?;
+        let x_frequency_axis: Vec<f64> = x_band_analysis_results
+            .freq_range
+            .iter()
+            .map(|&value| value as f64 + x_band_offset_mhz)
+            .collect();
+        let x_rate_axis: Vec<f64> = x_band_analysis_results
+            .rate_range
+            .iter()
+            .map(|&value| value as f64)
+            .collect();
+        write_complex_2d(
+            &npz_sidecar_path(&freq_plot_filename, "multi_sideband_x"),
+            NpyMeta::new(
+                "multi_sideband_x",
+                x_band_header.fft_point as u32,
+                x_band_header.number_of_sector as u32,
+            )
+            .axes("frequency", "MHz", "fringe_rate", "Hz"),
+            x_band_freq_rate_array.dim(),
+            x_band_freq_rate_array.iter().copied(),
+            &x_frequency_axis,
+            &x_rate_axis,
+        )?;
+    }
 
     let heatmap_func = move |freq_mhz: f64, rate_hz: f64| -> f64 {
         let rate_idx_c = ((rate_hz - c_band_rate_values_f32[0] as f64)

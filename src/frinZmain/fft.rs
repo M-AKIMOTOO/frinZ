@@ -1,9 +1,37 @@
 use ndarray::prelude::*;
 use num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
+use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::sync::{Arc, Mutex, OnceLock};
 
 type C32 = Complex<f32>;
+
+static FFT_PLAN_CACHE: OnceLock<Mutex<HashMap<(usize, bool), Arc<dyn Fft<f32>>>>> = OnceLock::new();
+
+pub(crate) fn cached_fft_plan(len: usize, inverse: bool) -> Arc<dyn Fft<f32>> {
+    let cache = FFT_PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(plan) = cache
+        .lock()
+        .expect("FFT plan cache poisoned")
+        .get(&(len, inverse))
+        .cloned()
+    {
+        return plan;
+    }
+
+    let mut planner = FftPlanner::new();
+    let plan = if inverse {
+        planner.plan_fft_inverse(len)
+    } else {
+        planner.plan_fft_forward(len)
+    };
+    cache
+        .lock()
+        .expect("FFT plan cache poisoned")
+        .insert((len, inverse), plan.clone());
+    plan
+}
 
 #[derive(Clone, Copy)]
 struct PhaseCorrection {
@@ -127,8 +155,7 @@ fn process_fft_impl(
     };
     let scale_factor = fft_scale * power_scale;
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(padding_length);
+    let fft = cached_fft_plan(padding_length, false);
 
     let mut freq_rate_array = Array2::<C32>::zeros((fft_point_half, padding_length));
     let mut fft_exe = vec![C32::new(0.0, 0.0); padding_length];
@@ -227,12 +254,27 @@ pub fn process_ifft(
     fft_point: i32,
     padding_length: usize,
 ) -> Array2<C32> {
+    process_ifft_with_delay_padding(freq_rate_array, fft_point, padding_length, 1)
+}
+
+/// Transform the frequency axis to delay with optional zero padding.
+///
+/// Padding interpolates the delay spectrum without changing its physical
+/// range. Dividing by the unpadded FFT size keeps amplitudes identical at
+/// the original integer-delay samples.
+pub fn process_ifft_with_delay_padding(
+    freq_rate_array: &Array2<C32>,
+    fft_point: i32,
+    padding_length: usize,
+    delay_padding: usize,
+) -> Array2<C32> {
     let fft_point_usize = fft_point as usize;
-    let mut delay_rate_array = Array2::<C32>::zeros((padding_length, fft_point_usize));
-    let mut planner = FftPlanner::new();
-    let ifft = planner.plan_fft_inverse(fft_point_usize);
-    let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point_usize];
-    let freq_bins = freq_rate_array.dim().0.min(fft_point_usize);
+    let delay_padding = delay_padding.max(1);
+    let padded_fft_point = fft_point_usize.saturating_mul(delay_padding);
+    let mut delay_rate_array = Array2::<C32>::zeros((padding_length, padded_fft_point));
+    let ifft = cached_fft_plan(padded_fft_point, true);
+    let mut ifft_exe = vec![C32::new(0.0, 0.0); padded_fft_point];
+    let freq_bins = freq_rate_array.dim().0.min(padded_fft_point);
     let scale = fft_point_usize as f32;
 
     for i in 0..freq_rate_array.dim().1 {
@@ -246,7 +288,7 @@ pub fn process_ifft(
 
         ifft.process(&mut ifft_exe);
 
-        let half = fft_point_usize / 2;
+        let half = padded_fft_point / 2;
         let (first_half, second_half) = ifft_exe.split_at(half);
         let mut row = delay_rate_array.row_mut(i);
         for (dst, src) in row.iter_mut().take(half).zip(first_half.iter().rev()) {
@@ -261,8 +303,7 @@ pub fn process_ifft(
 }
 
 pub fn perform_ifft_on_vec(input: &[C32], ifft_size: usize) -> Vec<C32> {
-    let mut planner = FftPlanner::new();
-    let ifft = planner.plan_fft_inverse(ifft_size);
+    let ifft = cached_fft_plan(ifft_size, true);
 
     let mut ifft_exe = vec![C32::new(0.0, 0.0); ifft_size];
     ifft_exe[..input.len()].copy_from_slice(input);
@@ -381,6 +422,33 @@ mod tests {
         for (expected, actual) in expected.iter().zip(actual.iter()) {
             assert!((expected.re - actual.re).abs() < 1.0e-4);
             assert!((expected.im - actual.im).abs() < 1.0e-4);
+        }
+    }
+
+    #[test]
+    fn delay_padding_preserves_integer_delay_samples() {
+        let fft_point = 8;
+        let rate_bins = 3;
+        let mut spectrum = Array2::<C32>::zeros((fft_point / 2, rate_bins));
+        for ((row, col), value) in spectrum.indexed_iter_mut() {
+            *value = C32::new((row + 2 * col) as f32, (2 * row + col) as f32 * 0.1);
+        }
+
+        let unpadded = process_ifft(&spectrum, fft_point as i32, rate_bins);
+        let factor = 4usize;
+        let padded =
+            process_ifft_with_delay_padding(&spectrum, fft_point as i32, rate_bins, factor);
+
+        for rate in 0..rate_bins {
+            for delay_idx in 0..fft_point {
+                // Axes are [-N/2+1, ..., N/2] and
+                // [-N/2+1/f, ..., N/2], respectively.
+                let padded_idx = factor * (delay_idx + 1) - 1;
+                let expected = unpadded[[rate, delay_idx]];
+                let actual = padded[[rate, padded_idx]];
+                assert!((expected.re - actual.re).abs() < 1.0e-4);
+                assert!((expected.im - actual.im).abs() < 1.0e-4);
+            }
         }
     }
 }

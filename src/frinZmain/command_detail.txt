@@ -18,7 +18,7 @@
   --skip <SEC>                       冒頭スキップ
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
-  --bandpass <BP.bin>                バンドパス適用 (--bptable で補正スペクトル保存)
+  --bandpass <BP.npz>                バンドパス適用 (--bptable で補正スペクトル保存)
   --norm-acf                         同ディレクトリの自己相関 .cor で相互相関振幅を規格化
 
 [補正・フラグ]
@@ -46,7 +46,7 @@
        onoff:0|1            0=(ON-OFF)/OFF（既定）、1=(ON-OFF)
        Vlst:<km/s>          LSR 速度補正の上書き
        corrfreq:<x>         サンプリング周波数への倍率
-       *_maser_data.tsv には baseline_mask 列 (1=ベースラインfit採用点, 0=除外点) を出力。
+       --npz 指定時は baseline mask を *_maser_baseline_mask.npz に保存。
        他に、出力グラフ/TSV は frinZ/maser/ 配下へ保存。
   --folding key:val...（可視光度fold）
        period:<sec>         折り畳み周期（必須）
@@ -64,11 +64,15 @@
        ecc:<0..1), omega_deg:<deg> 楕円軌道パラメータ
        eph:<FILE>           上記キーを key=value or KEY VALUE で書いたエフェメリスファイル
        --delay/--rate/--acel を適用した複素ビジビリティで fold を実行。
-       出力は frinZ/folding/*_folding_profile.png, *_folding_profile.tsv, *_folding_summary.txt。
+       出力は *_folding_profile.png, *_folding_summary.txt。--npz 指定時は *_folding.npz, *_folding_count.npz, *_folding_on_bin.npz も保存。
   --multi-sideband C_COR C_BP C_DELAY X_COR X_BP X_DELAY
        BP に -1 を入れると当該バンド BP 無効化。
   --fringe-rate-map key[:val]...
-       win_delay:min,max / win_rate:min,max / grid:<n> / peak:<n> / plot:0|1 等。
+       mode:cont|maser / range:<arcsec>|auto / grid:<64..4096>
+       range:auto は最小投影基線に対する ±3λ/B_proj,min を mas 表示。
+       delay-padding:1|2|4|8（既定4）/ snr:<f> / max-peaks:<n>。
+       cont モードは既定30秒区間の複素delay/rate mapを幾何位相整合して積算。
+       rate 8倍以上・delay 4倍のFFT格子を使用。
   --imaging key[:val]...
        size:<px>(既定 256), cell:<arcsec>, clean:0|1, gain:<f>,
        threshold:<Jy>, iter:<n>。
@@ -78,9 +82,13 @@
   --add-plot                         Amp/SNR/位相/雑音の時系列
   --wwz                              各 loop の fringe-search 結果に対して WWZ を実行（frinZ/wwz/）
   --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）
-  --bandpass-table                   補正後スペクトルをバイナリ保存
-  --spectrum                         クロススペクトルをバイナリ保存
+  --bandpass-table                   補正後スペクトルを圧縮NPZ保存
+  --spectrum                         クロススペクトルを圧縮NPZ保存
   --cor2bin                          生可視光度をバイナリ保存
+  --npz                              解析・グラフ作成時に同じ stem の圧縮自己記述型 *.npz も保存。
+                                     未指定時は大きな配列データ sidecar を作らない。
+  npy_open.py --npy FILE [--output] [--ext png|pdf|ps|eps|jpg...] [--nofig]
+  --output は FILE の stem に .tsv と指定拡張子のグラフを出力。
 
 [その他]
   --fft-rebin <PTS>                  FFT チャンネルを平均化して縮小

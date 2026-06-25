@@ -73,6 +73,7 @@ pub fn run_inbeam_vlbi_analysis(
             &result.header.source_name,
             &base_filename,
             &inbeam_dir,
+            args.npz,
         )?;
     }
 

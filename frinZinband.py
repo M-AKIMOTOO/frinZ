@@ -2,7 +2,7 @@
 """Plot light curves and spectra from frinZ --inband outputs.
 
 Inputs are frinZ --inband text files. Both the old flat table and the newer
-sectioned text format are supported through inband_txt_to_json.parse_inband_txt.
+sectioned text format are supported.
 """
 
 from __future__ import annotations
@@ -17,7 +17,178 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from inband_txt_to_json import parse_inband_txt
+
+def parse_bool(value: str) -> bool | str:
+    low = value.strip().lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    return value
+
+
+def parse_header_value(token: str) -> Any:
+    try:
+        value = float(token)
+        return int(value) if value.is_integer() else value
+    except ValueError:
+        return token
+
+
+def normalize_meta_key(key: str) -> str:
+    return key.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def parse_metadata_line(text: str, metadata: dict[str, Any]) -> None:
+    if text == "In-band fringe search":
+        metadata["product"] = "inband_fringe_search"
+        return
+    if text.startswith("Epoch ") or ":" not in text:
+        return
+    key, value = text.split(":", 1)
+    key = normalize_meta_key(key)
+    value = value.strip()
+    if key == "bandwidth":
+        # Old v1 text: "bandwidth: 512.000 MHz, inband: 32 MHz, bands: 16, RBW: 1.000000 MHz"
+        for part in text.split(","):
+            if ":" not in part:
+                continue
+            pkey, pval = part.split(":", 1)
+            pkey = normalize_meta_key(pkey)
+            tokens = pval.strip().split()
+            if not tokens:
+                continue
+            metadata[pkey] = parse_header_value(tokens[0])
+            if len(tokens) > 1:
+                metadata[f"{pkey}_unit"] = tokens[1]
+    else:
+        metadata[key] = parse_bool(value)
+
+
+def parse_old_rows(lines: list[str], metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 16:
+            raise ValueError(f"invalid inband row: {line}")
+        rows.append(
+            {
+                "epoch": f"{parts[0]} {parts[1]}",
+                "label": parts[2],
+                "source": parts[3],
+                "band": int(parts[4]),
+                "band_start_mhz": float(parts[5]),
+                "band_end_mhz": float(parts[6]),
+                "center_mhz": float(parts[7]),
+                "length_s": float(parts[8]),
+                "amp_percent": float(parts[9]),
+                "snr": float(parts[10]),
+                "phase_deg": float(parts[11]),
+                "noise_percent": float(parts[12]),
+                "res_delay_sample": float(parts[13]),
+                "res_rate_hz": float(parts[14]),
+                "mjd": float(parts[15]),
+            }
+        )
+    return rows
+
+
+def parse_sectioned_rows(section_lines: dict[str, list[str]], metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    time_rows = section_lines.get("times", [])
+    channel_rows = section_lines.get("channels", [])
+    data_rows = section_lines.get("data", [])
+    if not time_rows or not channel_rows or not data_rows:
+        raise ValueError("sectioned inband text requires @times, @channels, and @data")
+
+    def split_table(lines: list[str]) -> tuple[list[str], list[list[str]]]:
+        header = lines[0].split("\t")
+        body = [line.split("\t") for line in lines[1:] if line.strip()]
+        return header, body
+
+    time_header, time_body = split_table(time_rows)
+    channel_header, channel_body = split_table(channel_rows)
+    data_header, data_body = split_table(data_rows)
+
+    times: dict[int, dict[str, Any]] = {}
+    for fields in time_body:
+        rec = dict(zip(time_header, fields))
+        idx = int(rec["time_index"])
+        times[idx] = {"epoch": rec["epoch"], "mjd": float(rec["mjd"])}
+
+    channels: dict[int, dict[str, Any]] = {}
+    for fields in channel_body:
+        rec = dict(zip(channel_header, fields))
+        band = int(rec["band"])
+        channels[band] = {
+            "band": band,
+            "band_start_mhz": float(rec["band_start_mhz"]),
+            "band_end_mhz": float(rec["band_end_mhz"]),
+            "center_mhz": float(rec["center_mhz"]),
+        }
+
+    rows: list[dict[str, Any]] = []
+    label = str(metadata.get("label", ""))
+    source = str(metadata.get("source", ""))
+    length_s = float(metadata.get("length_s", 0.0))
+    for fields in data_body:
+        rec = dict(zip(data_header, fields))
+        time_index = int(rec["time_index"])
+        band = int(rec["band"])
+        time = times[time_index]
+        channel = channels[band]
+        rows.append(
+            {
+                "epoch": time["epoch"],
+                "label": label,
+                "source": source,
+                "band": band,
+                "band_start_mhz": channel["band_start_mhz"],
+                "band_end_mhz": channel["band_end_mhz"],
+                "center_mhz": channel["center_mhz"],
+                "length_s": length_s,
+                "amp_percent": float(rec["amp_percent"]),
+                "snr": float(rec["snr"]),
+                "phase_deg": float(rec["phase_deg"]),
+                "noise_percent": float(rec["noise_percent"]),
+                "res_delay_sample": float(rec["res_delay_sample"]),
+                "res_rate_hz": float(rec["res_rate_hz"]),
+                "mjd": time["mjd"],
+            }
+        )
+    return rows
+
+
+def parse_inband_txt(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    metadata: dict[str, Any] = {}
+    old_data_lines: list[str] = []
+    section_lines: dict[str, list[str]] = defaultdict(list)
+    current_section: str | None = None
+
+    with path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                parse_metadata_line(line[1:].strip(), metadata)
+                continue
+            if line.startswith("@"):
+                current_section = line[1:].strip().lower()
+                section_lines[current_section] = []
+                continue
+            if current_section is not None:
+                section_lines[current_section].append(line)
+            else:
+                old_data_lines.append(line)
+
+    rows = (
+        parse_sectioned_rows(section_lines, metadata)
+        if section_lines
+        else parse_old_rows(old_data_lines, metadata)
+    )
+    if not rows:
+        raise ValueError(f"no data rows found: {path}")
+    return metadata, rows
 
 
 def source_key(name: str) -> str:

@@ -140,10 +140,6 @@ frinZ --input data.cor --inband 128
 
 `--inband` takes a power-of-two width in MHz and writes `frinZ/inband/*_inband.txt`. If `--search` is omitted, peak search is used.
 
-Relative calibrated spectrum from two in-band outputs:
-```bash
-./inband_spectrum.py --target target_inband.txt --calibrator cal_inband.txt --cal-flux-mjy 100 --nofig
-```
 
 #### Manual Corrections
 ```bash

@@ -20,10 +20,6 @@ Thumbs.db
 /*.tsv
 /*.py
 !/npz_open.py
-!/inband_spectrum.py
-!/spectrum_index.py
-!/inband_timeseries.py
-!/inband_txt_to_json.py
 !/frinZinband.py
 *.log
 

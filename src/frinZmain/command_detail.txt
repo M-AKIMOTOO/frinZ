@@ -88,7 +88,7 @@
   --cor2bin                          生可視光度をバイナリ保存
   --npz                              解析・グラフ作成時に同じ stem の圧縮自己記述型 *.npz も保存。
                                      未指定時は大きな配列データ sidecar を作らない。
-  npz_open.py --npz FILE [--output] [--ext png|pdf|ps|eps|jpg...] [--nofig]
+  tools/npz_open.py --npz FILE [--output] [--ext png|pdf|ps|eps|jpg...] [--nofig]
   --output は FILE の stem に .tsv と指定拡張子のグラフを出力。
 
 [その他]

@@ -17,7 +17,7 @@ def text(record, name):
 def main():
     parser = argparse.ArgumentParser(
         description="frinZ が出力した圧縮された自己記述型 .npz を表示・TSV変換します。",
-        epilog="例: ./npz_open.py --npz result_bptable.npz --output --ext pdf --nofig",
+        epilog="例: ./tools/npz_open.py --npz result_bptable.npz --output --ext pdf --nofig",
     )
     parser.add_argument(
         "--npz", required=True, type=Path, metavar="FILE",

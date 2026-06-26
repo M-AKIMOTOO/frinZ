@@ -19,8 +19,8 @@ Thumbs.db
 /*.csv
 /*.tsv
 /*.py
-!/npz_open.py
-!/frinZinband.py
+!/tools/npz_open.py
+!/tools/frinZinband.py
 *.log
 
 # Observation data and generated analysis outputs

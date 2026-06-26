@@ -859,7 +859,7 @@ PNG compression:
   available. Use --no-pngquant to keep matplotlib PNG files uncompressed.
 
 Example:
-  frinZinband.py
+  tools/frinZinband.py
     --xdata target_x_inband.txt calibrator_x_inband.txt
     --cdata target_c_inband.txt calibrator_c_inband.txt
     --target CYGX-3 --calib 2016+386 --snr 30

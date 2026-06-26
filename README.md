@@ -132,6 +132,19 @@ frinZ --input data.cor --search --iter 5
 frinZ --input data.cor --search --delay-window -10 10 --rate-window -0.1 0.1
 ```
 
+#### In-band Fringe Search
+```bash
+# Split 512 MHz bandwidth into 128 MHz subbands and search each subband
+frinZ --input data.cor --inband 128
+```
+
+`--inband` takes a power-of-two width in MHz and writes `frinZ/inband/*_inband.txt`. If `--search` is omitted, peak search is used.
+
+Relative calibrated spectrum from two in-band outputs:
+```bash
+./inband_spectrum.py --target target_inband.txt --calibrator cal_inband.txt --cal-flux-mjy 100 --nofig
+```
+
 #### Manual Corrections
 ```bash
 # Apply delay and rate corrections
@@ -318,8 +331,8 @@ In stdout and `*_summary.txt`, these appear as:
 With `--npz`, analysis/plot modes also write compressed self-describing NumPy sidecars (`*.npz`) containing a primitive `complex64` `data` array plus `flag`, coordinate axes and units, `fft_point`, `pp`, and array shape. Inspect or export one file with:
 
 ```bash
-python3 npy_open.py --npy result_bptable.npz
-python3 npy_open.py --npy result_bptable.npz --output --ext pdf --nofig
+python3 npz_open.py --npz result_bptable.npz
+python3 npz_open.py --npz result_bptable.npz --output --ext pdf --nofig
 ```
 
 `--output` writes `result_bptable.tsv` and the selected figure format (default `png`). Analysis modes no longer emit duplicate BIN/TSV data files when the same arrays are present in requested NPZ sidecars; text summaries, `.cor` products, and model metadata remain separate. Without `--nofig`, the figure is also shown with `plt.show()`.

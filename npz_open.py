@@ -17,10 +17,10 @@ def text(record, name):
 def main():
     parser = argparse.ArgumentParser(
         description="frinZ が出力した圧縮された自己記述型 .npz を表示・TSV変換します。",
-        epilog="例: ./npy_open.py --npy result_bptable.npz --output --ext pdf --nofig",
+        epilog="例: ./npz_open.py --npz result_bptable.npz --output --ext pdf --nofig",
     )
     parser.add_argument(
-        "--npy", required=True, type=Path, metavar="FILE",
+        "--npz", required=True, type=Path, metavar="FILE",
         help="入力する frinZ の .npz ファイル",
     )
     parser.add_argument(
@@ -43,7 +43,7 @@ def main():
     import matplotlib.pyplot as plt
     import numpy as np
 
-    loaded = np.load(args.npy, allow_pickle=False)
+    loaded = np.load(args.npz, allow_pickle=False)
     array = loaded["data"] if isinstance(loaded, np.lib.npyio.NpzFile) else loaded
     if isinstance(loaded, np.lib.npyio.NpzFile) and array.dtype.names is None:
         data = array
@@ -151,7 +151,7 @@ def main():
 
     fig.tight_layout(pad=0.1)
     if args.output:
-        output_stem = args.npy.with_suffix("")
+        output_stem = args.npz.with_suffix("")
         tsv_path = output_stem.with_suffix(".tsv")
         figure_path = output_stem.with_suffix(f".{args.ext.lstrip(chr(46))}")
         amplitude = np.abs(data)

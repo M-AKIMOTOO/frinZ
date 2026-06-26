@@ -22,6 +22,7 @@ mod fitting;
 mod folding;
 mod frmap;
 mod header;
+mod inband;
 #[path = "inbeamVLBI.rs"]
 mod inbeam_vlbi;
 mod input_support;
@@ -52,6 +53,7 @@ use crate::earth_rotation_imaging::{
 };
 use crate::folding::run_folding_analysis;
 use crate::frmap::run_fringe_rate_map_analysis;
+use crate::inband::run_inband_analysis;
 use crate::inbeam_vlbi::run_inbeam_vlbi_analysis;
 use crate::input_support::read_input_bytes;
 use crate::maser::run_maser_analysis;
@@ -557,6 +559,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             exit(0);
         }
         return run_multisideband_analysis(&args);
+    }
+
+    if args.inband.is_some() {
+        if let Some(input_path) = &args.input {
+            if !check_memory_usage(&args, input_path)? {
+                exit(0);
+            }
+        } else {
+            eprintln!("Error: --inband requires an --input file.");
+            exit(1);
+        }
+        return run_inband_analysis(&args, &time_flag_ranges, &pp_flag_ranges);
     }
 
     // --- Argument Validation & Dispatch ---

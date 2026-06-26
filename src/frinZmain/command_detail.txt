@@ -11,6 +11,7 @@
   --frequency                        周波数ドメイン処理（未指定は時間ドメイン）
   --plot                             グラフ出力（--frequency 併用で周波数グラフ）
   --output                           frinZ/fringe_output/... に保存
+  --inband <MHz>                     観測帯域を指定幅(MHz, power of 2)で分割し、各サブバンドで fringe search。出力は frinZ/inband/*_inband.txt
 
 [入力・基本]
   --in <FILE>                        入力 .cor
@@ -87,7 +88,7 @@
   --cor2bin                          生可視光度をバイナリ保存
   --npz                              解析・グラフ作成時に同じ stem の圧縮自己記述型 *.npz も保存。
                                      未指定時は大きな配列データ sidecar を作らない。
-  npy_open.py --npy FILE [--output] [--ext png|pdf|ps|eps|jpg...] [--nofig]
+  npz_open.py --npz FILE [--output] [--ext png|pdf|ps|eps|jpg...] [--nofig]
   --output は FILE の stem に .tsv と指定拡張子のグラフを出力。
 
 [その他]

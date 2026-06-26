@@ -276,6 +276,10 @@ pub struct Args {
     #[arg(long, value_name = "POINTS")]
     pub fft_rebin: Option<i32>,
 
+    /// Split the observing bandwidth into in-band chunks of this width [MHz] and fringe-search each chunk.
+    #[arg(long, value_name = "MHz")]
+    pub inband: Option<u32>,
+
     /// Search mode: peak (default), deep, deep2, rate, or acel.
     #[arg(
         long,

@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "frinZ"
-version = "4.5.3"
+version = "4.6.0"
 dependencies = [
  "anyhow",
  "astro",

@@ -31,6 +31,7 @@ use crate::plot::{
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
+use crate::stfft;
 use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg};
 type C32 = Complex<f32>;
 
@@ -461,7 +462,10 @@ pub fn process_cor_file(
     if args.length != 0 && args.length > pp {
         length = pp;
     }
-    let mut loop_count = if (pp - args.skip) / length <= 0 {
+    let stfft_plan = stfft::build_plan(args, pp)?;
+    let mut loop_count = if let Some(plan) = stfft_plan {
+        plan.windows
+    } else if (pp - args.skip) / length <= 0 {
         1
     } else if (pp - args.skip) / length <= args.loop_ {
         (pp - args.skip) / length
@@ -504,12 +508,14 @@ pub fn process_cor_file(
         } else {
             length
         };
+        let read_skip = stfft::window_start(args.skip, l1, stfft_plan);
+        let read_loop_index = stfft::read_loop_index(l1, stfft_plan);
         let (mut complex_vec, current_obs_time, effective_integ_time) = match read_visibility_data(
             &mut cursor,
             &header,
             requested_length,
-            args.skip,
-            l1,
+            read_skip,
+            read_loop_index,
             args.cumulate != 0,
             pp_flag_ranges,
         ) {
@@ -548,8 +554,8 @@ pub fn process_cor_file(
                 current_obs_time,
                 effective_integ_time,
                 requested_length,
-                args.skip,
-                l1,
+                read_skip,
+                read_loop_index,
                 args.cumulate != 0,
                 pp_flag_ranges,
             )?;
@@ -635,6 +641,12 @@ pub fn process_cor_file(
                     //
                     // Do not feed the previous solution into rate_correct/delay_correct.
                     // It is only used as the next search seed inside run_*_search().
+                    // STFFT windows are independent; do not seed from an overlapping window.
+                    let search_seed = if stfft_plan.is_some() {
+                        None
+                    } else {
+                        prev_deep_solution
+                    };
                     let mut search_result = if primary_search_mode == Some("deep") {
                         search::run_deep_search(
                             &complex_vec,
@@ -649,7 +661,7 @@ pub fn process_cor_file(
                             &loop_args,
                             pp,
                             loop_args.cpu,
-                            prev_deep_solution,
+                            search_seed,
                         )?
                     } else {
                         search::run_peak_search(
@@ -665,7 +677,7 @@ pub fn process_cor_file(
                             &loop_args,
                             pp,
                             loop_args.cpu,
-                            prev_deep_solution,
+                            search_seed,
                         )?
                     };
                     search_result.analysis_results.residual_delay -= loop_args.delay_correct;
@@ -681,10 +693,12 @@ pub fn process_cor_file(
                         search_result.pre_bandpass_analysis_results,
                     );
 
-                    prev_deep_solution = Some((
-                        result_tuple.0.residual_delay + loop_args.delay_correct,
-                        result_tuple.0.residual_rate + loop_args.rate_correct,
-                    ));
+                    if stfft_plan.is_none() {
+                        prev_deep_solution = Some((
+                            result_tuple.0.residual_delay + loop_args.delay_correct,
+                            result_tuple.0.residual_rate + loop_args.rate_correct,
+                        ));
+                    }
 
                     result_tuple
                 }
@@ -944,12 +958,12 @@ pub fn process_cor_file(
             add_plot_amp.push(analysis_results.delay_max_amp * 100.0);
             add_plot_phase.push(analysis_results.delay_phase);
             add_plot_times.push(current_obs_time);
-            wwz_times_sec.push((args.skip + l1 * length) as f32 * effective_integ_time);
+            wwz_times_sec.push(read_skip as f32 * effective_integ_time);
             let phase_rad = analysis_results.delay_phase.to_radians();
             let complex_sample = Complex::from_polar(analysis_results.delay_max_amp, phase_rad);
             add_plot_complex.push(complex_sample);
 
-            if args.add_plot {
+            if args.add_plot || args.stfft > 0 {
                 add_plot_snr.push(analysis_results.delay_snr);
                 add_plot_noise.push(analysis_results.delay_noise * 100.0);
                 add_plot_res_delay.push(analysis_results.residual_delay);
@@ -1047,7 +1061,7 @@ pub fn process_cor_file(
                 }
             }
 
-            if args.add_plot {
+            if args.add_plot || args.stfft > 0 {
                 add_plot_times.push(current_obs_time);
                 add_plot_amp.push(analysis_results.freq_max_amp * 100.0);
                 add_plot_snr.push(analysis_results.freq_snr);

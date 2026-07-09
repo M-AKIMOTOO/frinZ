@@ -33,6 +33,7 @@
 
 [解析バリエーション]
   --closure-phase f1 f2 f3 [refant:NAME]
+  --stfft HOPS             Short-time FFT hop (--length: window, --loop: windows)
        3 基線のクロージャー位相。デフォルト refant=YAMAGU32。
   --phase-reference CAL TARGET [fit_spec cal_len tgt_len loop]
        fit_spec: <deg>, sin, <deg>+sin, <deg>+sin:<period_sec>

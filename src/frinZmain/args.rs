@@ -45,6 +45,11 @@ const PREFIX_ALIASES: &[PrefixAliasSpec] = &[
         min_len: 2,
     },
     PrefixAliasSpec {
+        arg_id: "stfft",
+        base: "stfft",
+        min_len: 3,
+    },
+    PrefixAliasSpec {
         arg_id: "plot",
         base: "plot",
         min_len: 2,
@@ -168,6 +173,10 @@ pub struct Args {
     /// Number of loops.
     #[arg(long, default_value_t = 1)]
     pub loop_: i32,
+
+    /// Short-time fringe FFT hop in sectors. --length sets the window.
+    #[arg(long, default_value_t = 0, value_name = "HOPS")]
+    pub stfft: i32,
 
     /// RFI ranges to exclude (e.g., "100,120"). Repeatable.
     #[arg(long, num_args = 1.., value_name = "MIN,MAX")]
@@ -377,6 +386,64 @@ impl Args {
             .iter()
             .find(|mode| *mode == "peak" || *mode == "deep" || *mode == "deep2")
             .map(|s| s.as_str())
+    }
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            input: None,
+            phase_reference: Vec::new(),
+            closure_phase: None,
+            length: 0,
+            skip: 0,
+            loop_: 1,
+            stfft: 0,
+            rfi: Vec::new(),
+            plot: false,
+            frequency: false,
+            cor2bin: false,
+            spectrum: false,
+            output: false,
+            npz: false,
+            delay_correct: 0.0,
+            rate_correct: 0.0,
+            acel_correct: 0.0,
+            jerk_correct: 0.0,
+            snap_correct: 0.0,
+            scan_correct: None,
+            drange: Vec::new(),
+            rrange: Vec::new(),
+            mask: Vec::new(),
+            frange: Vec::new(),
+            rate_padding: 1,
+            cumulate: 0,
+            add_plot: false,
+            wwz: false,
+            header: false,
+            fft_rebin: None,
+            inband: None,
+            search: Vec::new(),
+            in_beam: false,
+            iter: 5,
+            dynamic_spectrum: false,
+            bandpass: None,
+            norm_acf: false,
+            bandpass_table: false,
+            cpu: 0,
+            flagging: Vec::new(),
+            allan_deviance: false,
+            raw_visibility: false,
+            uv: None,
+            fringe_rate_map: None,
+            maser: Vec::new(),
+            folding: Vec::new(),
+            multi_sideband: Vec::new(),
+            uptimeplot: false,
+            imaging: None,
+            imaging_test: false,
+            detail: false,
+        }
     }
 }
 

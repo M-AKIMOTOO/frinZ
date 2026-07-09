@@ -79,6 +79,44 @@ cargo run -p frinZ-tools --bin bandscythe --release -- --help
 
 **Note:** crates.io publish target is `frinZ` only. On Windows, antivirus software may flag the compiled binary.
 
+## Library API
+
+`frinZ` can also be used as a Rust library without creating plots or sidecar files.
+
+```rust
+use frinZ::{delay_search, frequency_spectrum, read_cor, LibraryOptions, SearchMode};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cor = read_cor("data.cor")?;
+
+    let mut options = LibraryOptions::default();
+    options.search_mode = Some(SearchMode::Peak);
+
+    let fringe = delay_search(&cor, &options)?;
+    println!(
+        "delay = {} sample, rate = {} Hz, snr = {}",
+        fringe.analysis.residual_delay,
+        fringe.analysis.residual_rate,
+        fringe.analysis.delay_snr
+    );
+
+    let spectrum = frequency_spectrum(&cor, &options)?;
+    for (freq_mhz, value) in spectrum.frequency_mhz.iter().zip(spectrum.spectrum.iter()) {
+        println!("{freq_mhz}	{}	{}", value.re, value.im);
+    }
+
+    Ok(())
+}
+```
+
+Useful public entry points are:
+
+- `read_cor`, `read_cor_with_options`, `read_cor_bytes`: read `.cor` visibility data
+- `apply_delay_rate_correction`: apply delay/rate/acceleration phase correction in memory
+- `fringe_search`, `delay_search`: run delay/rate fringe search
+- `frequency_spectrum`: return the complex cross-power spectrum with a MHz axis
+- `read_bandpass`: read frinZ NPZ or legacy BIN bandpass tables
+
 ## Usage
 
 ### Basic Syntax
@@ -127,6 +165,9 @@ frinZ --input data.cor --frequency
 ```bash
 # Enable iterative search with custom iterations
 frinZ --input data.cor --search --iter 5
+
+# Short-time fringe FFT: 60-sector window, 10-sector hop, up to 100 windows
+frinZ --input data.cor --search --length 60 --stfft 10 --loop 100
 
 # With search windows
 frinZ --input data.cor --search --delay-window -10 10 --rate-window -0.1 0.1

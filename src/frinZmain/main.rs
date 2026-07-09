@@ -16,6 +16,7 @@ mod args;
 mod bandpass;
 mod bispectrum;
 mod search;
+mod stfft;
 //mod error;
 mod fft;
 mod fitting;
@@ -63,6 +64,7 @@ use crate::plot::{write_add_plot_outputs, write_cumulate_outputs};
 use crate::processing::process_cor_file;
 use crate::raw_visibility::run_raw_visibility_plot;
 use crate::search::run_acel_search_analysis;
+use crate::stfft::write_output as write_stfft_output;
 use crate::uptimeplot::run_uptime_plot;
 use crate::uv::run_uv_plot;
 use crate::wwz::write_wwz_outputs;
@@ -655,6 +657,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         write_cumulate_outputs(&args, &result, &frinz_dir)?;
         let base_filename = write_add_plot_outputs(&args, &result, &frinz_dir)?;
         write_wwz_outputs(&args, &result, &frinz_dir)?;
+        if let Some(path) = write_stfft_output(input_path, &args, &result)? {
+            println!("STFFT data saved to: {}", path.display());
+        }
         if args.allan_deviance {
             utils::write_allan_deviation_outputs(
                 &result.add_plot_phase,

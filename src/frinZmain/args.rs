@@ -154,12 +154,12 @@ pub struct Args {
     #[arg(long)]
     pub input: Option<PathBuf>,
 
-    /// Phase referencing: CAL TARGET [FIT_SPEC CAL_LEN TGT_LEN LOOP]
-    #[arg(long, num_args = 2..=6, value_names = ["CALIBRATOR", "TARGET", "FIT_SPEC", "CAL_LENGTH", "TGT_LENGTH", "LOOP"])]
+    /// Phase referencing: MODE CAL TARGET [CAL_LEN TGT_LEN LOOP]
+    #[arg(long, num_args = 3..=6, value_names = ["MODE", "CALIBRATOR", "TARGET", "CAL_LENGTH", "TGT_LENGTH", "LOOP"])]
     pub phase_reference: Vec<String>,
 
-    /// Compute closure phase from three baselines. Provide: FILE1 FILE2 FILE3 [refant:NAME].
-    #[arg(long = "closure-phase", num_args = 0.., value_name = "FILE|KEY:VALUE")]
+    /// Compute closure phase from three baselines. The first antenna in FILE1 is the reference.
+    #[arg(long = "closure-phase", num_args = 3, value_name = "FILE")]
     pub closure_phase: Option<Vec<String>>,
 
     /// Integration length in sectors (0 = whole file).
@@ -363,13 +363,9 @@ pub struct Args {
     #[arg(long)]
     pub uptimeplot: bool,
 
-    /// Earth-rotation imaging (see --detail).
-    #[arg(long, num_args = 0.., value_name = "KEY[:VALUE]", requires = "input")]
+    /// Earth-rotation imaging (use `--imaging test` for the synthetic self-test).
+    #[arg(long, num_args = 0.., value_name = "KEY[:VALUE]")]
     pub imaging: Option<Vec<String>>,
-
-    /// Run imaging test.
-    #[arg(long)]
-    pub imaging_test: bool,
 
     /// Show detailed CLI guide and exit.
     #[arg(long)]
@@ -441,7 +437,6 @@ impl Default for Args {
             multi_sideband: Vec::new(),
             uptimeplot: false,
             imaging: None,
-            imaging_test: false,
             detail: false,
         }
     }

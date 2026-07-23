@@ -7,7 +7,7 @@ use crate::bandpass::read_bandpass_file;
 use crate::fft::apply_phase_correction_in_place;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
-use crate::npy_output::{npz_sidecar_path, write_real_2d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::processing::run_analysis_pipeline;
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
@@ -827,23 +827,24 @@ pub fn run_earth_rotation_imaging(
     let dec_axis: Vec<f64> = (0..result.image_size)
         .map(|index| (center - index as f64) * result.cell_size_arcsec)
         .collect();
-    let write_image_npy = |path: &Path, flag: &str, values: &[f64]| -> Result<(), Box<dyn Error>> {
-        let values_f32: Vec<f32> = values.iter().map(|&value| value as f32).collect();
-        write_real_2d(
-            &npz_sidecar_path(path, flag),
-            NpyMeta::new(
-                flag,
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("dec_offset", "arcsec", "ra_offset", "arcsec"),
-            (result.image_size, result.image_size),
-            values_f32,
-            &dec_axis,
-            &ra_axis,
-        )?;
-        Ok(())
+    let mut imaging_npz = if args.npz {
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "imaging",
+            header.fft_point as u32,
+            header.number_of_sector as u32,
+        ));
+        npz.add_f64_1d("ra_offset_arcsec", &ra_axis);
+        npz.add_f64_1d("dec_offset_arcsec", &dec_axis);
+        Some(npz)
+    } else {
+        None
     };
+    let add_image_npy =
+        |npz: &mut NamedNpz, name: &str, values: &[f64]| -> Result<(), Box<dyn Error>> {
+            let values_f32: Vec<f32> = values.iter().map(|&value| value as f32).collect();
+            npz.add_f32_2d(name, (result.image_size, result.image_size), values_f32)?;
+            Ok(())
+        };
 
     let dirty_path = output_dir.join(format!("{}_dirty.png", base_name));
     render_scalar_field_plot(
@@ -855,8 +856,8 @@ pub fn run_earth_rotation_imaging(
         true,
         "Dirty Image",
     )?;
-    if args.npz {
-        write_image_npy(&dirty_path, "imaging_dirty", &result.dirty_image)?;
+    if let Some(npz) = imaging_npz.as_mut() {
+        add_image_npy(npz, "dirty_image", &result.dirty_image)?;
     }
     println!("Dirty image saved to {}", dirty_path.display());
 
@@ -870,8 +871,8 @@ pub fn run_earth_rotation_imaging(
         false,
         "Dirty Beam",
     )?;
-    if args.npz {
-        write_image_npy(&beam_path, "imaging_dirty_beam", &result.dirty_beam)?;
+    if let Some(npz) = imaging_npz.as_mut() {
+        add_image_npy(npz, "dirty_beam", &result.dirty_beam)?;
     }
     println!("Dirty beam saved to {}", beam_path.display());
 
@@ -886,8 +887,8 @@ pub fn run_earth_rotation_imaging(
             true,
             "Clean Image",
         )?;
-        if args.npz {
-            write_image_npy(&clean_path, "imaging_clean", clean)?;
+        if let Some(npz) = imaging_npz.as_mut() {
+            add_image_npy(npz, "clean_image", clean)?;
         }
         println!("Clean image saved to {}", clean_path.display());
     }
@@ -903,10 +904,25 @@ pub fn run_earth_rotation_imaging(
             true,
             "Residual Image",
         )?;
-        if args.npz {
-            write_image_npy(&residual_path, "imaging_residual", residual)?;
+        if let Some(npz) = imaging_npz.as_mut() {
+            add_image_npy(npz, "residual_image", residual)?;
         }
         println!("Residual image saved to {}", residual_path.display());
+    }
+
+    if let Some(npz) = imaging_npz {
+        let npz_path = npz_sidecar_path(&dirty_path, "imaging");
+        npz.write(&npz_path)?;
+        for legacy_flag in [
+            "imaging_dirty",
+            "imaging_dirty_beam",
+            "imaging_clean",
+            "imaging_residual",
+        ] {
+            let _ = std::fs::remove_file(npz_sidecar_path(&dirty_path, legacy_flag));
+            let _ = std::fs::remove_file(npz_sidecar_path(&beam_path, legacy_flag));
+        }
+        println!("Imaging NPZ data saved to {}", npz_path.display());
     }
 
     if let Some(ref components) = result.clean_components {
@@ -1042,15 +1058,16 @@ fn collect_visibilities_from_cor(
     };
 
     if args.cumulate != 0 {
-        if args.cumulate >= pp {
+        let available = pp.saturating_sub(skip);
+        if args.cumulate > available {
             return Err(format!(
                 "The specified cumulation length, {} s, is more than the observation time, {} s.",
-                args.cumulate, pp
+                args.cumulate, available
             )
             .into());
         }
         length = args.cumulate;
-        loop_count = pp / args.cumulate;
+        loop_count = available.saturating_add(args.cumulate - 1) / args.cumulate;
     }
 
     let mut visibilities = Vec::with_capacity(loop_count as usize);
@@ -1061,7 +1078,7 @@ fn collect_visibilities_from_cor(
 
     for l1 in 0..loop_count {
         let mut current_length = if args.cumulate != 0 {
-            (l1 + 1) * length
+            ((l1 + 1) * length).min(pp.saturating_sub(skip))
         } else {
             length
         };
@@ -1683,6 +1700,59 @@ fn render_scalar_field_plot(
             .draw(&Rectangle::new([(0.0, v0), (1.0, v1)], color.filled()))?;
     }
 
+    Ok(())
+}
+
+pub fn run_imaging_test() -> Result<(), Box<dyn Error>> {
+    let l0 = 0.0;
+    let num_points = 100usize;
+    let max_uv = 500_000.0;
+    let vis_data: Vec<Visibility> = (0..num_points)
+        .map(|i| {
+            let angle = i as f64 / num_points as f64 * 2.0 * PI;
+            let u = max_uv * angle.cos();
+            let v = max_uv * angle.sin();
+            let phase = -2.0 * PI * u * l0;
+            Visibility {
+                u,
+                v,
+                w: 0.0,
+                real: phase.cos(),
+                imag: phase.sin(),
+                weight: 1.0,
+                time: i as f64,
+            }
+        })
+        .collect();
+
+    let image_size = 256;
+    let dirty_image = perform_imaging(&vis_data, image_size, 0.1)?;
+    let peak_index = dirty_image
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(index, _)| index)
+        .ok_or("synthetic imaging produced an empty image")?;
+    let peak_x = peak_index % image_size;
+    let peak_y = peak_index / image_size;
+    let expected_offset = (l0 / (0.1 * PI / (180.0 * 3600.0))).round() as isize;
+    let expected_x = image_size as isize / 2 + expected_offset;
+    if (peak_x as isize - expected_x).abs() > 2
+        || (peak_y as isize - image_size as isize / 2).abs() > 2
+    {
+        return Err(format!(
+            "synthetic source position mismatch: peak=({}, {}), expected=({}, {})",
+            peak_x,
+            peak_y,
+            expected_x,
+            image_size / 2
+        )
+        .into());
+    }
+    println!(
+        "#IMAGING TEST: image={}x{} peak=({}, {}) value={:.6}",
+        image_size, image_size, peak_x, peak_y, dirty_image[peak_index]
+    );
     Ok(())
 }
 

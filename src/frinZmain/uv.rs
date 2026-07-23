@@ -1,7 +1,7 @@
 use crate::args::Args;
 use crate::header::parse_header;
 use crate::input_support::read_input_bytes;
-use crate::npy_output::{npz_sidecar_path, write_complex_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::plot_uv_tracks;
 use crate::read::{read_sector_header, read_visibility_data};
 use crate::utils::{radec2azalt, uvw_cal};
@@ -185,28 +185,28 @@ pub fn run_uv_plot(args: &Args, uv_mode: i32) -> Result<(), Box<dyn Error>> {
         center_frequency_hz,
         uv_mode,
     )?;
-    let write_uv_npy = |flag: &str, values: &[(f32, f32)]| -> Result<(), Box<dyn Error>> {
-        let complex: Vec<num_complex::Complex<f32>> = values
-            .iter()
-            .map(|&(u, v)| num_complex::Complex::new(u, v))
-            .collect();
-        let sample_axis: Vec<f64> = (0..complex.len()).map(|index| index as f64).collect();
-        write_complex_1d(
-            &npz_sidecar_path(&output_path, flag),
-            NpyMeta::new(
-                flag,
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("sample", "", "u_real_v_imag", "m"),
-            &complex,
-            &sample_axis,
-        )?;
-        Ok(())
-    };
     if args.npz {
-        write_uv_npy("uv_observed", &observed_uv)?;
-        write_uv_npy("uv_accessible", &accessible_uv)?;
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "uv",
+            header.fft_point as u32,
+            header.number_of_sector as u32,
+        ));
+        let observed_sample: Vec<f64> = (0..observed_uv.len()).map(|index| index as f64).collect();
+        let accessible_sample: Vec<f64> =
+            (0..accessible_uv.len()).map(|index| index as f64).collect();
+        let observed_u: Vec<f32> = observed_uv.iter().map(|&(u, _)| u).collect();
+        let observed_v: Vec<f32> = observed_uv.iter().map(|&(_, v)| v).collect();
+        let accessible_u: Vec<f32> = accessible_uv.iter().map(|&(u, _)| u).collect();
+        let accessible_v: Vec<f32> = accessible_uv.iter().map(|&(_, v)| v).collect();
+        npz.add_f64_1d("observed_sample", &observed_sample);
+        npz.add_f32_1d("observed_u_m", &observed_u);
+        npz.add_f32_1d("observed_v_m", &observed_v);
+        npz.add_f64_1d("accessible_sample", &accessible_sample);
+        npz.add_f32_1d("accessible_u_m", &accessible_u);
+        npz.add_f32_1d("accessible_v_m", &accessible_v);
+        npz.write(&npz_sidecar_path(&output_path, "uv"))?;
+        let _ = fs::remove_file(npz_sidecar_path(&output_path, "uv_observed"));
+        let _ = fs::remove_file(npz_sidecar_path(&output_path, "uv_accessible"));
     }
 
     println!("Generated UV coverage plot at {:?}", output_path);

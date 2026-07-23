@@ -263,7 +263,7 @@ pub fn calculate_sector_range(
     let total_sectors = header.number_of_sector;
 
     let mut start = if is_cumulate {
-        0
+        skip
     } else {
         skip.saturating_add(length.saturating_mul(loop_index))
             .clamp(i32::MIN, total_sectors)
@@ -275,11 +275,7 @@ pub fn calculate_sector_range(
         start = total_sectors;
     }
 
-    let mut end = if is_cumulate {
-        length
-    } else {
-        start.saturating_add(length)
-    };
+    let mut end = start.saturating_add(length);
 
     if end > total_sectors {
         end = total_sectors;
@@ -294,7 +290,7 @@ pub fn calculate_sector_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_read_params, CorReadOptions};
+    use super::{calculate_sector_range, resolve_read_params, CorReadOptions};
     use crate::header::CorHeader;
 
     fn header_with_sectors(number_of_sector: i32) -> CorHeader {
@@ -323,6 +319,13 @@ mod tests {
         };
 
         assert_eq!(resolve_read_params(&header, &options), (28680, 0));
+    }
+
+    #[test]
+    fn cumulative_range_starts_after_skip() {
+        let header = header_with_sectors(100);
+        assert_eq!(calculate_sector_range(&header, 30, 10, 0, true), (10, 40));
+        assert_eq!(calculate_sector_range(&header, 200, 10, 0, true), (10, 100));
     }
 
     #[test]

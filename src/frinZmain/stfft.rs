@@ -1,8 +1,10 @@
 use crate::args::Args;
+use crate::npy_output::{write_named_real_1d_npz, NpyMeta};
 use crate::processing::ProcessResult;
+use crate::utils::mjd_cal;
+use chrono::Duration;
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +80,7 @@ pub fn write_output(
         .and_then(|s| s.to_str())
         .unwrap_or("frinZ");
     let path = output_dir.join(format!(
-        "{}_len{}s_hop{}s_stfft.tsv",
+        "{}_len{}s_hop{}s_stfft.npz",
         stem, plan.window, plan.hop
     ));
     let rows = [
@@ -94,17 +96,18 @@ pub fn write_output(
     .min()
     .unwrap_or(0);
 
-    let mut out = BufWriter::new(File::create(&path)?);
-    writeln!(
-        out,
-        "# STFFT: window={} sectors, hop={} sectors, requested_loop={}, rows={}",
-        plan.window, plan.hop, args.loop_, rows
-    )?;
-    writeln!(
-        out,
-        "# Window\tStartSector\tEpoch\tElapsed[s]\tAmp[%]\tSNR\tPhase[deg]\tNoise[%]\tResDelay[sample]\tResRate[Hz]"
-    )?;
     let first_time = result.add_plot_times.first().copied();
+    let mut window = Vec::with_capacity(rows);
+    let mut start_sector_series = Vec::with_capacity(rows);
+    let mut start_mjd = Vec::with_capacity(rows);
+    let mut phase_mjd = Vec::with_capacity(rows);
+    let mut elapsed_s = Vec::with_capacity(rows);
+    let mut amp_percent = Vec::with_capacity(rows);
+    let mut snr = Vec::with_capacity(rows);
+    let mut phase_deg = Vec::with_capacity(rows);
+    let mut noise_percent = Vec::with_capacity(rows);
+    let mut res_delay_sample = Vec::with_capacity(rows);
+    let mut res_rate_hz = Vec::with_capacity(rows);
     for i in 0..rows {
         let elapsed = first_time.map_or(0.0, |first| {
             result.add_plot_times[i]
@@ -112,22 +115,48 @@ pub fn write_output(
                 .num_milliseconds() as f64
                 / 1000.0
         });
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{:.6}\t{:.9}\t{:.3}\t{:+.6}\t{:.9}\t{:+.9}\t{:+.12}",
-            i,
-            args.skip.saturating_add(i as i32 * plan.hop),
-            result.add_plot_times[i].format("%Y/%jT%H:%M:%S%.3f"),
-            elapsed,
-            result.add_plot_amp[i],
-            result.add_plot_snr[i],
-            result.add_plot_phase[i],
-            result.add_plot_noise[i],
-            result.add_plot_res_delay[i],
-            result.add_plot_res_rate[i],
-        )?;
+        let start_sector = args.skip.saturating_add(i as i32 * plan.hop);
+        let effective_integ_time = if plan.window > 0 {
+            result.length_sec as f64 / plan.window as f64
+        } else {
+            1.0
+        };
+        let start_offset_us =
+            (start_sector as f64 * effective_integ_time * 1_000_000.0).round() as i64;
+        let start_time = result.obs_time + Duration::microseconds(start_offset_us);
+        window.push(i as f64);
+        start_sector_series.push(start_sector as f64);
+        start_mjd.push(mjd_cal(start_time));
+        phase_mjd.push(mjd_cal(result.add_plot_times[i]));
+        elapsed_s.push(elapsed);
+        amp_percent.push(result.add_plot_amp[i] as f64);
+        snr.push(result.add_plot_snr[i] as f64);
+        phase_deg.push(result.add_plot_phase[i] as f64);
+        noise_percent.push(result.add_plot_noise[i] as f64);
+        res_delay_sample.push(result.add_plot_res_delay[i] as f64);
+        res_rate_hz.push(result.add_plot_res_rate[i] as f64);
     }
-    out.flush()?;
+    write_named_real_1d_npz(
+        &path,
+        NpyMeta::new(
+            "stfft",
+            result.header.fft_point.max(0) as u32,
+            result.header.number_of_sector.max(0) as u32,
+        ),
+        &[
+            ("window", &window),
+            ("start_sector", &start_sector_series),
+            ("start_mjd", &start_mjd),
+            ("phase_mjd", &phase_mjd),
+            ("elapsed_s", &elapsed_s),
+            ("amp_percent", &amp_percent),
+            ("snr", &snr),
+            ("phase_deg", &phase_deg),
+            ("noise_percent", &noise_percent),
+            ("res_delay_sample", &res_delay_sample),
+            ("res_rate_hz", &res_rate_hz),
+        ],
+    )?;
     Ok(Some(path))
 }
 

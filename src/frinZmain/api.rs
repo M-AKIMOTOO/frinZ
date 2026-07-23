@@ -373,3 +373,222 @@ fn pad_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_width: u
     }
     target_rows
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::f64::consts::PI;
+
+    fn wrap_degrees(value: f64) -> f64 {
+        (value + 180.0).rem_euclid(360.0) - 180.0
+    }
+
+    fn synthetic_data(
+        length: usize,
+        start_sec: f64,
+        delay: f64,
+        rate: f64,
+        phase0: f64,
+    ) -> CorData {
+        synthetic_data_with_acceleration(length, start_sec, delay, rate, 0.0, phase0)
+    }
+
+    fn synthetic_data_with_acceleration(
+        length: usize,
+        start_sec: f64,
+        delay: f64,
+        rate: f64,
+        acceleration: f64,
+        phase0: f64,
+    ) -> CorData {
+        let fft_point = 64usize;
+        let channels = fft_point / 2;
+        let visibility = (0..length)
+            .flat_map(|row| {
+                (0..channels).map(move |channel| {
+                    let time = start_sec + row as f64;
+                    let phase = phase0
+                        + 2.0
+                            * PI
+                            * (rate * time
+                                + 0.5 * acceleration * time * time
+                                + delay * channel as f64 / fft_point as f64);
+                    C32::new(phase.cos() as f32, phase.sin() as f32)
+                })
+            })
+            .collect();
+        CorData {
+            header: CorHeader {
+                sampling_speed: 64_000_000,
+                observing_frequency: 8_400_000_000.0,
+                fft_point: fft_point as i32,
+                number_of_sector: 600,
+                station1_position: [6_378_137.0, 0.0, 0.0],
+                station2_position: [6_378_137.0, 100.0, 0.0],
+                ..CorHeader::default()
+            },
+            visibility,
+            obs_time: Utc.timestamp_opt(start_sec as i64, 0).single().unwrap(),
+            effective_integ_time: 1.0,
+            first_sector: 0,
+            sectors_read: length as i32,
+        }
+    }
+
+    #[test]
+    fn peak_search_recovers_delay_rate_and_midpoint_phase_for_all_lengths() {
+        let delay = 0.35;
+        let rate = 0.037;
+        let phase0 = 0.4;
+        let start = 100.0;
+        let options = LibraryOptions {
+            search_mode: Some(SearchMode::Peak),
+            rate_padding: 8,
+            iter: 4,
+            cpu: 1,
+            ..LibraryOptions::default()
+        };
+
+        for length in [1usize, 2, 3, 4, 5, 10, 30, 60] {
+            let data = synthetic_data(length, start, delay, rate, phase0);
+            let output = delay_search(&data, &options).unwrap();
+            let midpoint = start + 0.5 * (length - 1) as f64;
+            let expected_phase = wrap_degrees((phase0 + 2.0 * PI * rate * midpoint).to_degrees());
+            println!(
+                "length={length} delay={} rate={} phase={} expected_phase={expected_phase}",
+                output.analysis.residual_delay,
+                output.analysis.residual_rate,
+                output.analysis.delay_phase
+            );
+            let phase_error =
+                wrap_degrees(output.analysis.delay_phase as f64 - expected_phase).abs();
+            assert!(
+                (output.analysis.residual_delay as f64 - delay).abs() < 1.0e-3,
+                "length={length}: delay={}",
+                output.analysis.residual_delay
+            );
+            if length == 1 {
+                assert_eq!(
+                    output.analysis.residual_rate, 0.0,
+                    "length=1 rate is not identifiable"
+                );
+            } else {
+                assert!(
+                    (output.analysis.residual_rate as f64 - rate).abs() < 1.0e-4,
+                    "length={length}: rate={}",
+                    output.analysis.residual_rate
+                );
+            }
+            assert!(
+                phase_error < 0.5,
+                "length={length}: phase={} expected={expected_phase} error={phase_error}",
+                output.analysis.delay_phase
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_phase_has_the_physical_quadratic_coefficient_for_every_length() {
+        let delay = 0.35;
+        let rate0 = 0.0023;
+        let acceleration = 2.0e-6;
+        let phase0 = 0.4;
+        let options = LibraryOptions {
+            search_mode: Some(SearchMode::Peak),
+            rate_padding: 8,
+            iter: 4,
+            cpu: 1,
+            ..LibraryOptions::default()
+        };
+
+        for length in [1usize, 2, 3, 4, 5, 10, 30, 60] {
+            let mut times = Vec::new();
+            let mut phases = Vec::new();
+            let mut rates = Vec::new();
+            for start in [100.0_f64, 160.0, 220.0, 280.0, 340.0] {
+                let data = synthetic_data_with_acceleration(
+                    length,
+                    start,
+                    delay,
+                    rate0,
+                    acceleration,
+                    phase0,
+                );
+                let output = delay_search(&data, &options).unwrap();
+                let midpoint = start + 0.5 * (length - 1) as f64;
+                times.push(midpoint as f32);
+                phases.push(output.analysis.delay_phase);
+                rates.push(if length == 1 {
+                    (rate0 + acceleration * midpoint) as f32
+                } else {
+                    output.analysis.residual_rate
+                });
+            }
+            let mut unwrapped = crate::utils::unwrap_phase_with_rate(&phases, &times, &rates);
+            let expected_first = (phase0
+                + 2.0
+                    * PI
+                    * (rate0 * times[0] as f64 + 0.5 * acceleration * (times[0] as f64).powi(2)))
+            .to_degrees();
+            let shift = ((expected_first - unwrapped[0] as f64) / 360.0).round() as f32 * 360.0;
+            for phase in &mut unwrapped {
+                *phase += shift;
+            }
+            let x: Vec<f64> = times.iter().map(|&value| value as f64).collect();
+            let y: Vec<f64> = unwrapped.iter().map(|&value| value as f64).collect();
+            let coeffs = crate::fitting::fit_polynomial_least_squares(&x, &y, 2).unwrap();
+            let expected_quadratic = 180.0 * acceleration;
+            assert!(
+                (coeffs[2] - expected_quadratic).abs() < 2.0e-6,
+                "length={length}: quadratic={} expected={expected_quadratic}",
+                coeffs[2]
+            );
+        }
+    }
+
+    #[test]
+    fn peak_search_reacquires_rate_instead_of_trusting_a_stale_seed() {
+        let length = 30usize;
+        let delay = 0.35;
+        let rates = [-0.016, -0.17];
+        let options = LibraryOptions {
+            search_mode: Some(SearchMode::Peak),
+            rate_padding: 8,
+            iter: 4,
+            cpu: 1,
+            ..LibraryOptions::default()
+        };
+        let args = args_from_options(&options, false);
+        for rate in rates {
+            let data = synthetic_data(length, 100.0, delay, rate, 0.4);
+            let mut visibility = data.visibility.clone();
+            let current_length = pad_rows_to_power_of_two(
+                &mut visibility,
+                length as i32,
+                data.header.fft_point as usize / 2,
+            );
+            let result = search::run_peak_search(
+                &visibility,
+                &data.header,
+                current_length,
+                length as i32,
+                data.effective_integ_time,
+                &data.obs_time,
+                &data.obs_time,
+                &[],
+                &None,
+                &args,
+                data.header.number_of_sector,
+                1,
+                Some((delay as f32, 0.05)),
+            )
+            .unwrap();
+            assert!(
+                (result.analysis_results.residual_rate as f64 - rate).abs() < 1.0e-4,
+                "stale seed was not reacquired: expected={rate}, rate={}",
+                result.analysis_results.residual_rate
+            );
+        }
+    }
+}

@@ -5,7 +5,7 @@
 // - UV-related plots
 // - multi-sideband summary plot (merged from former plot_msb.rs)
 use crate::args::Args;
-use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, write_named_real_1d_npz, NamedNpz, NpyMeta};
 use crate::output::generate_output_names;
 use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
@@ -968,17 +968,14 @@ pub fn write_cumulate_outputs(
             .map(|&value| value as f64)
             .collect();
         let npy_path = path.join(format!("{}_cumulate.npz", make_base_filename(args, result)));
-        write_real_1d(
-            &npy_path,
-            NpyMeta::new(
-                "cumulate",
-                result.header.fft_point as u32,
-                result.header.number_of_sector as u32,
-            )
-            .axes("integration_time", "s", "snr", ""),
-            &result.cumulate_snr,
-            &axis,
-        )?;
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "cumulate",
+            result.header.fft_point as u32,
+            result.header.number_of_sector as u32,
+        ));
+        npz.add_f64_1d("integration_time_s", &axis);
+        npz.add_f32_1d("snr", &result.cumulate_snr);
+        npz.write(&npy_path)?;
     }
     Ok(())
 }
@@ -1028,41 +1025,74 @@ pub fn write_add_plot_outputs(
             .iter()
             .map(|&value| value as f64)
             .collect();
-        let npy_series = [
-            ("add_plot_amp", "amplitude", "%", &result.add_plot_amp),
-            ("add_plot_snr", "snr", "", &result.add_plot_snr),
-            ("add_plot_phase", "phase", "deg", &result.add_plot_phase),
-            ("add_plot_noise", "noise", "%", &result.add_plot_noise),
-            (
-                "add_plot_resdelay",
-                "residual_delay",
-                "sample",
-                &result.add_plot_res_delay,
-            ),
-            (
-                "add_plot_resrate",
-                "residual_rate",
-                "Hz",
-                &result.add_plot_res_rate,
-            ),
-        ];
         if args.npz {
-            for (flag, value_name, value_unit, values) in npy_series {
-                if values.len() != axis.len() {
-                    continue;
-                }
-                write_real_1d(
-                    &npz_sidecar_path(&add_plot_filepath, flag),
-                    NpyMeta::new(
-                        flag,
-                        result.header.fft_point as u32,
-                        result.header.number_of_sector as u32,
-                    )
-                    .axes("elapsed_time", "s", value_name, value_unit),
-                    values,
-                    &axis,
-                )?;
+            let rows = [
+                axis.len(),
+                result.add_plot_amp.len(),
+                result.add_plot_snr.len(),
+                result.add_plot_phase.len(),
+                result.add_plot_noise.len(),
+                result.add_plot_res_delay.len(),
+                result.add_plot_res_rate.len(),
+            ]
+            .into_iter()
+            .min()
+            .unwrap_or(0);
+
+            let old_flags = [
+                "add_plot_amp",
+                "add_plot_snr",
+                "add_plot_phase",
+                "add_plot_noise",
+                "add_plot_resdelay",
+                "add_plot_resrate",
+            ];
+            for flag in old_flags {
+                let _ = std::fs::remove_file(npz_sidecar_path(&add_plot_filepath, flag));
             }
+
+            let time_s: Vec<f64> = axis[..rows].to_vec();
+            let amp_percent: Vec<f64> = result.add_plot_amp[..rows]
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            let phase_deg: Vec<f64> = result.add_plot_phase[..rows]
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            let snr: Vec<f64> = result.add_plot_snr[..rows]
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            let res_delay_sample: Vec<f64> = result.add_plot_res_delay[..rows]
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            let res_rate_hz: Vec<f64> = result.add_plot_res_rate[..rows]
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            let noise_percent: Vec<f64> = result.add_plot_noise[..rows]
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            write_named_real_1d_npz(
+                &npz_sidecar_path(&add_plot_filepath, "add_plot"),
+                NpyMeta::new(
+                    "add_plot",
+                    result.header.fft_point.max(0) as u32,
+                    result.header.number_of_sector.max(0) as u32,
+                ),
+                &[
+                    ("time_s", &time_s),
+                    ("amp_percent", &amp_percent),
+                    ("phase_deg", &phase_deg),
+                    ("snr", &snr),
+                    ("res_delay_sample", &res_delay_sample),
+                    ("res_rate_hz", &res_rate_hz),
+                    ("noise_percent", &noise_percent),
+                ],
+            )?;
         }
     }
 
@@ -1082,8 +1112,7 @@ pub fn add_plot(
     len_val_sec: f32,
     obs_start_time: &DateTime<Utc>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut phase_unwrapped = phase.to_vec();
-    utils::unwrap_phase(&mut phase_unwrapped, false);
+    let phase_unwrapped = utils::unwrap_phase_with_rate(phase, length, res_rate);
     let phase_unwrapped_slice: &[f32] = phase_unwrapped.as_slice();
 
     let plots = vec![

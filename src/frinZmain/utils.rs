@@ -10,7 +10,7 @@ use ndarray::prelude::*;
 use num_complex::Complex;
 
 use crate::header::CorHeader;
-use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot;
 
 const C: f64 = 299792458.0; // Speed of light in m/s
@@ -167,6 +167,25 @@ pub fn mjd_cal(time: DateTime<Utc>) -> f64 {
     julian_day - 2400000.5
 }
 
+pub fn unwrap_phase_with_rate(phases: &[f32], times_sec: &[f32], rates_hz: &[f32]) -> Vec<f32> {
+    if phases.len() < 2 || phases.len() != times_sec.len() || phases.len() != rates_hz.len() {
+        let mut fallback = phases.to_vec();
+        unwrap_phase(&mut fallback, false);
+        return fallback;
+    }
+
+    let mut unwrapped = Vec::with_capacity(phases.len());
+    unwrapped.push(phases[0]);
+    for index in 1..phases.len() {
+        let dt = times_sec[index] - times_sec[index - 1];
+        let predicted_delta = 360.0 * 0.5 * (rates_hz[index - 1] + rates_hz[index]) * dt;
+        let wrapped_delta = phases[index] - phases[index - 1];
+        let turns = ((predicted_delta - wrapped_delta) / 360.0).round();
+        unwrapped.push(unwrapped[index - 1] + wrapped_delta + 360.0 * turns);
+    }
+    unwrapped
+}
+
 pub fn unwrap_phase(phases: &mut [f32], radians: bool) {
     if phases.len() < 2 {
         return;
@@ -289,12 +308,10 @@ pub fn write_allan_deviation_outputs(
     if write_npz {
         let tau_axis: Vec<f64> = adev_data.iter().map(|&(tau, _)| tau as f64).collect();
         let values: Vec<f32> = adev_data.iter().map(|&(_, value)| value).collect();
-        write_real_1d(
-            &npz_sidecar_path(&plot_path, "allan_deviance"),
-            NpyMeta::new("allan_deviance", 0, 0).axes("tau", "s", "allan_deviation", ""),
-            &values,
-            &tau_axis,
-        )?;
+        let mut npz = NamedNpz::new(NpyMeta::new("allan_deviance", 0, 0));
+        npz.add_f64_1d("tau_s", &tau_axis);
+        npz.add_f32_1d("allan_deviation", &values);
+        npz.write(&npz_sidecar_path(&plot_path, "allan_deviance"))?;
     }
     println!("Allan deviation plot and data saved in {:?}", allan_dir);
 
@@ -417,4 +434,32 @@ pub fn rate_delay_to_lm(
     let m = inv_det * (-du_dt * b1 + u * b2);
 
     (l, m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unwrap_phase_with_rate;
+
+    #[test]
+    fn rate_assisted_unwrap_recovers_multiple_turns_between_samples() {
+        let times = [0.0_f32, 30.0, 60.0, 90.0];
+        for rate in [-0.016_f32, -0.17] {
+            let true_phase: Vec<f32> = times
+                .iter()
+                .map(|time| 25.0 + 360.0 * rate * time)
+                .collect();
+            let wrapped: Vec<f32> = true_phase
+                .iter()
+                .map(|phase| (*phase + 180.0).rem_euclid(360.0) - 180.0)
+                .collect();
+            let rates = vec![rate; times.len()];
+            let actual = unwrap_phase_with_rate(&wrapped, &times, &rates);
+            for (actual, expected) in actual.iter().zip(&true_phase) {
+                assert!(
+                    (actual - expected).abs() < 1.0e-3,
+                    "rate={rate}: {actual} != {expected}"
+                );
+            }
+        }
+    }
 }

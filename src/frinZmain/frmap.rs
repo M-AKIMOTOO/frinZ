@@ -16,9 +16,7 @@ use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
 use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft_with_delay_padding};
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
-use crate::npy_output::{
-    npz_sidecar_path, write_complex_1d, write_complex_2d, write_real_1d, NpyMeta,
-};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::{plot_cross_section, plot_sky_map, plot_uv_coverage};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
@@ -649,55 +647,34 @@ pub fn run_fringe_rate_map_analysis(
         .map(|i| ((height as f64 / 2.0) - i as f64) * cell_size_rad * rad_to_arcsec * 1_000.0)
         .collect();
 
-    let npy_meta = |flag| {
-        NpyMeta::new(
-            flag,
+    let mut frmap_npz = if args.npz {
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "frmap",
             header.fft_point as u32,
             header.number_of_sector as u32,
-        )
-        .axes("dec_offset", "mas", "ra_offset", "mas")
-    };
-    if args.npz {
-        let map_npy = npz_sidecar_path(&map_filename, "frmap");
-        write_complex_2d(
-            &map_npy,
-            npy_meta("frmap"),
+        ));
+        npz.add_f64_1d("ra_offset_mas", &ra_offsets);
+        npz.add_f64_1d("dec_offset_mas", &dec_offsets);
+        npz.add_complex64_2d(
+            "frmap",
             (height, width),
             total_complex_map.iter().map(|&value| value * inv_segments),
-            &dec_offsets,
-            &ra_offsets,
         )?;
-        let beam_npy = npz_sidecar_path(&beam_map_filename, "beam");
-        write_complex_2d(
-            &beam_npy,
-            npy_meta("beam"),
+        npz.add_complex64_2d(
+            "beam",
             (height, width),
             total_complex_beam.iter().map(|&value| value * inv_segments),
-            &dec_offsets,
-            &ra_offsets,
         )?;
-        let uv_values: Vec<Complex<f32>> = all_uv_data
-            .iter()
-            .map(|&(u, v)| Complex::new(u as f32, v as f32))
-            .collect();
-        let uv_index: Vec<f64> = (0..uv_values.len()).map(|index| index as f64).collect();
-        let uv_npy = npz_sidecar_path(&uv_coverage_filename, "uv");
-        write_complex_1d(
-            &uv_npy,
-            NpyMeta::new(
-                "uv",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("sample", "", "u_real_v_imag", "wavelength"),
-            &uv_values,
-            &uv_index,
-        )?;
-        println!(
-            "NumPy map data saved to: {:?}, {:?}, {:?}",
-            map_npy, beam_npy, uv_npy
-        );
-    }
+        let uv_sample: Vec<f64> = (0..all_uv_data.len()).map(|index| index as f64).collect();
+        let uv_u: Vec<f32> = all_uv_data.iter().map(|&(u, _)| u as f32).collect();
+        let uv_v: Vec<f32> = all_uv_data.iter().map(|&(_, v)| v as f32).collect();
+        npz.add_f64_1d("uv_sample", &uv_sample);
+        npz.add_f32_1d("uv_u_wavelength", &uv_u);
+        npz.add_f32_1d("uv_v_wavelength", &uv_v);
+        Some(npz)
+    } else {
+        None
+    };
     let horizontal_data: Vec<(f64, f32)> = ra_offsets
         .iter()
         .zip(horizontal_profile.iter())
@@ -727,29 +704,21 @@ pub fn run_fringe_rate_map_analysis(
     )?;
     let horizontal_values: Vec<f32> = horizontal_profile.iter().copied().collect();
     let vertical_values: Vec<f32> = vertical_profile.iter().copied().collect();
-    if args.npz {
-        write_real_1d(
-            &npz_sidecar_path(&cross_section_filename, "frmap_peak_ra"),
-            NpyMeta::new(
-                "frmap_peak_ra",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("ra_offset", "mas", "amplitude", ""),
-            &horizontal_values,
-            &ra_offsets,
-        )?;
-        write_real_1d(
-            &npz_sidecar_path(&cross_section_filename, "frmap_peak_dec"),
-            NpyMeta::new(
-                "frmap_peak_dec",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("dec_offset", "mas", "amplitude", ""),
-            &vertical_values,
-            &dec_offsets,
-        )?;
+    if let Some(npz) = frmap_npz.as_mut() {
+        npz.add_f32_1d("peak_ra_amplitude", &horizontal_values);
+        npz.add_f32_1d("peak_dec_amplitude", &vertical_values);
+        let npz_path = npz_sidecar_path(&map_filename, "frmap");
+        let npz = frmap_npz.take().expect("frmap npz exists");
+        npz.write(&npz_path)?;
+        for legacy in [
+            npz_sidecar_path(&beam_map_filename, "beam"),
+            npz_sidecar_path(&uv_coverage_filename, "uv"),
+            npz_sidecar_path(&cross_section_filename, "frmap_peak_ra"),
+            npz_sidecar_path(&cross_section_filename, "frmap_peak_dec"),
+        ] {
+            let _ = fs::remove_file(legacy);
+        }
+        println!("NumPy frmap data saved to: {:?}", npz_path);
     }
     println!("Cross-section plot saved to: {:?}", cross_section_filename);
 
@@ -1169,44 +1138,33 @@ fn run_frmap_maser(
         final_range_arcsec,
     )?;
     if args.npz {
-        let line_values: Vec<Complex<f32>> = lines
-            .iter()
-            .map(|line| Complex::new(line.du_dt as f32, line.dv_dt as f32))
-            .collect();
-        let line_rates: Vec<f64> = lines.iter().map(|line| line.rate_hz).collect();
-        write_complex_1d(
-            &npz_sidecar_path(&plot_path, "frmap_maser_lines"),
-            NpyMeta::new(
-                "frmap_maser_lines",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("fringe_rate", "Hz", "du_dt_real_dv_dt_imag", "m/s"),
-            &line_values,
-            &line_rates,
-        )?;
-        let intersection_values: Vec<Complex<f32>> = intersections
-            .iter()
-            .map(|point| {
-                Complex::new(
-                    (point.l * rad_to_arcsec) as f32,
-                    (point.m * rad_to_arcsec) as f32,
-                )
-            })
-            .collect();
-        let intersection_weights: Vec<f64> =
+        let line_rate_hz: Vec<f64> = lines.iter().map(|line| line.rate_hz).collect();
+        let line_du_dt_m_per_s: Vec<f32> = lines.iter().map(|line| line.du_dt as f32).collect();
+        let line_dv_dt_m_per_s: Vec<f32> = lines.iter().map(|line| line.dv_dt as f32).collect();
+        let intersection_weight: Vec<f64> =
             intersections.iter().map(|point| point.weight).collect();
-        write_complex_1d(
-            &npz_sidecar_path(&plot_path, "frmap_maser_intersections"),
-            NpyMeta::new(
-                "frmap_maser_intersections",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("weight", "", "ra_real_dec_imag", "arcsec"),
-            &intersection_values,
-            &intersection_weights,
-        )?;
+        let intersection_ra_arcsec: Vec<f32> = intersections
+            .iter()
+            .map(|point| (point.l * rad_to_arcsec) as f32)
+            .collect();
+        let intersection_dec_arcsec: Vec<f32> = intersections
+            .iter()
+            .map(|point| (point.m * rad_to_arcsec) as f32)
+            .collect();
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "frmap_maser",
+            header.fft_point as u32,
+            header.number_of_sector as u32,
+        ));
+        npz.add_f64_1d("line_rate_hz", &line_rate_hz);
+        npz.add_f32_1d("line_du_dt_m_per_s", &line_du_dt_m_per_s);
+        npz.add_f32_1d("line_dv_dt_m_per_s", &line_dv_dt_m_per_s);
+        npz.add_f64_1d("intersection_weight", &intersection_weight);
+        npz.add_f32_1d("intersection_ra_arcsec", &intersection_ra_arcsec);
+        npz.add_f32_1d("intersection_dec_arcsec", &intersection_dec_arcsec);
+        npz.write(&npz_sidecar_path(&plot_path, "frmap_maser"))?;
+        let _ = fs::remove_file(npz_sidecar_path(&plot_path, "frmap_maser_lines"));
+        let _ = fs::remove_file(npz_sidecar_path(&plot_path, "frmap_maser_intersections"));
     }
     println!("Fringe-rate line plot saved to {:?}", plot_path);
 

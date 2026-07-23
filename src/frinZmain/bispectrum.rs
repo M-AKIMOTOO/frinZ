@@ -5,7 +5,7 @@ use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
 use crate::fft;
 use crate::header::{parse_header, CorHeader};
-use crate::npy_output::{npz_sidecar_path, write_complex_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::run_analysis_pipeline;
@@ -174,12 +174,9 @@ fn compute_window_params(header: &CorHeader, args: &Args, eff_time: f32) -> (i32
     };
 
     if args.cumulate != 0 {
-        if args.cumulate >= pp {
-            loop_count = 1;
-        } else {
-            length = args.cumulate;
-            loop_count = (pp / args.cumulate).max(1);
-        }
+        let available = pp.saturating_sub(args.skip.max(0));
+        length = args.cumulate.min(available).max(1);
+        loop_count = available.saturating_add(length - 1) / length;
     }
 
     (length.max(1), loop_count.max(1))
@@ -1459,7 +1456,6 @@ pub fn run_closure_phase_analysis(
     cor_paths: &[PathBuf],
     time_flag_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
     pp_flag_ranges: &[(u32, u32)],
-    refant: &str,
 ) -> Result<(), Box<dyn Error>> {
     if cor_paths.len() != 3 {
         return Err("closure-phase requires exactly three .cor files.".into());
@@ -1472,11 +1468,6 @@ pub fn run_closure_phase_analysis(
             "#WARN: --closure-phase で有効な --search は peak/deep/deep2 のみです。指定モード {:?} は無視されます。",
             args.search
         );
-    }
-
-    let refant_name = refant.trim();
-    if refant_name.is_empty() {
-        return Err("refant must not be empty.".into());
     }
 
     let loaded1 =
@@ -1497,14 +1488,9 @@ pub fn run_closure_phase_analysis(
         .into());
     }
 
-    let base1_st1 = normalize_name(&loaded1.info.header.station1_name);
-    if !names_equal(&base1_st1, refant_name) {
-        return Err(format!(
-            "Baseline 1 station1 '{}' does not match refant '{}'.",
-            loaded1.info.header.station1_name.trim(),
-            refant_name
-        )
-        .into());
+    let refant_name = normalize_name(&loaded1.info.header.station1_name);
+    if refant_name.is_empty() {
+        return Err("Baseline 1 station1 name must not be empty.".into());
     }
     let mid_ant = normalize_name(&loaded1.info.header.station2_name);
 
@@ -1522,15 +1508,15 @@ pub fn run_closure_phase_analysis(
         .into());
     };
 
-    if names_equal(&third_ant, &mid_ant) || names_equal(&third_ant, refant_name) {
+    if names_equal(&third_ant, &mid_ant) || names_equal(&third_ant, &refant_name) {
         return Err("Baseline configuration does not form a valid triangle.".into());
     }
 
     let b3_st1 = normalize_name(&loaded3.info.header.station1_name);
     let b3_st2 = normalize_name(&loaded3.info.header.station2_name);
-    let orientation = if names_equal(&b3_st1, refant_name) && names_equal(&b3_st2, &third_ant) {
+    let orientation = if names_equal(&b3_st1, &refant_name) && names_equal(&b3_st2, &third_ant) {
         1.0f32
-    } else if names_equal(&b3_st2, refant_name) && names_equal(&b3_st1, &third_ant) {
+    } else if names_equal(&b3_st2, &refant_name) && names_equal(&b3_st1, &third_ant) {
         -1.0f32
     } else {
         return Err(format!(
@@ -1612,7 +1598,7 @@ pub fn run_closure_phase_analysis(
     let closure_dir = frinz_dir.join("closure_phase");
     fs::create_dir_all(&closure_dir)?;
 
-    let sanitized_ref = sanitize_token(refant_name);
+    let sanitized_ref = sanitize_token(&refant_name);
     let sanitized_mid = sanitize_token(&mid_ant);
     let sanitized_third = sanitize_token(&third_ant);
 
@@ -1689,40 +1675,45 @@ pub fn run_closure_phase_analysis(
     let meta_fft = loaded1.info.header.fft_point as u32;
     let meta_pp = loaded1.info.header.number_of_sector as u32;
     if args.npz {
+        let mut npz = NamedNpz::new(NpyMeta::new("closure_phase", meta_fft, meta_pp));
+        npz.add_f64_1d("elapsed_time_s", &time_axis);
         for baseline_index in 0..3 {
-            let flag = format!("closure_baseline{}", baseline_index + 1);
             let values: Vec<C32> = rows
                 .iter()
                 .map(|row| row.raw_complex[baseline_index])
                 .collect();
-            write_complex_1d(
-                &npz_sidecar_path(&closure_png, &flag),
-                NpyMeta::new(&flag, meta_fft, meta_pp).axes("elapsed_time", "s", "visibility", ""),
+            npz.add_complex64_1d(
+                &format!("baseline{}_visibility", baseline_index + 1),
                 &values,
-                &time_axis,
-            )?;
+            );
         }
         let bispectrum_values: Vec<C32> = rows.iter().map(|row| row.bispectrum).collect();
-        write_complex_1d(
-            &npz_sidecar_path(&bis_png, "bispectrum"),
-            NpyMeta::new("bispectrum", meta_fft, meta_pp).axes(
-                "elapsed_time",
-                "s",
-                "bispectrum",
-                "",
-            ),
-            &bispectrum_values,
-            &time_axis,
-        )?;
+        let closure_phase_deg: Vec<f32> = rows
+            .iter()
+            .map(|row| row.closure_phase_deg as f32)
+            .collect();
+        npz.add_complex64_1d("bispectrum", &bispectrum_values);
+        npz.add_f32_1d("closure_phase_deg", &closure_phase_deg);
+        let npz_path = npz_sidecar_path(&closure_png, "closure_phase");
+        npz.write(&npz_path)?;
+        for legacy_flag in [
+            "closure_baseline1",
+            "closure_baseline2",
+            "closure_baseline3",
+            "bispectrum",
+        ] {
+            let _ = std::fs::remove_file(npz_sidecar_path(&closure_png, legacy_flag));
+            let _ = std::fs::remove_file(npz_sidecar_path(&bis_png, legacy_flag));
+        }
     }
     compress_png_with_mode(&closure_png, CompressQuality::Low);
     compress_png_with_mode(&bis_png, CompressQuality::Low);
 
-    let third_station_meta = extract_third_station_meta(&loaded3.info.header, refant_name);
+    let third_station_meta = extract_third_station_meta(&loaded3.info.header, &refant_name);
     let out_header = patch_bispectrum_file_header(
         &loaded1.file_header_raw,
         bispec_spectra.len() as i32,
-        refant_name,
+        &refant_name,
         &third_station_meta,
     );
     write_phase_corrected_spectrum_binary(

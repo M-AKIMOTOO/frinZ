@@ -19,9 +19,7 @@ use crate::fft::{
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
 use crate::norm_acf::NormAcfContext;
-use crate::npy_output::{
-    npz_sidecar_path, write_complex_1d, write_complex_2d, write_real_2d, NpyMeta,
-};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::{
     format_delay_output, format_freq_output, generate_output_names, output_header_info,
 };
@@ -64,12 +62,20 @@ fn write_spectrum_npz(
         (0..spectrum.len()).map(|index| index as f64).collect()
     };
     let npz_path = npz_sidecar_path(output_path, flag);
-    write_complex_1d(
-        &npz_path,
-        NpyMeta::new(flag, fft_point, pp).axes("frequency", "MHz", "", ""),
-        spectrum,
-        &axis,
-    )?;
+    let real: Vec<f64> = spectrum.iter().map(|value| value.re as f64).collect();
+    let imag: Vec<f64> = spectrum.iter().map(|value| value.im as f64).collect();
+    let amplitude: Vec<f64> = spectrum.iter().map(|value| value.norm() as f64).collect();
+    let phase_deg: Vec<f64> = spectrum
+        .iter()
+        .map(|value| crate::utils::safe_arg(value).to_degrees() as f64)
+        .collect();
+    let mut npz = NamedNpz::new(NpyMeta::new(flag, fft_point, pp));
+    npz.add_f64_1d("frequency_mhz", &axis);
+    npz.add_f64_1d("real", &real);
+    npz.add_f64_1d("imag", &imag);
+    npz.add_f64_1d("amplitude", &amplitude);
+    npz.add_f64_1d("phase_deg", &phase_deg);
+    npz.write(&npz_path)?;
     Ok(npz_path)
 }
 
@@ -474,15 +480,16 @@ pub fn process_cor_file(
     };
 
     if args.cumulate != 0 {
-        if args.cumulate >= pp {
+        let available = pp.saturating_sub(args.skip.max(0));
+        if args.cumulate > available {
             eprintln!(
                 "The specified cumulation length, {} s, is more than the observation time, {} s.",
-                args.cumulate, pp
+                args.cumulate, available
             );
             process::exit(1);
         }
         length = args.cumulate;
-        loop_count = pp / args.cumulate;
+        loop_count = available.saturating_add(args.cumulate - 1) / args.cumulate;
     }
 
     let mut delay_output_str = String::new();
@@ -504,7 +511,7 @@ pub fn process_cor_file(
 
     for l1 in 0..loop_count {
         let requested_length = if args.cumulate != 0 {
-            (l1 + 1) * length
+            ((l1 + 1) * length).min(pp.saturating_sub(args.skip.max(0)))
         } else {
             length
         };
@@ -547,6 +554,12 @@ pub fn process_cor_file(
         }
 
         let physical_length = actual_length;
+        let midpoint_offset_us = (0.5_f64
+            * physical_length.saturating_sub(1) as f64
+            * effective_integ_time as f64
+            * 1_000_000.0)
+            .round() as i64;
+        let phase_obs_time = current_obs_time + Duration::microseconds(midpoint_offset_us);
 
         if let Some(norm_ctx) = &norm_acf_context {
             norm_ctx.normalize_cross_visibility(
@@ -684,8 +697,8 @@ pub fn process_cor_file(
                     search_result.analysis_results.residual_rate -= loop_args.rate_correct;
                     // corrected_* should represent user-provided/static correction values
                     // (e.g. --delay/--rate or scan-correct), not search-updated totals.
-                    search_result.analysis_results.corrected_delay = loop_args.delay_correct;
-                    search_result.analysis_results.corrected_rate = loop_args.rate_correct;
+                    search_result.analysis_results.corrected_delay = manual_delay_correct;
+                    search_result.analysis_results.corrected_rate = manual_rate_correct;
                     let result_tuple = (
                         search_result.analysis_results,
                         search_result.freq_rate_array,
@@ -783,7 +796,6 @@ pub fn process_cor_file(
                     1,
                 )?;
                 println!("Spectrum NPZ written to {:?}", npz_path);
-                println!("Spectrum NPZ written to {:?}", output_file_path);
             }
         }
 
@@ -808,7 +820,6 @@ pub fn process_cor_file(
                     0,
                 )?;
                 println!("Bandpass NPZ written to {:?}", npz_path);
-                println!("Bandpass NPZ written to {:?}", output_file_path);
             }
         }
 
@@ -861,22 +872,23 @@ pub fn process_cor_file(
                         + channel as f64 * channel_width_mhz
                 })
                 .collect();
-            if args.npz {
-                let freq_npy = output_path_freq.with_extension("npz");
-                write_complex_2d(
-                    &freq_npy,
-                    NpyMeta::new(
-                        "dynamic_spectrum",
-                        effective_fft_point as u32,
-                        processing_header.number_of_sector as u32,
-                    )
-                    .axes("time", "s", "frequency", "MHz"),
+            let dynamic_npz = if args.npz {
+                let mut npz = NamedNpz::new(NpyMeta::new(
+                    "dynamic_spectrum",
+                    effective_fft_point as u32,
+                    processing_header.number_of_sector as u32,
+                ));
+                npz.add_f64_1d("time_s", &time_axis);
+                npz.add_f64_1d("frequency_mhz", &frequency_axis);
+                npz.add_complex64_2d(
+                    "spectrum",
                     spectrum_array.dim(),
                     spectrum_array.iter().copied(),
-                    &time_axis,
-                    &frequency_axis,
                 )?;
-            }
+                Some(npz)
+            } else {
+                None
+            };
             let mut lag_data = Array::zeros((usable_rows, effective_fft_point as usize));
             let fft_point_usize = effective_fft_point as usize;
             for (i, row) in spectrum_array.rows().into_iter().enumerate() {
@@ -898,21 +910,11 @@ pub fn process_cor_file(
             let delay_axis: Vec<f64> = (0..fft_point_usize)
                 .map(|index| -(fft_point_usize as f64 / 2.0) + 1.0 + index as f64)
                 .collect();
-            if args.npz {
-                let lag_npy = output_path_lag.with_extension("npz");
-                write_real_2d(
-                    &lag_npy,
-                    NpyMeta::new(
-                        "dynamic_spectrum_lag",
-                        effective_fft_point as u32,
-                        processing_header.number_of_sector as u32,
-                    )
-                    .axes("time", "s", "delay", "sample"),
-                    lag_data.dim(),
-                    lag_data.iter().copied(),
-                    &time_axis,
-                    &delay_axis,
-                )?;
+            if let Some(mut npz) = dynamic_npz {
+                npz.add_f64_1d("delay_sample", &delay_axis);
+                npz.add_f32_2d("lag_amplitude", lag_data.dim(), lag_data.iter().copied())?;
+                npz.write(&output_path_freq.with_extension("npz"))?;
+                let _ = fs::remove_file(output_path_lag.with_extension("npz"));
             }
         }
 
@@ -957,8 +959,13 @@ pub fn process_cor_file(
 
             add_plot_amp.push(analysis_results.delay_max_amp * 100.0);
             add_plot_phase.push(analysis_results.delay_phase);
-            add_plot_times.push(current_obs_time);
-            wwz_times_sec.push(read_skip as f32 * effective_integ_time);
+            add_plot_times.push(phase_obs_time);
+            wwz_times_sec.push(
+                phase_obs_time
+                    .signed_duration_since(file_start_time)
+                    .num_milliseconds() as f32
+                    / 1000.0,
+            );
             let phase_rad = analysis_results.delay_phase.to_radians();
             let complex_sample = Complex::from_polar(analysis_results.delay_max_amp, phase_rad);
             add_plot_complex.push(complex_sample);
@@ -1062,7 +1069,7 @@ pub fn process_cor_file(
             }
 
             if args.add_plot || args.stfft > 0 {
-                add_plot_times.push(current_obs_time);
+                add_plot_times.push(phase_obs_time);
                 add_plot_amp.push(analysis_results.freq_max_amp * 100.0);
                 add_plot_snr.push(analysis_results.freq_snr);
                 add_plot_phase.push(analysis_results.freq_phase);
@@ -1120,19 +1127,19 @@ pub fn process_cor_file(
                         .map(|&v| v as f64)
                         .collect();
                     let npz_path = npz_sidecar_path(&output_filename, "plot_delay_rate");
-                    write_complex_2d(
-                        &npz_path,
-                        NpyMeta::new(
-                            "plot_delay_rate",
-                            effective_fft_point as u32,
-                            processing_header.number_of_sector as u32,
-                        )
-                        .axes("fringe_rate", "Hz", "delay", "sample"),
+                    let mut npz = NamedNpz::new(NpyMeta::new(
+                        "plot_delay_rate",
+                        effective_fft_point as u32,
+                        processing_header.number_of_sector as u32,
+                    ));
+                    npz.add_f64_1d("rate_hz", &rate_axis);
+                    npz.add_f64_1d("delay_sample", &delay_axis);
+                    npz.add_complex64_2d(
+                        "delay_rate",
                         delay_rate_2d_data_comp.dim(),
                         delay_rate_2d_data_comp.iter().copied(),
-                        &rate_axis,
-                        &delay_axis,
                     )?;
+                    npz.write(&npz_path)?;
                 } else if args.npz {
                     if let Some(freq_rate) = freq_rate_array.as_ref() {
                         let frequency_axis: Vec<f64> = analysis_results
@@ -1146,24 +1153,19 @@ pub fn process_cor_file(
                             .map(|&v| v as f64)
                             .collect();
                         let npz_path = npz_sidecar_path(&output_filename, "plot_freq_rate");
-                        write_complex_2d(
-                            &npz_path,
-                            NpyMeta::new(
-                                "plot_freq_rate",
-                                effective_fft_point as u32,
-                                processing_header.number_of_sector as u32,
-                            )
-                            .axes(
-                                "frequency",
-                                "MHz",
-                                "fringe_rate",
-                                "Hz",
-                            ),
+                        let mut npz = NamedNpz::new(NpyMeta::new(
+                            "plot_freq_rate",
+                            effective_fft_point as u32,
+                            processing_header.number_of_sector as u32,
+                        ));
+                        npz.add_f64_1d("frequency_mhz", &frequency_axis);
+                        npz.add_f64_1d("rate_hz", &rate_axis);
+                        npz.add_complex64_2d(
+                            "freq_rate",
                             freq_rate.dim(),
                             freq_rate.iter().copied(),
-                            &frequency_axis,
-                            &rate_axis,
                         )?;
+                        npz.write(&npz_path)?;
                     }
                 }
 

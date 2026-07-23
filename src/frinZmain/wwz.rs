@@ -1,5 +1,5 @@
 use crate::args::Args;
-use crate::npy_output::{write_real_1d, write_real_2d, NpyMeta};
+use crate::npy_output::{NamedNpz, NpyMeta};
 use crate::output::generate_output_names;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
@@ -103,14 +103,7 @@ pub fn write_wwz_outputs(
         match compute_wwz(&elapsed_times, &current_series.values) {
             Ok(transform) => {
                 if args.npz {
-                    write_wwz_grid_npz(
-                        &output_dir,
-                        &base_filename,
-                        &current_series,
-                        &transform,
-                        result,
-                    )?;
-                    write_wwz_ridge_npz(
+                    write_wwz_npz(
                         &output_dir,
                         &base_filename,
                         &current_series,
@@ -444,86 +437,55 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
-fn write_wwz_grid_npz(
+fn write_wwz_npz(
     output_dir: &Path,
     base_filename: &str,
     series: &WwzSeries<'_>,
     transform: &WwzTransform,
     result: &ProcessResult,
 ) -> Result<(), Box<dyn Error>> {
-    let legacy_path = output_dir.join(format!("{}_wwz_{}.tsv", base_filename, series.suffix));
-    let _ = fs::remove_file(legacy_path);
-    let shape = transform.wwz.dim();
-    let grids = [
-        (format!("wwz_{}", series.suffix), &transform.wwz),
-        (format!("wwa_{}", series.suffix), &transform.wwa),
-        (format!("wwz_neff_{}", series.suffix), &transform.n_eff),
-    ];
-    for (flag, grid) in grids {
-        write_real_2d(
-            &output_dir.join(format!("{}_{}.npz", base_filename, flag)),
-            NpyMeta::new(
-                &flag,
-                result.header.fft_point as u32,
-                result.header.number_of_sector as u32,
-            )
-            .axes("time", "s", "frequency", "Hz"),
-            shape,
-            grid.iter().map(|&value| value as f32),
-            &transform.tau,
-            &transform.freq,
-        )?;
+    let _ =
+        fs::remove_file(output_dir.join(format!("{}_wwz_{}.tsv", base_filename, series.suffix)));
+    let _ = fs::remove_file(
+        output_dir.join(format!("{}_wwz_{}_ridge.tsv", base_filename, series.suffix)),
+    );
+    for legacy in [
+        format!("{}_wwz_{}.npz", base_filename, series.suffix),
+        format!("{}_wwa_{}.npz", base_filename, series.suffix),
+        format!("{}_wwz_neff_{}.npz", base_filename, series.suffix),
+        format!("{}_wwz_{}_ridge_power.npz", base_filename, series.suffix),
+        format!("{}_wwz_{}_ridge_period.npz", base_filename, series.suffix),
+    ] {
+        let _ = fs::remove_file(output_dir.join(legacy));
     }
-    Ok(())
-}
-
-fn write_wwz_ridge_npz(
-    output_dir: &Path,
-    base_filename: &str,
-    series: &WwzSeries<'_>,
-    transform: &WwzTransform,
-    result: &ProcessResult,
-) -> Result<(), Box<dyn Error>> {
-    let legacy_path = output_dir.join(format!("{}_wwz_{}_ridge.tsv", base_filename, series.suffix));
-    let _ = fs::remove_file(legacy_path);
-    let ridge_values: Vec<f32> = transform
-        .peak_power
-        .iter()
-        .map(|&value| value as f32)
-        .collect();
-    write_real_1d(
-        &output_dir.join(format!(
-            "{}_wwz_{}_ridge_power.npz",
-            base_filename, series.suffix
-        )),
-        NpyMeta::new(
-            &format!("wwz_{}_ridge", series.suffix),
-            result.header.fft_point as u32,
-            result.header.number_of_sector as u32,
-        )
-        .axes("time", "s", "peak_wwz", ""),
-        &ridge_values,
-        &transform.tau,
+    let mut npz = NamedNpz::new(NpyMeta::new(
+        &format!("wwz_{}", series.suffix),
+        result.header.fft_point as u32,
+        result.header.number_of_sector as u32,
+    ));
+    npz.add_f64_1d("time_s", &transform.tau);
+    npz.add_f64_1d("frequency_hz", &transform.freq);
+    npz.add_f64_1d("period_s", &transform.period);
+    npz.add_f32_2d(
+        "wwz_power",
+        transform.wwz.dim(),
+        transform.wwz.iter().map(|&v| v as f32),
     )?;
-    let ridge_period: Vec<f32> = transform
-        .peak_period
-        .iter()
-        .map(|&value| value as f32)
-        .collect();
-    write_real_1d(
-        &output_dir.join(format!(
-            "{}_wwz_{}_ridge_period.npz",
-            base_filename, series.suffix
-        )),
-        NpyMeta::new(
-            &format!("wwz_{}_ridge_period", series.suffix),
-            result.header.fft_point as u32,
-            result.header.number_of_sector as u32,
-        )
-        .axes("time", "s", "peak_period", "s"),
-        &ridge_period,
-        &transform.tau,
+    npz.add_f32_2d(
+        "wwa_amplitude",
+        transform.wwa.dim(),
+        transform.wwa.iter().map(|&v| v as f32),
     )?;
+    npz.add_f32_2d(
+        "effective_n",
+        transform.n_eff.dim(),
+        transform.n_eff.iter().map(|&v| v as f32),
+    )?;
+    let ridge_power: Vec<f64> = transform.peak_power.clone();
+    let ridge_period_s: Vec<f64> = transform.peak_period.clone();
+    npz.add_f64_1d("ridge_power", &ridge_power);
+    npz.add_f64_1d("ridge_period_s", &ridge_period_s);
+    npz.write(&output_dir.join(format!("{}_wwz_{}.npz", base_filename, series.suffix)))?;
     Ok(())
 }
 

@@ -58,12 +58,30 @@ pub fn run_inbeam_vlbi_analysis(
         return run_acel_search_analysis(args, &degrees, time_flag_ranges, pp_flag_ranges);
     }
 
-    let result = process_cor_file(input_path, args, time_flag_ranges, pp_flag_ranges, false)?;
+    // In-beam is an output-producing workflow, not only an output-directory switch.
+    // Enable its standard per-scan products without requiring three extra CLI flags.
+    let mut workflow_args = args.clone();
+    workflow_args.plot = true;
+    workflow_args.output = true;
+    workflow_args.add_plot = true;
+    if workflow_args.primary_search_mode().is_none() {
+        workflow_args.search = vec!["peak".to_string()];
+        workflow_args.rate_padding = 8;
+        workflow_args.iter = 4;
+    }
+
+    let result = process_cor_file(
+        input_path,
+        &workflow_args,
+        time_flag_ranges,
+        pp_flag_ranges,
+        false,
+    )?;
     let parent_dir = input_path.parent().unwrap_or_else(|| Path::new(""));
     let inbeam_dir = parent_dir.join("frinZ").join("inbeamVLBI");
-    write_cumulate_outputs(args, &result, &inbeam_dir)?;
-    let base_filename = write_add_plot_outputs(args, &result, &inbeam_dir)?;
-    write_wwz_outputs(args, &result, &inbeam_dir)?;
+    write_cumulate_outputs(&workflow_args, &result, &inbeam_dir)?;
+    let base_filename = write_add_plot_outputs(&workflow_args, &result, &inbeam_dir)?;
+    write_wwz_outputs(&workflow_args, &result, &inbeam_dir)?;
 
     if args.allan_deviance {
         utils::write_allan_deviation_outputs(

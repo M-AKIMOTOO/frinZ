@@ -141,16 +141,13 @@ frinZ --input data.cor --skip 10
 
 #### Phase Reference Analysis
 ```bash
-# Basic phase referencing (calibrator, target)
-frinZ --phase-reference cal.cor target.cor
+# 110 m baseline: global quadratic phase model
+frinZ --phase-reference poly2 cal.cor target.cor
 
-# With fit_spec and custom integration times
-frinZ --phase-reference cal.cor target.cor 2 60 120 3
-# Arguments: calibrator target fit_spec cal_length target_length loop
-# fit_spec: <deg>, sin, <deg>+sin, <deg>+sin:<period_sec>
-# With polynomial degree and custom integration times
-frinZ --phase-reference cal.cor target.cor 2 60 120 3
-# Arguments: calibrator target fit_degree cal_length target_length loop
+# VLBI: quadratic trend plus locally interpolated atmospheric residual
+frinZ --phase-reference hybrid cal.cor target.cor 60 120 3
+# Arguments: mode calibrator target cal_length target_length loop
+# Modes: poly2, linear, nearest, hybrid
 ```
 
 ### Analysis Options
@@ -243,7 +240,7 @@ frinZ --input data.cor \
 
 #### Phase Reference with Custom Parameters
 ```bash
-frinZ --phase-reference cal.cor target.cor 1 30 60 5 \
+frinZ --phase-reference linear cal.cor target.cor 30 60 5 \
   --search --plot --output
 ```
 
@@ -409,7 +406,7 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 
 ### Required Arguments (one of)
 - `--input <FILE>`: Single .cor file for analysis
-- `--phase-reference <CAL> <TARGET> [OPTIONS]`: Phase referencing mode
+- `--phase-reference <MODE> <CAL> <TARGET> [CAL_LENGTH TGT_LENGTH LOOP]`: Phase referencing mode
 
 ### Time Parameters
 - `--length <SECONDS>`: Integration time (default: entire file)

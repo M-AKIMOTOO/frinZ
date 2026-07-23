@@ -31,6 +31,7 @@ impl<'a> NpyMeta<'a> {
             axis1_unit: "",
         }
     }
+    #[allow(dead_code)]
     pub fn axes(mut self, n0: &'a str, u0: &'a str, n1: &'a str, u1: &'a str) -> Self {
         self.axis0_name = n0;
         self.axis0_unit = u0;
@@ -54,6 +55,7 @@ pub fn npz_sidecar_path(output_path: &Path, flag: &str) -> PathBuf {
     }
 }
 
+#[allow(dead_code)]
 pub fn write_complex_1d(
     path: &Path,
     meta: NpyMeta<'_>,
@@ -70,6 +72,7 @@ pub fn write_complex_1d(
         &[],
     )
 }
+#[allow(dead_code)]
 pub fn write_real_1d(
     path: &Path,
     meta: NpyMeta<'_>,
@@ -86,6 +89,7 @@ pub fn write_real_1d(
         &[],
     )
 }
+#[allow(dead_code)]
 pub fn write_complex_2d(
     path: &Path,
     meta: NpyMeta<'_>,
@@ -106,6 +110,7 @@ pub fn write_complex_2d(
         axis1,
     )
 }
+#[allow(dead_code)]
 pub fn write_real_2d(
     path: &Path,
     meta: NpyMeta<'_>,
@@ -126,6 +131,179 @@ pub fn write_real_2d(
         axis1,
     )
 }
+
+#[allow(dead_code)]
+pub struct NamedNpz {
+    entries: Vec<(String, Vec<u8>)>,
+}
+
+#[allow(dead_code)]
+impl NamedNpz {
+    pub fn new(meta: NpyMeta<'_>) -> Self {
+        let u32_payload = |values: &[u32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let text_entry = |name: &str, value: &str| {
+            (
+                name.to_string(),
+                make_npy("|u1", &[value.len()], value.as_bytes()),
+            )
+        };
+        Self {
+            entries: vec![
+                text_entry("flag.npy", meta.flag),
+                (
+                    "fft_point.npy".to_string(),
+                    make_npy("<u4", &[1], &u32_payload(&[meta.fft_point])),
+                ),
+                (
+                    "pp.npy".to_string(),
+                    make_npy("<u4", &[1], &u32_payload(&[meta.pp])),
+                ),
+                (
+                    "format_version.npy".to_string(),
+                    make_npy("<u4", &[1], &u32_payload(&[FORMAT_VERSION])),
+                ),
+            ],
+        }
+    }
+
+    pub fn add_f64_1d(&mut self, name: &str, values: &[f64]) {
+        let payload = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("<f8", &[values.len()], &payload),
+        ));
+    }
+
+    pub fn add_f32_1d(&mut self, name: &str, values: &[f32]) {
+        let payload = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("<f4", &[values.len()], &payload),
+        ));
+    }
+
+    pub fn add_u8_1d(&mut self, name: &str, values: &[u8]) {
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("|u1", &[values.len()], values),
+        ));
+    }
+
+    pub fn add_complex64_1d(&mut self, name: &str, values: &[num_complex::Complex<f32>]) {
+        let mut payload = Vec::with_capacity(values.len() * 8);
+        for value in values {
+            payload.extend_from_slice(&value.re.to_le_bytes());
+            payload.extend_from_slice(&value.im.to_le_bytes());
+        }
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("<c8", &[values.len()], &payload),
+        ));
+    }
+
+    pub fn add_f32_2d(
+        &mut self,
+        name: &str,
+        shape: (usize, usize),
+        values: impl IntoIterator<Item = f32>,
+    ) -> io::Result<()> {
+        let values: Vec<f32> = values.into_iter().collect();
+        validate_len(values.len(), shape)?;
+        let payload = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("<f4", &[shape.0, shape.1], &payload),
+        ));
+        Ok(())
+    }
+
+    pub fn add_complex64_2d(
+        &mut self,
+        name: &str,
+        shape: (usize, usize),
+        values: impl IntoIterator<Item = num_complex::Complex<f32>>,
+    ) -> io::Result<()> {
+        let values: Vec<num_complex::Complex<f32>> = values.into_iter().collect();
+        validate_len(values.len(), shape)?;
+        let mut payload = Vec::with_capacity(values.len() * 8);
+        for value in values {
+            payload.extend_from_slice(&value.re.to_le_bytes());
+            payload.extend_from_slice(&value.im.to_le_bytes());
+        }
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("<c8", &[shape.0, shape.1], &payload),
+        ));
+        Ok(())
+    }
+
+    pub fn write(self, path: &Path) -> io::Result<()> {
+        write_npz(path, &self.entries)
+    }
+}
+
+pub fn write_named_real_1d_npz(
+    path: &Path,
+    meta: NpyMeta<'_>,
+    series: &[(&str, &[f64])],
+) -> io::Result<()> {
+    let u32_payload = |values: &[u32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    let text_entry = |name: &str, value: &str| {
+        (
+            name.to_string(),
+            make_npy("|u1", &[value.len()], value.as_bytes()),
+        )
+    };
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(series.len() + 5);
+    for (name, values) in series {
+        let payload = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>();
+        entries.push((
+            format!("{name}.npy"),
+            make_npy("<f8", &[values.len()], &payload),
+        ));
+    }
+    entries.push(text_entry("flag.npy", meta.flag));
+    entries.push((
+        "fft_point.npy".to_string(),
+        make_npy("<u4", &[1], &u32_payload(&[meta.fft_point])),
+    ));
+    entries.push((
+        "pp.npy".to_string(),
+        make_npy("<u4", &[1], &u32_payload(&[meta.pp])),
+    ));
+    entries.push((
+        "format_version.npy".to_string(),
+        make_npy("<u4", &[1], &u32_payload(&[FORMAT_VERSION])),
+    ));
+    entries.push((
+        "series_count.npy".to_string(),
+        make_npy("<u4", &[1], &u32_payload(&[series.len() as u32])),
+    ));
+    write_npz(path, &entries)
+}
+
 fn validate_len(len: usize, shape: (usize, usize)) -> io::Result<()> {
     if len != shape.0.saturating_mul(shape.1) {
         Err(io::Error::new(

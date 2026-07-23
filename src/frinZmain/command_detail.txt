@@ -3,7 +3,7 @@
 ============================================================
 
 [基本モード]
-  --in-beam                          in-beam VLBI 用の標準 delay-rate 解析フローで実行（出力先: frinZ/inbeamVLBI/ 直下）
+  --in-beam                          in-beam VLBI 用の標準 delay-rate 解析フロー。plot/text/時系列を frinZ/inbeamVLBI/ に自動出力
                                      --plot 時は全面 delay-rate ヒートマップ表示
   --search [peak|deep|deep2|rate|acel]
                                      デフォルト peak（deep2 は coarse 後に rate/delay 軸を交互探索）
@@ -32,11 +32,11 @@
   --flagging pp START END ...        セクターをゼロ詰め
 
 [解析バリエーション]
-  --closure-phase f1 f2 f3 [refant:NAME]
   --stfft HOPS             Short-time FFT hop (--length: window, --loop: windows)
-       3 基線のクロージャー位相。デフォルト refant=YAMAGU32。
-  --phase-reference CAL TARGET [fit_spec cal_len tgt_len loop]
-       fit_spec: <deg>, sin, <deg>+sin, <deg>+sin:<period_sec>
+  --closure-phase FILE1 FILE2 FILE3
+       第1ファイルの第1アンテナを基準とする3基線クロージャー位相。
+  --phase-reference MODE CAL TARGET [cal_len tgt_len loop]
+       MODE: poly2（全体二次）, linear（前後scan線形補間）, nearest（最近傍）, hybrid（二次trend＋残差線形補間）
   --maser key:val...（メーザー解析）
        off:<path>           OFF ソース .cor
        off:linear           OFF無し時、band/subt 範囲でロバスト直線ベースライン推定
@@ -105,5 +105,5 @@
 [使い方例]
   frinZ --in data.cor --len 60 --plot
   frinZ --in data.cor --search deep --rfi 100,120
-  frinZ --closure-phase b12.cor b23.cor b13.cor refant:ANT1
-  frinZ --phase-reference cal.cor tgt.cor 1+sin:3600 30 30 1 --plot --output
+  frinZ --closure-phase b12.cor b23.cor b13.cor
+  frinZ --phase-reference hybrid cal.cor tgt.cor 30 30 1 --plot --output

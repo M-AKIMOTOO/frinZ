@@ -8,7 +8,6 @@ use std::process::exit;
 use chrono::{DateTime, Utc};
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 use num_complex::Complex;
-use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 
 mod analysis;
@@ -50,7 +49,7 @@ mod wwz;
 use crate::args::{check_memory_usage, Args};
 use crate::bispectrum::run_closure_phase_analysis;
 use crate::earth_rotation_imaging::{
-    parse_imaging_cli_options, perform_imaging, run_earth_rotation_imaging, Visibility,
+    parse_imaging_cli_options, run_earth_rotation_imaging, run_imaging_test,
 };
 use crate::folding::run_folding_analysis;
 use crate::frmap::run_fringe_rate_map_analysis;
@@ -153,68 +152,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !matches!(args.rate_padding, 1 | 2 | 4 | 8) {
         eprintln!("Error: --rate-padding must be one of 1, 2, 4, or 8.");
         exit(1);
-    }
-
-    if args.imaging_test {
-        println!("Running Earth-rotation synthesis imaging test...");
-
-        // --- Create Sample Visibility Data ---
-        // Simulate a point source at (l, m) = (5.0e-5, 0.0) radians
-        // V(u,v) = 1.0 * exp(-2*pi*i * (u*l + v*m))
-        // Since m=0, V(u,v) = cos(2*pi*u*l) - i*sin(2*pi*u*l)
-        let mut vis_data: Vec<Visibility> = Vec::new();
-        let l0 = 5.0e-5; // offset in l-direction
-        let num_points = 100;
-        let max_uv = 5000.0; // 5k wavelengths
-
-        for i in 0..num_points {
-            let angle = (i as f64 / num_points as f64) * 2.0 * PI; // Simulate Earth rotation
-            let u = max_uv * angle.cos();
-            let v = max_uv * angle.sin();
-
-            let phase = -2.0 * PI * u * l0;
-            let real = phase.cos();
-            let imag = phase.sin();
-
-            vis_data.push(Visibility {
-                u,
-                v,
-                w: 0.0,
-                real,
-                imag,
-                weight: 1.0,
-                time: i as f64,
-            });
-        }
-
-        // --- Set Imaging Parameters ---
-        let image_size = 256; // 256x256 pixels
-        let cell_size = 0.1; // 0.1 arcsec/pixel
-
-        // --- Perform Imaging ---
-        match perform_imaging(&vis_data, image_size, cell_size) {
-            Ok(dirty_image) => {
-                println!(
-                    "Imaging successful! Dirty image size: {}x{}",
-                    image_size, image_size
-                );
-                // For verification, let's print a small center patch of the image
-                println!("Center 5x5 patch of the dirty image (real part):");
-                let center = image_size / 2;
-                for r in (center - 2)..=(center + 2) {
-                    for c in (center - 2)..=(center + 2) {
-                        let index = r * image_size + c;
-                        print!("{:8.4} ", dirty_image[index]);
-                    }
-                    println!();
-                }
-            }
-            Err(e) => {
-                eprintln!("Error during imaging: {}", e);
-                exit(1);
-            }
-        }
-        return Ok(());
     }
 
     if args.cor2bin {
@@ -486,42 +423,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(cp_tokens) = &args.closure_phase {
-        if cp_tokens.len() < 3 {
-            eprintln!("Error: --closure-phase requires at least three .cor files.");
-            exit(1);
-        }
-        let mut paths = Vec::new();
-        let mut refant_name = String::from("YAMAGU32");
-        for token in cp_tokens {
-            if token.starts_with("refant:") {
-                refant_name = token["refant:".len()..].trim().to_string();
-            } else if paths.len() < 3 {
-                paths.push(PathBuf::from(token));
-            } else {
-                eprintln!("Error: Unknown --closure-phase option '{}'.", token);
-                exit(1);
-            }
-        }
-        if paths.len() != 3 {
+        if cp_tokens.len() != 3 {
             eprintln!("Error: --closure-phase requires exactly three .cor files.");
             exit(1);
         }
+        let paths: Vec<PathBuf> = cp_tokens.iter().map(PathBuf::from).collect();
         for path in &paths {
             if !check_memory_usage(&args, path)? {
                 exit(0);
             }
         }
-        run_closure_phase_analysis(
-            &args,
-            &paths,
-            &time_flag_ranges,
-            &pp_flag_ranges,
-            &refant_name,
-        )?;
+        run_closure_phase_analysis(&args, &paths, &time_flag_ranges, &pp_flag_ranges)?;
         return Ok(());
     }
 
     if let Some(imaging_tokens) = args.imaging.as_ref() {
+        if imaging_tokens.len() == 1 && imaging_tokens[0].eq_ignore_ascii_case("test") {
+            return run_imaging_test();
+        }
         if args.input.is_none() {
             eprintln!("Error: --imaging requires an --input file.");
             exit(1);
@@ -626,11 +545,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if !args.phase_reference.is_empty() {
-        let cal_path = std::path::PathBuf::from(&args.phase_reference[0]);
+        let cal_path = std::path::PathBuf::from(&args.phase_reference[1]);
         if !check_memory_usage(&args, &cal_path)? {
             exit(0);
         }
-        let target_path = std::path::PathBuf::from(&args.phase_reference[1]);
+        let target_path = std::path::PathBuf::from(&args.phase_reference[2]);
         if !check_memory_usage(&args, &target_path)? {
             exit(0);
         }

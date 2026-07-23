@@ -15,7 +15,7 @@ use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
 use crate::header::parse_header;
 use crate::input_support::open_input_data;
-use crate::npy_output::{npz_sidecar_path, write_complex_1d, write_real_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
@@ -1045,45 +1045,21 @@ pub fn run_folding_analysis(
             .map(|bin| C32::new(bin.mean_complex.re as f32, bin.mean_complex.im as f32))
             .collect();
         let phase_axis: Vec<f64> = profile.iter().map(|bin| bin.phase_center).collect();
-        let profile_npy_path = npz_sidecar_path(&profile_png_path, "folding");
-        write_complex_1d(
-            &profile_npy_path,
-            NpyMeta::new(
-                "folding",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("pulse_phase", "turn", "complex_visibility", ""),
-            &profile_complex,
-            &phase_axis,
-        )?;
         let count_values: Vec<f32> = profile.iter().map(|bin| bin.count as f32).collect();
-        write_real_1d(
-            &output_dir.join(format!("{stem}_folding_count.npz")),
-            NpyMeta::new(
-                "folding_count",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("pulse_phase", "turn", "count", "sample"),
-            &count_values,
-            &phase_axis,
-        )?;
-        let on_bin_values: Vec<f32> = profile
-            .iter()
-            .map(|bin| if bin.on_bin { 1.0 } else { 0.0 })
-            .collect();
-        write_real_1d(
-            &output_dir.join(format!("{stem}_folding_on_bin.npz")),
-            NpyMeta::new(
-                "folding_on_bin",
-                header.fft_point as u32,
-                header.number_of_sector as u32,
-            )
-            .axes("pulse_phase", "turn", "on_bin", "bool"),
-            &on_bin_values,
-            &phase_axis,
-        )?;
+        let on_bin_values: Vec<u8> = profile.iter().map(|bin| u8::from(bin.on_bin)).collect();
+        let profile_npy_path = npz_sidecar_path(&profile_png_path, "folding");
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "folding",
+            header.fft_point as u32,
+            header.number_of_sector as u32,
+        ));
+        npz.add_f64_1d("pulse_phase_turn", &phase_axis);
+        npz.add_complex64_1d("profile", &profile_complex);
+        npz.add_f32_1d("count_sample", &count_values);
+        npz.add_u8_1d("on_bin_bool", &on_bin_values);
+        npz.write(&profile_npy_path)?;
+        let _ = fs::remove_file(output_dir.join(format!("{stem}_folding_count.npz")));
+        let _ = fs::remove_file(output_dir.join(format!("{stem}_folding_on_bin.npz")));
         println!("Folding NPZ data saved to {}", profile_npy_path.display());
     }
 

@@ -559,10 +559,11 @@ mod deep {
     use crate::analysis::{analyze_results, AnalysisResults};
     use crate::args::Args;
     use crate::bandpass::apply_bandpass_correction;
-    use crate::fft::{process_fft, process_fft_with_phase_correction, process_ifft};
+    use crate::fft::{
+        cached_fft_plan, process_fft, process_fft_with_phase_correction, process_ifft,
+    };
     use crate::header::CorHeader;
     use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, positive_or_epsilon, rate_cal};
-    use rustfft::FftPlanner;
 
     type C32 = Complex<f32>;
 
@@ -769,7 +770,7 @@ mod deep {
             &self,
             final_delay: f32,
             final_rate: f32,
-            algorithm: DeepSearchAlgorithm,
+            _algorithm: DeepSearchAlgorithm,
         ) -> Result<
             (
                 AnalysisResults,
@@ -781,7 +782,13 @@ mod deep {
         > {
             let (mut final_freq_rate_array, padding_length) =
                 self.fft_for_correction(final_delay, final_rate);
-            let final_args = create_corrected_args(self.args, final_delay, final_rate);
+            let mut final_args = create_corrected_args(self.args, final_delay, final_rate);
+            // The final candidate has already applied the full correction. Measure
+            // amplitude and phase at residual delay=rate=0, independent of the
+            // absolute search windows or masks used to select the candidate.
+            final_args.drange.clear();
+            final_args.rrange.clear();
+            final_args.mask.clear();
 
             let pre_bandpass_analysis_results = if self.args.plot && self.bandpass_data.is_some() {
                 let pre_bandpass_delay_rate_2d_data_comp = process_ifft(
@@ -798,7 +805,7 @@ mod deep {
                     self.current_obs_time,
                     padding_length,
                     &final_args,
-                    Some(algorithm.mode_name()),
+                    None,
                 ))
             } else {
                 None
@@ -819,11 +826,15 @@ mod deep {
                 self.current_obs_time,
                 padding_length,
                 &final_args,
-                Some(algorithm.mode_name()),
+                None,
             );
 
             analysis_results.residual_delay = final_delay;
-            analysis_results.residual_rate = final_rate;
+            analysis_results.residual_rate = if self.physical_length <= 1 {
+                0.0
+            } else {
+                final_rate
+            };
             analysis_results.length_f32 = self.physical_length as f32 * self.effective_integ_time;
 
             Ok((
@@ -947,13 +958,13 @@ mod deep {
         physical_length: i32,
         effective_integ_time: f32,
         current_obs_time: &DateTime<Utc>,
-        obs_time: &DateTime<Utc>,
+        _obs_time: &DateTime<Utc>,
         rfi_ranges: &[(usize, usize)],
         bandpass_data: &Option<Vec<C32>>,
         args: &Args,
-        pp: i32,
+        _pp: i32,
         cpu_count_arg: u32,
-        previous_solution: Option<(f32, f32)>,
+        _previous_solution: Option<(f32, f32)>,
         algorithm: DeepSearchAlgorithm,
     ) -> Result<DeepSearchResult, Box<dyn Error>> {
         /*
@@ -1017,28 +1028,20 @@ mod deep {
             algorithm,
         };
 
-        // Step 1: 粗い遅延・レート推定
-        let seed_solution = previous_solution.or_else(|| {
-            (args.delay_correct != 0.0 || args.rate_correct != 0.0)
-                .then_some((args.delay_correct, args.rate_correct))
-        });
-        let (coarse_delay, coarse_rate) = if let Some((prev_delay, prev_rate)) = seed_solution {
-            /*
-            println!(
-                "[{}] Seeding from previous solution: delay={:.6}, rate={:.6}",
-                algorithm.log_name(),
-                prev_delay,
-                prev_rate
-            );
-            */
-            (prev_delay, prev_rate)
+        let is_autocorrelation = is_autocorrelation_header(header);
+
+        // Step 1: Reacquire a coarse solution for every segment. A previous
+        // segment is not a safe sole seed when acceleration or atmospheric
+        // fluctuations move the fringe by more than the fine-search window.
+        //
+        // For auto-correlation the physical delay and fringe rate are exactly
+        // zero. Optimizing the delay/rate plane can otherwise fit tiny spectral
+        // amplitude asymmetries or numerical interpolation noise and report a
+        // non-physical offset. Keep the search path active, but make its
+        // candidate solution the exact auto-correlation solution.
+        let (coarse_delay, coarse_rate) = if is_autocorrelation {
+            (0.0, 0.0)
         } else {
-            /*
-            println!(
-                "[{}] Running coarse grid search for initial estimate",
-                algorithm.log_name()
-            );
-            */
             context.coarse_estimates(algorithm)?
         };
 
@@ -1056,56 +1059,50 @@ mod deep {
         search_params.max_iterations = (args.iter.max(1)) as usize;
         let mut current_delay = coarse_delay;
         let mut current_rate = coarse_rate;
+        let rate_denominator =
+            physical_length.max(1) as f32 * effective_integ_time.abs().max(1.0e-9);
         let effective_cpu_count = determine_effective_cpu_count(cpu_count_arg);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(effective_cpu_count)
             .build()?;
 
-        for iteration in 0..search_params.max_iterations {
-            /*
-            println!(
-                "[{}] Iteration {} starting",
-                algorithm.log_name(),
-                iteration + 1
-            );
-            */
+        if !is_autocorrelation {
+            for iteration in 0..search_params.max_iterations {
+                /*
+                println!(
+                    "[{}] Iteration {} starting",
+                    algorithm.log_name(),
+                    iteration + 1
+                );
+                */
 
-            // 現在の階層での探索範囲とステップサイズを計算
-            let scale_factor = 10.0_f32.powi(iteration as i32);
-            let delay_range = search_params.delay_search_range / scale_factor;
-            let rate_range =
-                search_params.rate_search_range_factor / (2.0 * pp as f32) / scale_factor;
-            let delay_step = search_params.delay_fine_step / scale_factor;
-            let rate_step = search_params.rate_fine_step_factor / (10.0 * pp as f32) / scale_factor;
+                // 現在の階層での探索範囲とステップサイズを計算
+                let scale_factor = 10.0_f32.powi(iteration as i32);
+                let delay_range = search_params.delay_search_range / scale_factor;
+                let rate_range = search_params.rate_search_range_factor
+                    / (2.0 * rate_denominator)
+                    / scale_factor;
+                let delay_step = search_params.delay_fine_step / scale_factor;
+                let rate_step =
+                    search_params.rate_fine_step_factor / (10.0 * rate_denominator) / scale_factor;
 
-            /*
-            println!(
-                "[{}]   Delay range: +/- {:.6} samples, step: {:.6}",
-                algorithm.log_name(),
-                delay_range,
-                delay_step
-            );
-            println!(
-                "[{}]   Rate range: +/- {:.6} Hz, step: {:.6}",
-                algorithm.log_name(),
-                rate_range,
-                rate_step
-            );
-            */
-
-            let (best_delay, best_rate, best_snr) = match algorithm {
-                DeepSearchAlgorithm::FullGrid => parallel_grid_search(
-                    &context,
-                    current_delay,
-                    current_rate,
+                /*
+                println!(
+                    "[{}]   Delay range: +/- {:.6} samples, step: {:.6}",
+                    algorithm.log_name(),
                     delay_range,
+                    delay_step
+                );
+                println!(
+                    "[{}]   Rate range: +/- {:.6} Hz, step: {:.6}",
+                    algorithm.log_name(),
                     rate_range,
-                    delay_step,
-                    rate_step,
-                    &pool,
-                )?,
-                DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish => {
-                    parallel_axis_search(
+                    rate_step
+                );
+                */
+
+                let (best_delay, best_rate, best_snr) = match algorithm {
+                    DeepSearchAlgorithm::FullGrid => parallel_grid_search(
                         &context,
                         current_delay,
                         current_rate,
@@ -1114,34 +1111,48 @@ mod deep {
                         delay_step,
                         rate_step,
                         &pool,
-                    )?
-                }
-            };
+                    )?,
+                    DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish => {
+                        parallel_axis_search(
+                            &context,
+                            current_delay,
+                            current_rate,
+                            delay_range,
+                            rate_range,
+                            delay_step,
+                            rate_step,
+                            &pool,
+                        )?
+                    }
+                };
 
-            // 結果を更新
-            current_delay = best_delay;
-            current_rate = best_rate;
+                // 結果を更新
+                current_delay = best_delay;
+                current_rate = best_rate;
 
-            let _ = best_snr;
-            /*
-            println!(
-                "[{}]   Best result: delay={:.6} samples, rate={:.6} Hz, SNR={:.3}",
-                algorithm.log_name(),
-                current_delay,
-                current_rate,
-                best_snr
-            );
-            */
+                let _ = best_snr;
+                /*
+                println!(
+                    "[{}]   Best result: delay={:.6} samples, rate={:.6} Hz, SNR={:.3}",
+                    algorithm.log_name(),
+                    current_delay,
+                    current_rate,
+                    best_snr
+                );
+                */
+            }
         }
 
-        if matches!(
-            algorithm,
-            DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish
-        ) {
+        if !is_autocorrelation
+            && matches!(
+                algorithm,
+                DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish
+            )
+        {
             let final_scale = 10.0_f32.powi(search_params.max_iterations.saturating_sub(1) as i32);
             let final_delay_step = search_params.delay_fine_step / final_scale;
             let final_rate_step =
-                search_params.rate_fine_step_factor / (10.0 * pp as f32) / final_scale;
+                search_params.rate_fine_step_factor / (10.0 * rate_denominator) / final_scale;
             let (best_delay, best_rate, best_snr) = parallel_grid_search(
                 &context,
                 current_delay,
@@ -1192,6 +1203,26 @@ mod deep {
             delay_rate_2d_data: final_delay_rate_2d_data,
             pre_bandpass_analysis_results,
         })
+    }
+
+    fn is_autocorrelation_header(header: &CorHeader) -> bool {
+        let name1 = header.station1_name.trim();
+        let name2 = header.station2_name.trim();
+        if !name1.is_empty() && name1 == name2 {
+            return true;
+        }
+
+        let code1 = header.station1_code.trim();
+        let code2 = header.station2_code.trim();
+        if !code1.is_empty() && code1 == code2 {
+            return true;
+        }
+
+        header
+            .station1_position
+            .iter()
+            .zip(header.station2_position.iter())
+            .all(|(a, b)| (a - b).abs() < 1.0e-6)
     }
 
     fn determine_effective_cpu_count(cpu_count_arg: u32) -> usize {
@@ -1453,8 +1484,9 @@ mod deep {
             .saturating_sub(1)
             .min(fft_point_usize.saturating_sub(1));
 
-        let mut planner = FftPlanner::new();
-        let ifft = planner.plan_fft_inverse(fft_point_usize);
+        // Candidate evaluation runs many transforms of the same size. Reusing
+        // the plan avoids repeated planning and allocator pressure.
+        let ifft = cached_fft_plan(fft_point_usize, true);
         let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point_usize];
         let mut norm_sum = 0.0f32;
         let mut peak_norm = 0.0f32;

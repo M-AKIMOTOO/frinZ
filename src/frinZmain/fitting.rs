@@ -149,6 +149,11 @@ pub fn fit_polynomial_least_squares(
     degree: usize,
 ) -> Result<Vec<f64>, Box<dyn Error>> {
     let n = x_coords.len();
+    if n != y_values.len() {
+        return Err(Box::new(FittingError(
+            "Input vectors must have the same length.".to_string(),
+        )));
+    }
     if n <= degree {
         return Err(Box::new(FittingError(format!(
             "Not enough data points ({}) for a polynomial of degree {}. Need at least {} points.",
@@ -158,83 +163,49 @@ pub fn fit_polynomial_least_squares(
         ))));
     }
 
-    // Construct the Vandermonde matrix A
+    // Center and scale the abscissa before building the Vandermonde matrix.
+    // Fringe fits commonly use seconds from an absolute epoch; forming normal
+    // equations directly from those values squares an already large condition
+    // number and noticeably biases small quadratic coefficients.
+    let x_center = x_coords.iter().sum::<f64>() / n as f64;
+    let x_scale = x_coords
+        .iter()
+        .map(|x| (x - x_center).abs())
+        .fold(0.0_f64, f64::max);
+    if !x_center.is_finite() || !x_scale.is_finite() || x_scale == 0.0 {
+        return Err(Box::new(FittingError(
+            "X coordinates must be finite and span a non-zero range.".to_string(),
+        )));
+    }
+
     let mut a_data = Vec::with_capacity(n * (degree + 1));
     for &x in x_coords {
+        let normalized_x = (x - x_center) / x_scale;
         for i in 0..=degree {
-            a_data.push(x.powi(i as i32));
+            a_data.push(normalized_x.powi(i as i32));
         }
     }
     let a = DMatrix::from_row_slice(n, degree + 1, &a_data);
-
-    // Construct the y vector
     let y = DVector::from_vec(y_values.to_vec());
+    let normalized_coeffs = a
+        .svd(true, true)
+        .solve(&y, f64::EPSILON * n as f64)
+        .map_err(|message| Box::new(FittingError(message.to_string())))?;
 
-    // Solve A^T * A * coeffs = A^T * y for coeffs
-    // (A^T * A) is the normal matrix
-    let ata = a.transpose() * &a;
-    let aty = a.transpose() * y;
-
-    // Solve the linear system using LU decomposition
-    let lu = ata.lu();
-    let coeffs = lu.solve(&aty).ok_or_else(|| {
-        Box::new(FittingError(
-            "Failed to solve linear system for polynomial fitting. Matrix might be singular."
-                .to_string(),
-        ))
-    })?;
-
-    Ok(coeffs.iter().cloned().collect())
-}
-
-/// Fits y = c0 + c1*x + ... + cn*x^n + a*sin(w*x) + b*cos(w*x)
-/// using least squares. Returns coefficients in this order:
-/// [c0..cn, a_sin, b_cos].
-pub fn fit_polynomial_plus_sinusoid_least_squares(
-    x_coords: &[f64],
-    y_values: &[f64],
-    degree: usize,
-    period_sec: f64,
-) -> Result<Vec<f64>, Box<dyn Error>> {
-    let n = x_coords.len();
-    let cols = degree + 3; // poly (degree+1) + sin + cos
-    if n < cols {
-        return Err(Box::new(FittingError(format!(
-            "Not enough data points ({}) for polynomial+sin fitting with {} parameters. Need at least {} points.",
-            n, cols, cols
-        ))));
-    }
-    if !period_sec.is_finite() || period_sec <= 0.0 {
-        return Err(Box::new(FittingError(format!(
-            "Invalid sinusoid period: {}",
-            period_sec
-        ))));
-    }
-
-    let omega = 2.0 * f64::consts::PI / period_sec;
-
-    let mut a_data = Vec::with_capacity(n * cols);
-    for &x in x_coords {
-        for i in 0..=degree {
-            a_data.push(x.powi(i as i32));
+    // Convert coefficients in z=(x-x_center)/x_scale back to powers of x.
+    let mut coefficients = vec![0.0; degree + 1];
+    for power in 0..=degree {
+        let scaled = normalized_coeffs[power] / x_scale.powi(power as i32);
+        let mut binomial = 1.0;
+        for x_power in 0..=power {
+            coefficients[x_power] += scaled * binomial * (-x_center).powi((power - x_power) as i32);
+            if x_power < power {
+                binomial *= (power - x_power) as f64 / (x_power + 1) as f64;
+            }
         }
-        a_data.push((omega * x).sin());
-        a_data.push((omega * x).cos());
     }
-    let a = DMatrix::from_row_slice(n, cols, &a_data);
-    let y = DVector::from_vec(y_values.to_vec());
 
-    let ata = a.transpose() * &a;
-    let aty = a.transpose() * y;
-    let lu = ata.lu();
-    let coeffs = lu.solve(&aty).ok_or_else(|| {
-        Box::new(FittingError(
-            "Failed to solve linear system for polynomial+sin fitting. Matrix might be singular."
-                .to_string(),
-        ))
-    })?;
-
-    Ok(coeffs.iter().cloned().collect())
+    Ok(coefficients)
 }
 
 #[cfg(test)]
@@ -354,6 +325,19 @@ mod tests {
         assert!((coeffs[0] - 3.0).abs() < 1e-9); // c
         assert!((coeffs[1] - (-2.0)).abs() < 1e-9); // b
         assert!((coeffs[2] - 1.0).abs() < 1e-9); // a
+    }
+
+    #[test]
+    fn test_fit_polynomial_least_squares_with_large_time_offset() {
+        let x_coords: Vec<f64> = vec![1.0e9, 1.0e9 + 60.0, 1.0e9 + 120.0, 1.0e9 + 180.0];
+        let x0: f64 = 1.0e9;
+        let y_values: Vec<f64> = x_coords
+            .iter()
+            .map(|x| 3.0 + 0.25 * (x - x0) + 2.0e-6 * (x - x0).powi(2))
+            .collect();
+
+        let coefficients = fit_polynomial_least_squares(&x_coords, &y_values, 2).unwrap();
+        assert!((coefficients[2] - 2.0e-6).abs() < 1.0e-12);
     }
 
     #[test]

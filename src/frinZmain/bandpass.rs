@@ -41,63 +41,135 @@ pub fn read_bandpass_file(path: &std::path::Path) -> io::Result<Vec<C32>> {
 
 fn read_bandpass_npz(path: &std::path::Path) -> io::Result<Vec<C32>> {
     let archive = fs::read(path)?;
+    let entries = read_npz_entries(&archive)?;
+
+    if let Some(data_npy) = entries
+        .iter()
+        .find_map(|(name, npy)| (name == "data.npy").then_some(npy))
+    {
+        return parse_complex64_npy(data_npy);
+    }
+
+    let real_npy = entries
+        .iter()
+        .find_map(|(name, npy)| (name == "real.npy").then_some(npy))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "NPZ real.npy entry is missing")
+        })?;
+    let imag_npy = entries
+        .iter()
+        .find_map(|(name, npy)| (name == "imag.npy").then_some(npy))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "NPZ imag.npy entry is missing")
+        })?;
+    let real = parse_real_npy(real_npy)?;
+    let imag = parse_real_npy(imag_npy)?;
+    if real.len() != imag.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "real/imag length mismatch: {} != {}",
+                real.len(),
+                imag.len()
+            ),
+        ));
+    }
+    Ok(real
+        .into_iter()
+        .zip(imag)
+        .map(|(re, im)| C32::new(re, im))
+        .collect())
+}
+
+fn read_npz_entries(archive: &[u8]) -> io::Result<Vec<(String, Vec<u8>)>> {
     if archive.len() < 30 || &archive[..4] != b"PK\x03\x04" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid NPZ local header",
         ));
     }
-    let u16_at =
-        |offset: usize| u16::from_le_bytes([archive[offset], archive[offset + 1]]) as usize;
-    let u32_at = |offset: usize| {
-        u32::from_le_bytes([
-            archive[offset],
-            archive[offset + 1],
-            archive[offset + 2],
-            archive[offset + 3],
-        ]) as usize
-    };
-    let method = u16_at(8);
-    let compressed_size = u32_at(18);
-    let name_len = u16_at(26);
-    let extra_len = u16_at(28);
-    let data_start = 30_usize
-        .checked_add(name_len)
-        .and_then(|value| value.checked_add(extra_len))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NPZ offset overflow"))?;
-    let data_end = data_start
-        .checked_add(compressed_size)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NPZ size overflow"))?;
-    if data_end > archive.len() || &archive[30..30 + name_len] != b"data.npy" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "NPZ data.npy entry is missing",
-        ));
-    }
-    let npy = match method {
-        0 => archive[data_start..data_end].to_vec(),
-        8 => {
-            let mut decoder = flate2::read::DeflateDecoder::new(&archive[data_start..data_end]);
-            let mut decoded = Vec::new();
-            decoder.read_to_end(&mut decoded)?;
-            decoded
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset + 30 <= archive.len() {
+        if &archive[offset..offset + 4] == b"PK\x01\x02"
+            || &archive[offset..offset + 4] == b"PK\x05\x06"
+        {
+            break;
         }
-        _ => {
+        if &archive[offset..offset + 4] != b"PK\x03\x04" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported NPZ compression method {method}"),
-            ))
+                format!("invalid NPZ local entry signature at byte {offset}"),
+            ));
         }
-    };
+        let u16_at = |base: usize, rel: usize| {
+            u16::from_le_bytes([archive[base + rel], archive[base + rel + 1]]) as usize
+        };
+        let u32_at = |base: usize, rel: usize| {
+            u32::from_le_bytes([
+                archive[base + rel],
+                archive[base + rel + 1],
+                archive[base + rel + 2],
+                archive[base + rel + 3],
+            ]) as usize
+        };
+        let method = u16_at(offset, 8);
+        let compressed_size = u32_at(offset, 18);
+        let name_len = u16_at(offset, 26);
+        let extra_len = u16_at(offset, 28);
+        let name_start = offset + 30;
+        let name_end = name_start.checked_add(name_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "NPZ name offset overflow")
+        })?;
+        let data_start = name_end.checked_add(extra_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "NPZ data offset overflow")
+        })?;
+        let data_end = data_start
+            .checked_add(compressed_size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NPZ data size overflow"))?;
+        if data_end > archive.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NPZ entry exceeds archive length",
+            ));
+        }
+        let name = std::str::from_utf8(&archive[name_start..name_end])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "NPZ entry name is not UTF-8"))?
+            .to_string();
+        let npy = match method {
+            0 => archive[data_start..data_end].to_vec(),
+            8 => {
+                let mut decoder = flate2::read::DeflateDecoder::new(&archive[data_start..data_end]);
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded)?;
+                decoded
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported NPZ compression method {method}"),
+                ))
+            }
+        };
+        entries.push((name, npy));
+        offset = data_end;
+    }
+    Ok(entries)
+}
+
+fn npy_payload(npy: &[u8]) -> io::Result<(&str, &[u8])> {
     if npy.len() < 12 || &npy[..6] != b"\x93NUMPY" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid data.npy header",
+            "invalid NPY header",
         ));
     }
-    let payload_start = match (npy[6], npy[7]) {
-        (1, 0) => 10 + u16::from_le_bytes([npy[8], npy[9]]) as usize,
-        (2, 0) | (3, 0) => 12 + u32::from_le_bytes([npy[8], npy[9], npy[10], npy[11]]) as usize,
+    let (header_start, header_len) = match (npy[6], npy[7]) {
+        (1, 0) => (10usize, u16::from_le_bytes([npy[8], npy[9]]) as usize),
+        (2, 0) | (3, 0) => (
+            12usize,
+            u32::from_le_bytes([npy[8], npy[9], npy[10], npy[11]]) as usize,
+        ),
         version => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -105,20 +177,75 @@ fn read_bandpass_npz(path: &std::path::Path) -> io::Result<Vec<C32>> {
             ))
         }
     };
-    if payload_start > npy.len() || (npy.len() - payload_start) % 8 != 0 {
+    let payload_start = header_start
+        .checked_add(header_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NPY payload offset overflow"))?;
+    if payload_start > npy.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NPY payload starts past end of file",
+        ));
+    }
+    let header = std::str::from_utf8(&npy[header_start..payload_start])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "NPY header is not UTF-8"))?;
+    Ok((header, &npy[payload_start..]))
+}
+
+fn parse_complex64_npy(npy: &[u8]) -> io::Result<Vec<C32>> {
+    let (header, payload) = npy_payload(npy)?;
+    if !header.contains("'descr': '<c8'") && !header.contains("\"descr\": \"<c8\"") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "data.npy is not a complex64 array",
         ));
     }
-    let mut result = Vec::with_capacity((npy.len() - payload_start) / 8);
-    for value in npy[payload_start..].chunks_exact(8) {
-        result.push(C32::new(
-            f32::from_le_bytes(value[0..4].try_into().unwrap()),
-            f32::from_le_bytes(value[4..8].try_into().unwrap()),
+    if payload.len() % 8 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "complex64 payload length is not divisible by 8",
         ));
     }
-    Ok(result)
+    Ok(payload
+        .chunks_exact(8)
+        .map(|value| {
+            C32::new(
+                f32::from_le_bytes(value[0..4].try_into().unwrap()),
+                f32::from_le_bytes(value[4..8].try_into().unwrap()),
+            )
+        })
+        .collect())
+}
+
+fn parse_real_npy(npy: &[u8]) -> io::Result<Vec<f32>> {
+    let (header, payload) = npy_payload(npy)?;
+    if header.contains("'descr': '<f8'") || header.contains("\"descr\": \"<f8\"") {
+        if payload.len() % 8 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "float64 payload length is not divisible by 8",
+            ));
+        }
+        Ok(payload
+            .chunks_exact(8)
+            .map(|value| f64::from_le_bytes(value.try_into().unwrap()) as f32)
+            .collect())
+    } else if header.contains("'descr': '<f4'") || header.contains("\"descr\": \"<f4\"") {
+        if payload.len() % 4 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "float32 payload length is not divisible by 4",
+            ));
+        }
+        Ok(payload
+            .chunks_exact(4)
+            .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+            .collect())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "real/imag NPY entries must be float32 or float64",
+        ))
+    }
 }
 
 pub fn apply_bandpass_correction(freq_rate_array: &mut Array2<C32>, bandpass_data: &[C32]) {

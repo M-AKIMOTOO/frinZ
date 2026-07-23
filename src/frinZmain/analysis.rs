@@ -153,8 +153,11 @@ pub struct AnalysisResults {
     pub rate_offset: f32,
     // Add new fields here
     // pub residual_acel: f32,
+    #[allow(dead_code)]
     pub corrected_acel: f32,
+    #[allow(dead_code)]
     pub corrected_jerk: f32,
+    #[allow(dead_code)]
     pub corrected_snap: f32,
     // Ranges
     pub rate_range: Vec<f32>,

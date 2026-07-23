@@ -11,7 +11,7 @@ use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
 use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
-use crate::npy_output::{npz_sidecar_path, write_complex_2d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::frequency_plane_msb;
 use crate::read::{read_sector_header, read_visibility_data};
 use crate::rfi::parse_rfi_ranges;
@@ -714,18 +714,17 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|&value| value as f64)
             .collect();
-        write_complex_2d(
-            &npz_sidecar_path(&freq_plot_filename, "multi_sideband_c"),
-            NpyMeta::new(
-                "multi_sideband_c",
-                c_band_header.fft_point as u32,
-                c_band_header.number_of_sector as u32,
-            )
-            .axes("frequency", "MHz", "fringe_rate", "Hz"),
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "multi_sideband",
+            c_band_header.fft_point as u32,
+            c_band_header.number_of_sector as u32,
+        ));
+        npz.add_f64_1d("c_frequency_mhz", &c_frequency_axis);
+        npz.add_f64_1d("c_rate_hz", &c_rate_axis);
+        npz.add_complex64_2d(
+            "c_freq_rate",
             c_band_freq_rate_array.dim(),
             c_band_freq_rate_array.iter().copied(),
-            &c_frequency_axis,
-            &c_rate_axis,
         )?;
         let x_frequency_axis: Vec<f64> = x_band_analysis_results
             .freq_range
@@ -737,19 +736,16 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|&value| value as f64)
             .collect();
-        write_complex_2d(
-            &npz_sidecar_path(&freq_plot_filename, "multi_sideband_x"),
-            NpyMeta::new(
-                "multi_sideband_x",
-                x_band_header.fft_point as u32,
-                x_band_header.number_of_sector as u32,
-            )
-            .axes("frequency", "MHz", "fringe_rate", "Hz"),
+        npz.add_f64_1d("x_frequency_mhz", &x_frequency_axis);
+        npz.add_f64_1d("x_rate_hz", &x_rate_axis);
+        npz.add_complex64_2d(
+            "x_freq_rate",
             x_band_freq_rate_array.dim(),
             x_band_freq_rate_array.iter().copied(),
-            &x_frequency_axis,
-            &x_rate_axis,
         )?;
+        npz.write(&npz_sidecar_path(&freq_plot_filename, "multi_sideband"))?;
+        let _ = fs::remove_file(npz_sidecar_path(&freq_plot_filename, "multi_sideband_c"));
+        let _ = fs::remove_file(npz_sidecar_path(&freq_plot_filename, "multi_sideband_x"));
     }
 
     let heatmap_func = move |freq_mhz: f64, rate_hz: f64| -> f64 {

@@ -12,7 +12,7 @@ use num_complex::Complex;
 use crate::args::Args;
 use crate::fitting;
 use crate::input_support::read_input_bytes;
-use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::plot::phase_reference_plot;
 use crate::processing::process_cor_file;
@@ -23,136 +23,117 @@ type C32 = Complex<f32>;
 
 #[derive(Debug, Clone)]
 enum PhaseFitSpec {
-    Polynomial {
-        degree: usize,
-    },
-    PolynomialPlusSin {
-        degree: usize,
-        period_sec: Option<f64>,
-    },
+    Poly2,
+    Linear,
+    Nearest,
+    Hybrid,
 }
 
 #[derive(Debug, Clone)]
 enum ResolvedPhaseFitModel {
-    Polynomial { degree: usize },
-    PolynomialPlusSin { degree: usize, period_sec: f64 },
+    Poly2,
+    Linear,
+    Nearest,
+    Hybrid,
 }
 
 impl PhaseFitSpec {
     fn min_data_points(&self) -> usize {
         match self {
-            Self::Polynomial { degree } => degree + 1,
-            Self::PolynomialPlusSin { degree, .. } => degree + 3,
+            Self::Nearest => 1,
+            Self::Linear => 2,
+            Self::Poly2 | Self::Hybrid => 3,
         }
     }
 
-    fn describe(&self) -> String {
+    fn describe(&self) -> &'static str {
         match self {
-            Self::Polynomial { degree } => format!("polynomial(deg={})", degree),
-            Self::PolynomialPlusSin {
-                degree,
-                period_sec: Some(period_sec),
-            } => format!("polynomial+sin(deg={}, period={}s)", degree, period_sec),
-            Self::PolynomialPlusSin {
-                degree,
-                period_sec: None,
-            } => format!("polynomial+sin(deg={}, period=auto)", degree),
+            Self::Poly2 => "poly2",
+            Self::Linear => "linear",
+            Self::Nearest => "nearest",
+            Self::Hybrid => "hybrid",
         }
     }
 
-    fn resolve(self, default_period_sec: f64) -> Result<ResolvedPhaseFitModel, String> {
+    fn resolve(&self) -> ResolvedPhaseFitModel {
         match self {
-            Self::Polynomial { degree } => Ok(ResolvedPhaseFitModel::Polynomial { degree }),
-            Self::PolynomialPlusSin { degree, period_sec } => {
-                let fallback = if default_period_sec.is_finite() && default_period_sec > 0.0 {
-                    default_period_sec
-                } else {
-                    1.0
-                };
-                let period = period_sec.unwrap_or(fallback);
-                if !period.is_finite() || period <= 0.0 {
-                    return Err(format!("Invalid sinusoid period: {}", period));
-                }
-                Ok(ResolvedPhaseFitModel::PolynomialPlusSin {
-                    degree,
-                    period_sec: period,
-                })
-            }
+            Self::Poly2 => ResolvedPhaseFitModel::Poly2,
+            Self::Linear => ResolvedPhaseFitModel::Linear,
+            Self::Nearest => ResolvedPhaseFitModel::Nearest,
+            Self::Hybrid => ResolvedPhaseFitModel::Hybrid,
         }
     }
 }
 
 fn parse_phase_fit_spec(raw_spec: Option<&str>) -> Result<PhaseFitSpec, String> {
-    let Some(raw) = raw_spec else {
-        return Ok(PhaseFitSpec::Polynomial { degree: 1 });
-    };
-
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(PhaseFitSpec::Polynomial { degree: 1 });
+    let mode = raw_spec.unwrap_or("poly2").trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "poly2" | "quadratic" | "2" => Ok(PhaseFitSpec::Poly2),
+        "linear" | "interp" => Ok(PhaseFitSpec::Linear),
+        "nearest" => Ok(PhaseFitSpec::Nearest),
+        "hybrid" => Ok(PhaseFitSpec::Hybrid),
+        _ => Err(format!(
+            "Invalid phase-reference mode '{}'. Use poly2, linear, nearest, or hybrid.",
+            mode
+        )),
     }
+}
 
-    if let Ok(degree) = trimmed.parse::<usize>() {
-        return Ok(PhaseFitSpec::Polynomial { degree });
+fn pack_samples(times: &[f64], values: &[f64], prefix: &[f64]) -> Vec<f64> {
+    let mut packed = Vec::with_capacity(prefix.len() + times.len() * 2);
+    packed.extend_from_slice(prefix);
+    for (&time, &value) in times.iter().zip(values) {
+        packed.push(time);
+        packed.push(value);
     }
+    packed
+}
 
-    let normalized = trimmed.to_ascii_lowercase().replace(' ', "");
-    let (model_part, period_sec) = if let Some((lhs, rhs)) = normalized.split_once(':') {
-        let period = rhs.parse::<f64>().map_err(|_| {
-            format!(
-                "Invalid fit spec '{}': period part '{}' must be a positive number in seconds.",
-                trimmed, rhs
-            )
-        })?;
-        if !period.is_finite() || period <= 0.0 {
-            return Err(format!(
-                "Invalid fit spec '{}': period must be > 0.",
-                trimmed
-            ));
-        }
-        (lhs, Some(period))
-    } else {
-        (normalized.as_str(), None)
-    };
-
-    let degree = if model_part == "sin" {
-        0
-    } else if let Some(prefix) = model_part.strip_suffix("+sin") {
-        prefix.parse::<usize>().map_err(|_| {
-            format!(
-                "Invalid fit spec '{}': degree before '+sin' must be non-negative integer.",
-                trimmed
-            )
-        })?
-    } else {
-        return Err(format!(
-            "Invalid fit spec '{}'. Use one of: <deg>, sin, <deg>+sin, <deg>+sin:<period_sec>.",
-            trimmed
-        ));
-    };
-
-    Ok(PhaseFitSpec::PolynomialPlusSin { degree, period_sec })
+fn sample_model(x_sec: f64, packed: &[f64], offset: usize, nearest: bool) -> f64 {
+    let samples = &packed[offset..];
+    let count = samples.len() / 2;
+    if count == 0 {
+        return 0.0;
+    }
+    let at = |index: usize| (samples[index * 2], samples[index * 2 + 1]);
+    if x_sec <= at(0).0 {
+        return at(0).1;
+    }
+    if x_sec >= at(count - 1).0 {
+        return at(count - 1).1;
+    }
+    let mut upper = 1usize;
+    while upper < count && at(upper).0 < x_sec {
+        upper += 1;
+    }
+    let (t0, y0) = at(upper - 1);
+    let (t1, y1) = at(upper);
+    if nearest {
+        return if x_sec - t0 <= t1 - x_sec { y0 } else { y1 };
+    }
+    if (t1 - t0).abs() <= f64::EPSILON {
+        return y0;
+    }
+    y0 + (y1 - y0) * ((x_sec - t0) / (t1 - t0))
 }
 
 fn evaluate_phase_fit_model(x_sec: f64, coeffs: &[f64], model: &ResolvedPhaseFitModel) -> f64 {
     match model {
-        ResolvedPhaseFitModel::Polynomial { degree } => coeffs
+        ResolvedPhaseFitModel::Poly2 => coeffs
             .iter()
-            .take(degree + 1)
+            .take(3)
             .enumerate()
-            .map(|(i, &c)| c * x_sec.powi(i as i32))
+            .map(|(power, &coefficient)| coefficient * x_sec.powi(power as i32))
             .sum(),
-        ResolvedPhaseFitModel::PolynomialPlusSin { degree, period_sec } => {
-            let omega = 2.0 * std::f64::consts::PI / period_sec;
-            let poly_sum: f64 = coeffs
+        ResolvedPhaseFitModel::Linear => sample_model(x_sec, coeffs, 0, false),
+        ResolvedPhaseFitModel::Nearest => sample_model(x_sec, coeffs, 0, true),
+        ResolvedPhaseFitModel::Hybrid => {
+            let trend: f64 = coeffs[..3]
                 .iter()
-                .take(degree + 1)
                 .enumerate()
-                .map(|(i, &c)| c * x_sec.powi(i as i32))
+                .map(|(power, &coefficient)| coefficient * x_sec.powi(power as i32))
                 .sum();
-            let sin_coeff = coeffs[*degree + 1];
-            let cos_coeff = coeffs[*degree + 2];
-            poly_sum + sin_coeff * (omega * x_sec).sin() + cos_coeff * (omega * x_sec).cos()
+            trend + sample_model(x_sec, coeffs, 3, false)
         }
     }
 }
@@ -162,11 +143,11 @@ pub fn run_phase_reference_analysis(
     time_flag_ranges: &[(DateTime<Utc>, DateTime<Utc>)],
     pp_flag_ranges: &[(u32, u32)],
 ) -> Result<(), Box<dyn Error>> {
-    let cal_path = PathBuf::from(&args.phase_reference[0]);
-    let target_path = PathBuf::from(&args.phase_reference[1]);
+    let cal_path = PathBuf::from(&args.phase_reference[1]);
+    let target_path = PathBuf::from(&args.phase_reference[2]);
 
     // --- Parse phase_reference arguments ---
-    let fit_spec = match parse_phase_fit_spec(args.phase_reference.get(2).map(|s| s.as_str())) {
+    let fit_spec = match parse_phase_fit_spec(args.phase_reference.first().map(|s| s.as_str())) {
         Ok(spec) => spec,
         Err(msg) => {
             eprintln!("Error: {}", msg);
@@ -237,6 +218,29 @@ pub fn run_phase_reference_analysis(
         false,
     )?;
 
+    let cal_header = &cal_results.header;
+    let target_header = &target_results.header;
+    let same_baseline = cal_header.station1_name.trim() == target_header.station1_name.trim()
+        && cal_header.station2_name.trim() == target_header.station2_name.trim();
+    let same_setup = cal_header.fft_point == target_header.fft_point
+        && cal_header.sampling_speed == target_header.sampling_speed
+        && (cal_header.observing_frequency - target_header.observing_frequency).abs() <= 1.0;
+    if !same_baseline || !same_setup {
+        return Err(format!(
+            "Calibrator and target must use the same directed baseline and frequency setup: cal={}–{} FFT={} fs={} fobs={:.3}, target={}–{} FFT={} fs={} fobs={:.3}",
+            cal_header.station1_name.trim(),
+            cal_header.station2_name.trim(),
+            cal_header.fft_point,
+            cal_header.sampling_speed,
+            cal_header.observing_frequency,
+            target_header.station1_name.trim(),
+            target_header.station2_name.trim(),
+            target_header.fft_point,
+            target_header.sampling_speed,
+            target_header.observing_frequency,
+        ).into());
+    }
+
     // --- Phase Unwrapping ---
     utils::unwrap_phase(&mut cal_results.add_plot_phase, false);
     utils::unwrap_phase(&mut target_results.add_plot_phase, false);
@@ -273,45 +277,44 @@ pub fn run_phase_reference_analysis(
             .iter()
             .map(|&p| p as f64)
             .collect();
-        let cal_duration_sec = cal_times_f64.last().copied().unwrap_or(0.0)
-            - cal_times_f64.first().copied().unwrap_or(0.0);
-        let fit_model = match fit_spec.clone().resolve(cal_duration_sec) {
-            Ok(model) => model,
-            Err(msg) => {
-                eprintln!("Warning: {}", msg);
-                return Err("Failed to resolve phase fit model".into());
+        let fit_model = fit_spec.resolve();
+        let fit_result: Result<Vec<f64>, Box<dyn Error>> = match &fit_model {
+            ResolvedPhaseFitModel::Poly2 => {
+                fitting::fit_polynomial_least_squares(&cal_times_f64, &cal_phases_f64, 2)
             }
-        };
-
-        let fit_result = match &fit_model {
-            ResolvedPhaseFitModel::Polynomial { degree } => {
-                fitting::fit_polynomial_least_squares(&cal_times_f64, &cal_phases_f64, *degree)
+            ResolvedPhaseFitModel::Linear | ResolvedPhaseFitModel::Nearest => {
+                Ok(pack_samples(&cal_times_f64, &cal_phases_f64, &[]))
             }
-            ResolvedPhaseFitModel::PolynomialPlusSin { degree, period_sec } => {
-                fitting::fit_polynomial_plus_sinusoid_least_squares(
-                    &cal_times_f64,
-                    &cal_phases_f64,
-                    *degree,
-                    *period_sec,
-                )
-            }
+            ResolvedPhaseFitModel::Hybrid => fitting::fit_polynomial_least_squares(
+                &cal_times_f64,
+                &cal_phases_f64,
+                2,
+            )
+            .map(|trend| {
+                let residuals: Vec<f64> = cal_times_f64
+                    .iter()
+                    .zip(&cal_phases_f64)
+                    .map(|(&time, &phase)| {
+                        let fitted: f64 = trend
+                            .iter()
+                            .enumerate()
+                            .map(|(power, &coefficient)| coefficient * time.powi(power as i32))
+                            .sum();
+                        phase - fitted
+                    })
+                    .collect();
+                pack_samples(&cal_times_f64, &residuals, &trend)
+            }),
         };
 
         match fit_result {
             Ok(coeffs) => {
-                match &fit_model {
-                    ResolvedPhaseFitModel::Polynomial { degree } => {
-                        println!(
-                            "Polynomial fit (degree {}) to calibrator phase. Coefficients: {:?}",
-                            degree, coeffs
-                        );
-                    }
-                    ResolvedPhaseFitModel::PolynomialPlusSin { degree, period_sec } => {
-                        println!(
-                            "Polynomial+sin fit (degree {}, period {:.3}s) to calibrator phase. Coefficients: {:?}",
-                            degree, period_sec, coeffs
-                        );
-                    }
+                println!("Phase-reference mode: {}", fit_spec.describe());
+                if matches!(
+                    fit_model,
+                    ResolvedPhaseFitModel::Poly2 | ResolvedPhaseFitModel::Hybrid
+                ) {
+                    println!("Quadratic trend coefficients: {:?}", &coeffs[..3]);
                 }
 
                 // Calculate fitted_cal_phases
@@ -335,6 +338,24 @@ pub fn run_phase_reference_analysis(
                             t.signed_duration_since(first_time).num_milliseconds() as f64 / 1000.0
                         })
                         .collect();
+                    let cal_start = cal_times_f64[0];
+                    let cal_end = *cal_times_f64.last().unwrap_or(&cal_start);
+                    let outside = target_times_f64
+                        .iter()
+                        .filter(|&&time| time < cal_start || time > cal_end)
+                        .count();
+                    if outside > 0 {
+                        match fit_model {
+                            ResolvedPhaseFitModel::Poly2 => eprintln!(
+                                "#WARN: {} target epochs are outside the calibrator range [{:.3}, {:.3}] s; quadratic phase is being extrapolated.",
+                                outside, cal_start, cal_end
+                            ),
+                            _ => eprintln!(
+                                "#WARN: {} target epochs are outside the calibrator range [{:.3}, {:.3}] s; local residual correction is clamped to the nearest endpoint.",
+                                outside, cal_start, cal_end
+                            ),
+                        }
+                    }
                     for (i, t) in target_times_f64.iter().enumerate() {
                         let fitted_val = evaluate_phase_fit_model(*t, &coeffs, &fit_model);
                         target_results.add_plot_phase[i] -= fitted_val as f32;
@@ -457,57 +478,42 @@ pub fn run_phase_reference_analysis(
         &target_results.add_plot_phase,
         output_filepath.to_str().unwrap(),
     )?;
-    let write_phase_npy = |flag: &str,
-                           times: &[chrono::DateTime<chrono::Utc>],
-                           values: &[f32],
-                           fft: u32,
-                           pp: u32|
-     -> Result<(), Box<dyn Error>> {
-        if times.len() != values.len() || times.is_empty() {
-            return Ok(());
-        }
-        let epoch = times[0];
-        let axis: Vec<f64> = times
+    let phase_axis = |times: &[chrono::DateTime<chrono::Utc>]| -> Vec<f64> {
+        let Some(epoch) = times.first() else {
+            return Vec::new();
+        };
+        times
             .iter()
-            .map(|time| time.signed_duration_since(epoch).num_milliseconds() as f64 / 1000.0)
-            .collect();
-        write_real_1d(
-            &npz_sidecar_path(&output_filepath, flag),
-            NpyMeta::new(flag, fft, pp).axes("elapsed_time", "s", "phase", "deg"),
-            values,
-            &axis,
-        )?;
-        Ok(())
+            .map(|time| time.signed_duration_since(*epoch).num_milliseconds() as f64 / 1000.0)
+            .collect()
     };
     if args.npz {
-        write_phase_npy(
+        let mut npz = NamedNpz::new(NpyMeta::new(
+            "phase_reference",
+            target_results.header.fft_point as u32,
+            target_results.header.number_of_sector as u32,
+        ));
+        if cal_results.add_plot_times.len() == original_cal_phases.len() {
+            let axis = phase_axis(&cal_results.add_plot_times);
+            npz.add_f64_1d("calibrator_elapsed_time_s", &axis);
+            npz.add_f32_1d("calibrator_phase_deg", &original_cal_phases);
+            npz.add_f32_1d("calibrator_fit_phase_deg", &fitted_cal_phases);
+        }
+        if target_results.add_plot_times.len() == original_target_phases.len() {
+            let axis = phase_axis(&target_results.add_plot_times);
+            npz.add_f64_1d("target_elapsed_time_s", &axis);
+            npz.add_f32_1d("target_phase_deg", &original_target_phases);
+            npz.add_f32_1d("target_corrected_phase_deg", &target_results.add_plot_phase);
+        }
+        npz.write(&npz_sidecar_path(&output_filepath, "phase_reference"))?;
+        for legacy_flag in [
             "phase_reference_calibrator",
-            &cal_results.add_plot_times,
-            &original_cal_phases,
-            cal_results.header.fft_point as u32,
-            cal_results.header.number_of_sector as u32,
-        )?;
-        write_phase_npy(
             "phase_reference_calibrator_fit",
-            &cal_results.add_plot_times,
-            &fitted_cal_phases,
-            cal_results.header.fft_point as u32,
-            cal_results.header.number_of_sector as u32,
-        )?;
-        write_phase_npy(
             "phase_reference_target",
-            &target_results.add_plot_times,
-            &original_target_phases,
-            target_results.header.fft_point as u32,
-            target_results.header.number_of_sector as u32,
-        )?;
-        write_phase_npy(
             "phase_reference_target_corrected",
-            &target_results.add_plot_times,
-            &target_results.add_plot_phase,
-            target_results.header.fft_point as u32,
-            target_results.header.number_of_sector as u32,
-        )?;
+        ] {
+            let _ = fs::remove_file(npz_sidecar_path(&output_filepath, legacy_flag));
+        }
     }
 
     println!("Phase reference plot saved to: {:?}\n", output_filepath);
@@ -520,34 +526,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_fit_spec_accepts_polynomial_degree() {
-        let spec = parse_phase_fit_spec(Some("2")).unwrap();
-        match spec {
-            PhaseFitSpec::Polynomial { degree } => assert_eq!(degree, 2),
-            _ => panic!("Expected polynomial fit spec"),
-        }
+    fn parses_supported_transfer_modes() {
+        assert!(matches!(
+            parse_phase_fit_spec(Some("poly2")).unwrap(),
+            PhaseFitSpec::Poly2
+        ));
+        assert!(matches!(
+            parse_phase_fit_spec(Some("linear")).unwrap(),
+            PhaseFitSpec::Linear
+        ));
+        assert!(matches!(
+            parse_phase_fit_spec(Some("nearest")).unwrap(),
+            PhaseFitSpec::Nearest
+        ));
+        assert!(matches!(
+            parse_phase_fit_spec(Some("hybrid")).unwrap(),
+            PhaseFitSpec::Hybrid
+        ));
+        assert!(parse_phase_fit_spec(Some("cubic")).is_err());
     }
 
     #[test]
-    fn parse_fit_spec_accepts_poly_plus_sin_with_period() {
-        let spec = parse_phase_fit_spec(Some("1+sin:3600")).unwrap();
-        match spec {
-            PhaseFitSpec::PolynomialPlusSin { degree, period_sec } => {
-                assert_eq!(degree, 1);
-                assert_eq!(period_sec, Some(3600.0));
-            }
-            _ => panic!("Expected polynomial+sin fit spec"),
-        }
+    fn linear_interpolation_clamps_outside_calibrator_range() {
+        let packed = pack_samples(&[0.0, 10.0], &[20.0, 40.0], &[]);
+        let model = ResolvedPhaseFitModel::Linear;
+        assert_eq!(evaluate_phase_fit_model(-1.0, &packed, &model), 20.0);
+        assert_eq!(evaluate_phase_fit_model(5.0, &packed, &model), 30.0);
+        assert_eq!(evaluate_phase_fit_model(20.0, &packed, &model), 40.0);
     }
 
     #[test]
-    fn evaluate_phase_fit_model_poly_plus_sin_uses_sin_cos_terms() {
-        let model = ResolvedPhaseFitModel::PolynomialPlusSin {
-            degree: 1,
-            period_sec: 10.0,
-        };
-        let coeffs = vec![1.0, 2.0, 3.0, 4.0]; // c0, c1, sin, cos
-        let y = evaluate_phase_fit_model(0.0, &coeffs, &model);
-        assert!((y - 5.0).abs() < 1e-9);
+    fn nearest_uses_closest_calibrator_scan() {
+        let packed = pack_samples(&[0.0, 10.0], &[20.0, 40.0], &[]);
+        let model = ResolvedPhaseFitModel::Nearest;
+        assert_eq!(evaluate_phase_fit_model(4.0, &packed, &model), 20.0);
+        assert_eq!(evaluate_phase_fit_model(6.0, &packed, &model), 40.0);
+    }
+
+    #[test]
+    fn hybrid_combines_quadratic_trend_and_interpolated_residual() {
+        let packed = pack_samples(&[0.0, 10.0], &[2.0, 4.0], &[1.0, 0.5, 0.0]);
+        let model = ResolvedPhaseFitModel::Hybrid;
+        assert!((evaluate_phase_fit_model(5.0, &packed, &model) - 6.5).abs() < 1.0e-12);
     }
 }

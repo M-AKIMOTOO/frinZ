@@ -11,7 +11,7 @@ use crate::args::Args;
 use crate::fft::process_fft;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
-use crate::npy_output::{npz_sidecar_path, write_real_1d, NpyMeta};
+use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 
@@ -1110,27 +1110,25 @@ fn plot_maser_spectrum(
     if write_npz {
         let axis: Vec<f64> = data.iter().map(|point| point.0).collect();
         let values: Vec<f32> = data.iter().map(|point| point.1).collect();
-        let (axis_name, axis_unit) = if x_label.contains("Velocity") {
-            ("velocity", "km/s")
+        let mut npz = NamedNpz::new(NpyMeta::new("maser", 0, 0));
+        if x_label.contains("Velocity") {
+            npz.add_f64_1d("velocity_km_per_s", &axis);
         } else {
-            ("frequency", "MHz")
-        };
-        write_real_1d(
-            &output_path.with_extension("npz"),
-            NpyMeta::new("maser", 0, 0).axes(axis_name, axis_unit, "intensity", ""),
-            &values,
-            &axis,
-        )?;
+            npz.add_f64_1d("frequency_mhz", &axis);
+        }
+        npz.add_f32_1d("intensity", &values);
         if let Some(fit_data) = gaussian_fit {
             let fit_axis: Vec<f64> = fit_data.iter().map(|point| point.0).collect();
             let fit_values: Vec<f32> = fit_data.iter().map(|point| point.1).collect();
-            write_real_1d(
-                &npz_sidecar_path(output_path, "maser_fit"),
-                NpyMeta::new("maser_fit", 0, 0).axes(axis_name, axis_unit, "intensity", ""),
-                &fit_values,
-                &fit_axis,
-            )?;
+            if x_label.contains("Velocity") {
+                npz.add_f64_1d("fit_velocity_km_per_s", &fit_axis);
+            } else {
+                npz.add_f64_1d("fit_frequency_mhz", &fit_axis);
+            }
+            npz.add_f32_1d("fit_intensity", &fit_values);
+            let _ = fs::remove_file(npz_sidecar_path(output_path, "maser_fit"));
         }
+        npz.write(&output_path.with_extension("npz"))?;
     }
     Ok(())
 }
@@ -1233,16 +1231,18 @@ fn plot_on_off_spectra(
     root.present()?;
     compress_png_with_mode(output_path, CompressQuality::Low);
     if write_npz {
-        for (flag, data) in [("maser_on", on_data), ("maser_off", off_data)] {
-            let axis: Vec<f64> = data.iter().map(|point| point.0).collect();
-            let values: Vec<f32> = data.iter().map(|point| point.1).collect();
-            write_real_1d(
-                &npz_sidecar_path(output_path, flag),
-                NpyMeta::new(flag, 0, 0).axes("frequency", "MHz", "amplitude", ""),
-                &values,
-                &axis,
-            )?;
-        }
+        let on_frequency_mhz: Vec<f64> = on_data.iter().map(|point| point.0).collect();
+        let on_amplitude: Vec<f32> = on_data.iter().map(|point| point.1).collect();
+        let off_frequency_mhz: Vec<f64> = off_data.iter().map(|point| point.0).collect();
+        let off_amplitude: Vec<f32> = off_data.iter().map(|point| point.1).collect();
+        let mut npz = NamedNpz::new(NpyMeta::new("maser_on_off", 0, 0));
+        npz.add_f64_1d("on_frequency_mhz", &on_frequency_mhz);
+        npz.add_f32_1d("on_amplitude", &on_amplitude);
+        npz.add_f64_1d("off_frequency_mhz", &off_frequency_mhz);
+        npz.add_f32_1d("off_amplitude", &off_amplitude);
+        npz.write(&npz_sidecar_path(output_path, "maser_on_off"))?;
+        let _ = fs::remove_file(npz_sidecar_path(output_path, "maser_on"));
+        let _ = fs::remove_file(npz_sidecar_path(output_path, "maser_off"));
     }
     Ok(())
 }
@@ -2236,22 +2236,15 @@ fn analyze_segment(
 
     if write_outputs {
         let _ = fs::remove_file(output_dir.join(format!("{}{}_maser_data.tsv", on_stem, suffix)));
-        let mask_values: Vec<f32> = baseline_mask
-            .iter()
-            .map(|&masked| if masked { 1.0 } else { 0.0 })
-            .collect();
         if write_npz {
-            write_real_1d(
-                &output_dir.join(format!("{}{}_maser_baseline_mask.npz", on_stem, suffix)),
-                NpyMeta::new("maser_baseline_mask", 0, 0).axes(
-                    "frequency",
-                    "MHz",
-                    "masked",
-                    "bool",
-                ),
-                &mask_values,
-                &analysis_freq_mhz,
-            )?;
+            let mask_bool: Vec<u8> = baseline_mask
+                .iter()
+                .map(|&masked| u8::from(masked))
+                .collect();
+            let mut npz = NamedNpz::new(NpyMeta::new("maser_baseline_mask", 0, 0));
+            npz.add_f64_1d("frequency_mhz", &analysis_freq_mhz);
+            npz.add_u8_1d("masked_bool", &mask_bool);
+            npz.write(&output_dir.join(format!("{}{}_maser_baseline_mask.npz", on_stem, suffix)))?;
         }
 
         if gaussian_fit_attempted {

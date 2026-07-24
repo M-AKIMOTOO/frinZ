@@ -118,6 +118,10 @@ const EXPLICIT_ALIASES: &[(&str, &[&str])] = &[
 ];
 
 fn with_aliases(mut command: Command) -> Command {
+    command = command
+        .next_line_help(false)
+        .term_width(120)
+        .max_term_width(120);
     for spec in PREFIX_ALIASES {
         command = add_prefix_aliases(command, spec);
     }
@@ -150,87 +154,87 @@ This program is licensed under the MIT License
 see https://opensource.org/license/mit"#
 )]
 pub struct Args {
-    /// Path to the input .cor file
+    /// Input .cor file.
     #[arg(long)]
     pub input: Option<PathBuf>,
 
-    /// Phase referencing: MODE CAL TARGET [CAL_LEN TGT_LEN LOOP]
-    #[arg(long, num_args = 3..=6, value_names = ["MODE", "CALIBRATOR", "TARGET", "CAL_LENGTH", "TGT_LENGTH", "LOOP"])]
+    /// Phase referencing; see --detail.
+    #[arg(long, num_args = 3..=6, value_name = "ARGS")]
     pub phase_reference: Vec<String>,
 
-    /// Compute closure phase from three baselines. The first antenna in FILE1 is the reference.
+    /// Closure phase from three baselines.
     #[arg(long = "closure-phase", num_args = 3, value_name = "FILE")]
     pub closure_phase: Option<Vec<String>>,
 
-    /// Integration length in sectors (0 = whole file).
+    /// Integration length [sectors].
     #[arg(long, default_value_t = 0)]
     pub length: i32,
 
-    /// Skip time in seconds from the start.
+    /// Skip from start [s].
     #[arg(long, default_value_t = 0)]
     pub skip: i32,
 
-    /// Number of loops.
+    /// Loop count.
     #[arg(long, default_value_t = 1)]
     pub loop_: i32,
 
-    /// Short-time fringe FFT hop in sectors. --length sets the window.
+    /// STFFT hop [sectors].
     #[arg(long, default_value_t = 0, value_name = "HOPS")]
     pub stfft: i32,
 
-    /// RFI ranges to exclude (e.g., "100,120"). Repeatable.
+    /// RFI ranges.
     #[arg(long, num_args = 1.., value_name = "MIN,MAX")]
     pub rfi: Vec<String>,
 
-    /// Generate plots.
+    /// Plot figures.
     #[arg(long)]
     pub plot: bool,
 
-    /// Use frequency-domain mode.
+    /// Frequency-domain mode.
     #[arg(long)]
     pub frequency: bool,
 
-    /// Output raw complex visibility to binary.
+    /// Save raw visibility BIN.
     #[arg(long)]
     pub cor2bin: bool,
 
-    /// Output cross spectrum to compressed NPZ.
+    /// Save cross spectrum NPZ.
     #[arg(long)]
     pub spectrum: bool,
 
-    /// Output analysis results to .txt.
+    /// Save text output.
     #[arg(long)]
     pub output: bool,
 
-    /// Write compressed NPZ sidecar data for plots and analysis products.
+    /// Save NPZ sidecars.
     #[arg(long)]
     pub npz: bool,
 
-    /// Delay correction value.
+    /// Delay correction [sample].
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub delay_correct: f32,
 
-    /// Rate correction value [Hz]. Scientific notation is accepted, e.g. 1.234e-13.
+    /// Rate correction [Hz].
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub rate_correct: f32,
 
-    /// Acceleration correction value [Hz/s]. Scientific notation is accepted, e.g. 1.234e-13.
+    /// Acceleration correction [Hz/s].
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub acel_correct: f32,
 
-    /// Jerk correction value [Hz/s^2]. Scientific notation is accepted, e.g. 1.234e-13.
+    /// Jerk correction [Hz/s^2].
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub jerk_correct: f32,
 
-    /// Snap correction value [Hz/s^3]. Scientific notation is accepted, e.g. 1.234e-13.
+    /// Snap correction [Hz/s^3].
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub snap_correct: f32,
 
-    /// Apply scan table corrections (CSV: start, integ, delay[samp], rate[Hz]).
+    /// Scan correction CSV.
     #[arg(long, value_name = "FILE")]
     pub scan_correct: Option<PathBuf>,
 
-    /// Delay range (min max).
+    /// Delay window.
     #[arg(
         long = "drange",
         num_args = 2,
@@ -239,7 +243,7 @@ pub struct Args {
     )]
     pub drange: Vec<f32>,
 
-    /// Rate range (min max).
+    /// Rate window.
     #[arg(
         long = "rrange",
         num_args = 2,
@@ -248,48 +252,48 @@ pub struct Args {
     )]
     pub rrange: Vec<f32>,
 
-    /// Mask rectangle in time-domain delay/rate plane: DELAY_MIN DELAY_MAX RATE_MIN RATE_MAX.
+    /// Mask delay-rate rectangle.
     #[arg(
         long,
         num_args = 4,
-        value_names = ["DELAY_MIN", "DELAY_MAX", "RATE_MIN", "RATE_MAX"],
+        value_names = ["D1", "D2", "R1", "R2"],
         allow_negative_numbers = true
     )]
     pub mask: Vec<f32>,
 
-    /// Frequency range for --frequency plots/search.
+    /// Frequency window [MHz].
     #[arg(long = "frange", num_args = 2, value_names = ["MIN", "MAX"])]
     pub frange: Vec<f32>,
 
-    /// Rate padding factor (1/2/4/8). --search peak/deep/deep2 forces 8.
+    /// Rate FFT padding.
     #[arg(long, default_value_t = 1)]
     pub rate_padding: u32,
 
-    /// Cumulate length in seconds (0=off).
+    /// Cumulate length [s].
     #[arg(long, default_value_t = 0)]
     pub cumulate: i32,
 
-    /// Extra plots of amp/SNR/phase/noise vs time.
+    /// Plot time series.
     #[arg(long)]
     pub add_plot: bool,
 
-    /// Run WWZ on per-loop fringe-search results.
+    /// WWZ time-frequency analysis.
     #[arg(long)]
     pub wwz: bool,
 
-    /// Output header info.
+    /// Print header.
     #[arg(long)]
     pub header: bool,
 
-    /// Rebin FFT channels to this point count.
+    /// Rebin FFT channels.
     #[arg(long, value_name = "POINTS")]
     pub fft_rebin: Option<i32>,
 
-    /// Split the observing bandwidth into in-band chunks of this width [MHz] and fringe-search each chunk.
+    /// In-band search width [MHz].
     #[arg(long, value_name = "MHz")]
     pub inband: Option<u32>,
 
-    /// Search mode: peak (default), deep, deep2, rate, or acel.
+    /// Fringe search mode.
     #[arg(
         long,
         num_args = 0..=1,
@@ -300,74 +304,74 @@ pub struct Args {
     )]
     pub search: Vec<String>,
 
-    /// In-beam VLBI mode (standard delay-rate fringe search workflow).
+    /// In-beam VLBI workflow.
     #[arg(long = "in-beam")]
     pub in_beam: bool,
 
-    /// Iterations for --search=peak/deep/deep2 (deep/deep2 default=4 when omitted).
+    /// Search iterations.
     #[arg(long, default_value_t = 5)]
     pub iter: u32,
 
-    /// Plot dynamic spectrum.
+    /// Dynamic spectrum.
     #[arg(long)]
     pub dynamic_spectrum: bool,
 
-    /// Bandpass calibration NPZ file (legacy BIN is also readable).
+    /// Bandpass table.
     #[arg(long)]
     pub bandpass: Option<PathBuf>,
 
-    /// Normalize cross-correlation by auto-correlation amplitudes.
+    /// Normalize by ACF.
     #[arg(long = "norm-acf")]
     pub norm_acf: bool,
 
-    /// Write bandpass-corrected spectrum to compressed NPZ.
+    /// Save bandpass table NPZ.
     #[arg(long)]
     pub bandpass_table: bool,
 
-    /// CPU cores for --search deep/deep2 (0 = auto).
+    /// CPU cores.
     #[arg(long, default_value_t = 0)]
     pub cpu: u32,
 
-    /// Flag data by time or pp ranges.
-    #[arg(long, num_args = 1.., value_name = "MODE [ARGS...]")]
+    /// Flag data.
+    #[arg(long, num_args = 1.., value_name = "SPEC")]
     pub flagging: Vec<String>,
 
-    /// Plot Allan deviation (requires length/loop).
+    /// Allan deviation.
     #[arg(long)]
     pub allan_deviance: bool,
 
-    /// Heatmaps of raw visibility (amp/phase).
+    /// Raw visibility plots.
     #[arg(long)]
     pub raw_visibility: bool,
 
-    /// UV coverage plot (0 planar, 1 3D).
+    /// UV coverage.
     #[arg(long, num_args = 0..=1, default_missing_value = "1")]
     pub uv: Option<i32>,
 
-    #[arg(long, num_args = 0.., value_name = "KEY[:VALUE]")]
+    #[arg(long, num_args = 0.., value_name = "KEY")]
     pub fringe_rate_map: Option<Vec<String>>,
 
-    /// Maser analysis (off:<path> / off:linear / off:quad; see --detail).
-    #[arg(long, num_args = 1.., value_name = "KEY:VALUE")]
+    /// Maser analysis.
+    #[arg(long, num_args = 1.., value_name = "KEY")]
     pub maser: Vec<String>,
 
-    /// Visibility-domain pulse folding (period/bins/on-duty).
-    #[arg(long, num_args = 1.., value_name = "KEY:VALUE")]
+    /// Pulse folding.
+    #[arg(long, num_args = 1.., value_name = "KEY")]
     pub folding: Vec<String>,
 
-    /// Multi-sideband inputs (see --detail).
-    #[arg(long, num_args = 6, value_names = ["C_COR", "C_BP", "C_DELAY", "X_COR", "X_BP", "X_DELAY"], allow_negative_numbers = true)]
+    /// Multi-sideband analysis.
+    #[arg(long, num_args = 6, value_name = "ARGS", allow_negative_numbers = true)]
     pub multi_sideband: Vec<String>,
 
-    /// Plot antenna uptime (Az/El).
+    /// Antenna uptime.
     #[arg(long)]
     pub uptimeplot: bool,
 
-    /// Earth-rotation imaging (use `--imaging test` for the synthetic self-test).
-    #[arg(long, num_args = 0.., value_name = "KEY[:VALUE]")]
+    /// Earth-rotation imaging.
+    #[arg(long, num_args = 0.., value_name = "KEY")]
     pub imaging: Option<Vec<String>>,
 
-    /// Show detailed CLI guide and exit.
+    /// Detailed help.
     #[arg(long)]
     pub detail: bool,
 }

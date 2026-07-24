@@ -48,7 +48,7 @@
        onoff:0|1            0=(ON-OFF)/OFF（既定）、1=(ON-OFF)
        Vlst:<km/s>          LSR 速度補正の上書き
        corrfreq:<x>         サンプリング周波数への倍率
-       --npz 指定時は baseline mask を *_maser_baseline_mask.npz に保存。
+       --npz 指定時は frequency_mhz/masked_bool を含む *_maser_baseline_mask.npz を保存。
        他に、出力グラフ/TSV は frinZ/maser/ 配下へ保存。
   --folding key:val...（可視光度fold）
        period:<sec>         折り畳み周期（必須）
@@ -66,7 +66,7 @@
        ecc:<0..1), omega_deg:<deg> 楕円軌道パラメータ
        eph:<FILE>           上記キーを key=value or KEY VALUE で書いたエフェメリスファイル
        --delay/--rate/--acel を適用した複素ビジビリティで fold を実行。
-       出力は *_folding_profile.png, *_folding_summary.txt。--npz 指定時は *_folding.npz, *_folding_count.npz, *_folding_on_bin.npz も保存。
+       出力は *_folding_profile.png, *_folding_summary.txt。--npz 指定時は pulse_phase_turn/profile/count_sample/on_bin_bool を含む *_folding.npz を保存。
   --multi-sideband C_COR C_BP C_DELAY X_COR X_BP X_DELAY
        BP に -1 を入れると当該バンド BP 無効化。
   --fringe-rate-map key[:val]...
@@ -84,10 +84,11 @@
   --add-plot                         Amp/SNR/位相/雑音の時系列
   --wwz                              各 loop の fringe-search 結果に対して WWZ を実行（frinZ/wwz/）
   --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）
-  --bandpass-table                   補正後スペクトルを圧縮NPZ保存
-  --spectrum                         クロススペクトルを圧縮NPZ保存
+  --bandpass-table                   補正後スペクトルを圧縮NPZ保存（frequency_mhz, real, imag, amplitude, phase_deg）
+  --spectrum                         クロススペクトルを圧縮NPZ保存（frequency_mhz, real, imag, amplitude, phase_deg）
   --cor2bin                          生可視光度をバイナリ保存
-  --npz                              解析・グラフ作成時に同じ stem の圧縮自己記述型 *.npz も保存。
+  --npz                              解析・グラフ作成時に同じ stem の圧縮 *.npz を保存。
+                                     各配列は time_s, frequency_mhz, rate_hz, delay_sample など単位付きキー名で保存。
                                      未指定時は大きな配列データ sidecar を作らない。
   tools/npz_open.py --npz FILE [--output] [--ext png|pdf|ps|eps|jpg...] [--nofig]
   --output は FILE の stem に .tsv と指定拡張子のグラフを出力。

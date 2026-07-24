@@ -129,8 +129,11 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
 
 fn try_pngquant(path: &Path, original_size: usize, mode: CompressQuality) -> bool {
     let (quality_arg, speed_arg) = match mode {
-        CompressQuality::High => ("60-80", "3"),
-        CompressQuality::Low => ("50-70", "5"),
+        // Scientific plots often use smooth color maps.  Aggressive palette
+        // quantization makes them look like pixel art, so keep pngquant in a
+        // visually near-lossless range and spend CPU instead of color fidelity.
+        CompressQuality::High => ("95-100", "1"),
+        CompressQuality::Low => ("90-100", "2"),
     };
     let output_path = path.with_extension("pngquant.tmp.png");
 
@@ -138,6 +141,7 @@ fn try_pngquant(path: &Path, original_size: usize, mode: CompressQuality) -> boo
         .arg("--force")
         .arg("--skip-if-larger")
         .arg("--strip")
+        .arg("--nofs")
         .arg("--speed")
         .arg(speed_arg)
         .arg("--quality")

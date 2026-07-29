@@ -32,7 +32,7 @@
 
   --contamination-subtract <MODEL.npz>
   --contamisubt <MODEL.npz>            上記の短縮別名
-       flux が通常出力と同じprefixで常に出力する obscode_***_contamisubt_model.npz と --input ORIGINAL.cor を同時に読み、
+       flux がC/Xそれぞれ通常出力と同じprefixで出力する obscode_***_{c,x}_contamisubt_model.npz と、対応bandの --input ORIGINAL.cor を同時に読み、
        private copy-on-writeメモリ上で減算してそのまま通常解析する。元 .cor は変更せず、*_contamisubt.cor も作らない。
        解析結果の場所・名前は従来どおり contamisubt/frinZ/.../*_contamisubt_* を維持する。
        モデル内の input_cor と --input を照合し、該当する積分区間だけを減算する。

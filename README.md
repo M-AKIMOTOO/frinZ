@@ -362,11 +362,11 @@ In stdout and `*_summary.txt`, these appear as:
 
 ## Contamination handoff (`--contamination`)
 
-`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` が通常出力と同じprefixの `obscode_***_contamisubt_model.npz` を常に生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` と補正テーブルを同時に読み、private copy-on-writeメモリ上で減算して通常解析を続けます。元 `.cor` と出力ファイル名は維持し、`*_contamisubt.cor` は生成しません。
+`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` がC/Xそれぞれ通常出力と同じprefixの `obscode_***_{c,x}_contamisubt_model.npz` を生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` と補正テーブルを同時に読み、private copy-on-writeメモリ上で減算して通常解析を続けます。元 `.cor` と出力ファイル名は維持し、`*_contamisubt.cor` は生成しません。
 
 format v5 handoff は、`--length` の積分開始 MJD/UVW、積分時間、中心周波数、および frinZ が通常のテキスト行へ出した delay/rate セルの複素値を1個保存します。MJDは積分中心ではなく開始時刻で、その時刻から `effective_integration_time_s` のデータを用います。fringe searchの位相基準も最初のsampleです。加えて `raw_mjd`, `raw_uv_{u,v,w}`, `raw_frequency_mhz`, `raw_visibility_real/imag` を保存します。raw visibilityは `.cor` 読み込み直後のrow-major `[sector,channel]` で、ACF規格化、rebin、delay/rate補正、padding、bandpass補正より前の値です。
 
-fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v5はdirect arrayを保持せず、gain複素スペクトル、各sectorの時刻・幾何遅延、周波数軸、フラックス比、窓ごとの複素規格化係数だけを小容量テーブルとして保持します。frinZ `--contamisubt` は元 `.cor` のcopy-on-writeビュー上で同じ補正量を再構成して減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
+fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v5はC/X別ファイルで、direct arrayを保持せず、gain複素スペクトル、各sectorの時刻・幾何遅延、周波数軸、フラックス比、窓ごとの複素規格化係数だけを小容量テーブルとして保持します。frinZ `--contamisubt` は元 `.cor` のcopy-on-writeビュー上で同じ補正量を再構成して減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
 
 `flux --contamination` の `c:`/`x:` はこの `*_contamination.npz`（複数・ワイルドカード可）、`ra:HHMMSS`/`dec:DDMMSS` は位相中心基準の J2000 絶対座標、`flux:mJy` は基準周波数のフラックス、`alpha` は `S_nu ∝ nu^alpha` です。方向余弦は `l=cos(dec)*sin(ra-ra0)`、`m=sin(dec)*cos(dec0)-cos(dec)*sin(dec0)*cos(ra-ra0)` です。
 
@@ -385,7 +385,7 @@ flux ... --contamination ... ra:... dec:... flux:10 fit:on
 
 # 3. 元 .cor へテーブルをメモリ内適用し、そのまま通常解析
 frinZ --input ant1_ant2_yyyydddhhmmss_c.cor \
-  --contamination-subtract i25314x_frinZ_x_all_SIGMAGEM_x_contamisubt_model.npz \
+  --contamination-subtract i25314x_frinZ_c_all_SIGMAGEM_c_contamisubt_model.npz \
   --length 480 --loop 3
 # 短縮別名: --contamisubt
 ```

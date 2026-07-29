@@ -364,17 +364,21 @@ In stdout and `*_summary.txt`, these appear as:
 
 `frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` が通常出力と同じprefixの `obscode_***_contamisubt_model.npz` を常に生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` へモデルを適用し、元 `.cor` ディレクトリ直下の `contamisubt/` に `*_contamisubt.cor` を生成します。
 
-format v3 handoff は、`--length` の積分開始 MJD/UVW、積分時間、中心周波数、および frinZ が実際に採用して通常のテキスト行へ出した delay/rate セルの複素値を1個保存します。MJDは積分中心ではなく開始時刻であり、その時刻から `effective_integration_time_s` のデータを用いたことを表します。fringe search で求めた residual rate の位相基準も積分区間の最初のサンプル（`elapsed_s=0`）です。したがって、NPZ の複素位相、MJD、UVW は同一の積分開始 epoch を表します。手動補正やbandpassはfrinZ内で適用済みで、fluxはsearch delay/rateを再適用しません。通常handoffに周波数チャネル配列は保存せず、必要な場合だけ独立した `--spectrum` を使用します。v3は `.cor` への随伴減算を再現するため `analysis_rows`、`rate_padding`、RFI指定、bandpass使用有無も保存します。
+format v5 handoff は、`--length` の積分開始 MJD/UVW、積分時間、中心周波数、および frinZ が通常のテキスト行へ出した delay/rate セルの複素値を1個保存します。MJDは積分中心ではなく開始時刻で、その時刻から `effective_integration_time_s` のデータを用います。fringe searchの位相基準も最初のsampleです。加えて `raw_mjd`, `raw_uv_{u,v,w}`, `raw_frequency_mhz`, `raw_visibility_real/imag` を保存します。raw visibilityは `.cor` 読み込み直後のrow-major `[sector,channel]` で、ACF規格化、rebin、delay/rate補正、padding、bandpass補正より前の値です。
+
+fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v4はこのdirect arrayを保持し、frinZ `--contamisubt` は元 `.cor` から要素ごとに直接減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
 
 `flux --contamination` の `c:`/`x:` はこの `*_contamination.npz`（複数・ワイルドカード可）、`ra:HHMMSS`/`dec:DDMMSS` は位相中心基準の J2000 絶対座標、`flux:mJy` は基準周波数のフラックス、`alpha` は `S_nu ∝ nu^alpha` です。方向余弦は `l=cos(dec)*sin(ra-ra0)`、`m=sin(dec)*cos(dec0)-cos(dec)*sin(dec0)*cos(ra-ra0)` です。
 
-帯域 `b` の座標位相を `G_b(t)=phase_sign*2*pi*uv_sign*(u*l+v*m)` とすると、flux は全時刻を `V_i=A_i exp(i theta_target)+S_contam exp(i(G_i+theta_contam))+N_i` で複素fitします。`A_i>=0` は時刻ごとに自由で、C/X の `theta_target` と `theta_contam` は独立です。最初の観測位相への強制整列、delay/rate の再補正、周波数チャネル処理は行いません。`fit:off` は外部座標を固定し、`fit:on` は同じ複素残差で位置も推定します。
+帯域 `b` の座標位相を `G_b(t)=phase_sign*2*pi*uv_sign*(u*l+v*m)` とすると、flux は全時刻を `V_i=A_i exp(i theta_target)+S_contam exp(i(G_i+theta_contam))+N_i` で複素fitします。`A_i>=0` は時刻ごとに自由で、C/X の `theta_target` と `theta_contam` は独立です。最初の観測位相への強制整列やdelay/rateの再探索は行いません。二天体fitは複素scalarで行い、補正 `.cor` の生成時だけv4の正確な生UVW・周波数グリッドを使用します。`fit:off` は外部座標を固定し、`fit:on` は同じ複素残差で位置も推定します。
 
 複素減算は `Vobs=Vtarget+Vcontam+N`、`Vclean=Vobs-Vcontam`。`before` は減算前、`after` は複素減算後の振幅です。
 
 ```bash
-# 1. frinZ handoff を作成
-frinZ --input ant1_ant2_yyyydddhhmmss_c.cor --length 480 --loop 3 --contamination
+# 1. target と前後gainの handoff を作成
+frinZ --input target.cor --length 480 --loop 3 --contamination
+frinZ --input gain_before.cor --length 480 --loop 1 --contamination
+frinZ --input gain_after.cor  --length 480 --loop 1 --contamination
 
 # 2. flux がコンタミモデルを推定（元 .cor は読まない）
 flux ... --contamination ... ra:... dec:... flux:10 fit:on
@@ -388,7 +392,7 @@ frinZ --input ant1_ant2_yyyydddhhmmss_c.cor \
 frinZ --input contamisubt/ant1_ant2_yyyydddhhmmss_c_contamisubt.cor --length 480 --loop 3
 ```
 
-同じdelay/rateセルのfrinZ複素値へ同じtarget−gain位相回転を適用すると、fluxのclean scalarと一致します。raw `.cor` はgain-reference前なので、未回転の位相角は直接比較しません。再度 `--search` して別セルが最大になった場合は、コンタミ除去後の新しいピークとして別に評価します。
+同じdelay/rateセルのfrinZ複素値へ同じtarget−gain位相回転を適用すると、fluxのclean scalarと一致します。raw `.cor` はgain-reference前なので、未回転の位相角は直接比較しません。既知の位相中心天体は補正後の `(delay,rate)=(0,0)` 固定セルで評価します。全平面 `--search` の最大SNRはtrial factorを含み、SNR 5--6だけでは検出ではありません。非ゼロセルは未モデル成分、RFI、雑音最大点として別途検証します。定数位相オフセットは複素平面を一様回転するだけでdelay/rate座標を変えません。delayずれは周波数位相傾斜、rateずれは時間位相傾斜です。
 
 ## Output Files
 
@@ -504,6 +508,10 @@ vis = z["frinz_complex_vis"]  # exact selected fringe cell, shape (1,)
 freq = z["frequency_mhz"]     # representative frequency [MHz], shape (1,)
 mjd = z["mjd"]                # integration start MJD, shape (1,)
 duration = z["effective_integration_time_s"]  # data length from mjd [s]
+raw_mjd = z["raw_mjd"]
+raw_freq = z["raw_frequency_mhz"]
+raw_vis = z["raw_visibility_real"] + 1j*z["raw_visibility_imag"]
+raw_vis = raw_vis.reshape(len(raw_mjd), len(raw_freq))
 ```
 
-format v2/v3 の `complex_vis`、`visibility_real`、`visibility_imag` も同じ1個の複素フリンジピークです。Additional arrays include start-time `uv_w`, `du_dt_m_per_s`, `dv_dt_m_per_s`, `elapsed_s=0`, representative `wavelength_m`, `peak_delay_sample`, `peak_rate_hz`, `peak_snr`, and `peak_noise`. Scalar/header values are stored as one-element arrays (`phase_center_ra_rad`, `phase_center_dec_rad`, `observing_frequency_hz`, `effective_integration_time_s`); text metadata is available as UTF-8 byte arrays (`source_name`, `input_cor`) and the complete handoff is retained in `metadata_json`. 外部 JSON ファイルは廃止され、`flux --contamination` も NPZ のみを受け付けます。
+format v2/v3/v4 の `complex_vis`、`visibility_real`、`visibility_imag` も同じ1個の複素フリンジピークです。Additional arrays include start-time `uv_w`, `du_dt_m_per_s`, `dv_dt_m_per_s`, `elapsed_s=0`, representative `wavelength_m`, `peak_delay_sample`, `peak_rate_hz`, `peak_snr`, and `peak_noise`. Scalar/header values are stored as one-element arrays (`phase_center_ra_rad`, `phase_center_dec_rad`, `observing_frequency_hz`, `effective_integration_time_s`); text metadata is available as UTF-8 byte arrays (`source_name`, `input_cor`) and the complete handoff is retained in `metadata_json`. 外部 JSON ファイルは廃止され、`flux --contamination` も NPZ のみを受け付けます。

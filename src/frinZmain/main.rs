@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .input
             .as_ref()
             .ok_or("--contamination-subtract requires --input ORIGINAL.cor")?;
-        run_contamination_subtract(input_path, model_path)?;
+        run_contamination_subtract(input_path, model_path, args.bandpass.as_deref())?;
         return Ok(());
     }
 

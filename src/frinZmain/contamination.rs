@@ -28,6 +28,18 @@ struct ContaminationHandoff<'a> {
     projection: ProjectionInfo,
     visibility: VisibilitySeries,
     flux_usage: FluxUsage,
+    #[serde(skip)]
+    bandpass_real: Vec<f32>,
+    #[serde(skip)]
+    bandpass_imag: Vec<f32>,
+    /// Unmodified row-major complex visibility read from the source .cor
+    /// window, before normalization, rebinning, phase correction, padding,
+    /// or bandpass correction.  Shape is
+    /// [time_axis.samples_per_visibility, spectral_setup.original_channels].
+    #[serde(skip)]
+    raw_visibility_real: Vec<f32>,
+    #[serde(skip)]
+    raw_visibility_imag: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +70,10 @@ struct SpectralSetup {
     channel_width_hz: f64,
     frequency_mhz: Vec<f64>,
     wavelength_m: Vec<f64>,
+    #[serde(skip)]
+    raw_frequency_mhz: Vec<f64>,
+    #[serde(skip)]
+    raw_wavelength_m: Vec<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +84,10 @@ struct TimeAxis {
     samples_per_visibility: i32,
     mjd: Vec<f64>,
     elapsed_s: Vec<f64>,
+    #[serde(skip)]
+    raw_mjd: Vec<f64>,
+    #[serde(skip)]
+    raw_elapsed_s: Vec<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +98,12 @@ struct UvwSeries {
     w_m: Vec<f64>,
     du_dt_m_per_s: Vec<f64>,
     dv_dt_m_per_s: Vec<f64>,
+    #[serde(skip)]
+    raw_u_m: Vec<f64>,
+    #[serde(skip)]
+    raw_v_m: Vec<f64>,
+    #[serde(skip)]
+    raw_w_m: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +185,8 @@ pub fn write_contamination_handoff(
     fringe_peak_snr: f32,
     fringe_peak_noise: f32,
     correction: ContaminationPhaseCorrectionInput,
+    bandpass_data: Option<&[num_complex::Complex<f32>]>,
+    raw_visibility: &[num_complex::Complex<f32>],
 ) -> Result<PathBuf, Box<dyn Error>> {
     let output_path = contamination_output_path(input_path, args, frinz_dir, basename)?;
     if let Some(parent) = output_path.parent() {
@@ -177,6 +205,8 @@ pub fn write_contamination_handoff(
         fringe_peak_snr,
         fringe_peak_noise,
         correction,
+        bandpass_data,
+        raw_visibility,
         args,
     );
     let npz_path = output_path;
@@ -204,6 +234,20 @@ fn write_contamination_npz(
     npz.add_f64_1d("dv_dt_m_per_s", &handoff.uvw_m.dv_dt_m_per_s);
     npz.add_f64_1d("frequency_mhz", &handoff.spectral_setup.frequency_mhz);
     npz.add_f64_1d("wavelength_m", &handoff.spectral_setup.wavelength_m);
+    npz.add_f64_1d("raw_mjd", &handoff.time_axis.raw_mjd);
+    npz.add_f64_1d("raw_elapsed_s", &handoff.time_axis.raw_elapsed_s);
+    npz.add_f64_1d("raw_uv_u", &handoff.uvw_m.raw_u_m);
+    npz.add_f64_1d("raw_uv_v", &handoff.uvw_m.raw_v_m);
+    npz.add_f64_1d("raw_uv_w", &handoff.uvw_m.raw_w_m);
+    npz.add_f64_1d(
+        "raw_frequency_mhz",
+        &handoff.spectral_setup.raw_frequency_mhz,
+    );
+    npz.add_f64_1d("raw_wavelength_m", &handoff.spectral_setup.raw_wavelength_m);
+    npz.add_f32_1d("bandpass_real", &handoff.bandpass_real);
+    npz.add_f32_1d("bandpass_imag", &handoff.bandpass_imag);
+    npz.add_f32_1d("raw_visibility_real", &handoff.raw_visibility_real);
+    npz.add_f32_1d("raw_visibility_imag", &handoff.raw_visibility_imag);
     npz.add_complex64_1d("complex_vis", &[fringe_peak_visibility]);
     npz.add_complex64_1d("frinz_complex_vis", &[fringe_peak_visibility]);
     npz.add_f32_1d("visibility_real", &handoff.visibility.real);
@@ -281,6 +325,8 @@ fn build_handoff<'a>(
     fringe_peak_snr: f32,
     fringe_peak_noise: f32,
     correction: ContaminationPhaseCorrectionInput,
+    bandpass_data: Option<&[num_complex::Complex<f32>]>,
+    raw_visibility: &[num_complex::Complex<f32>],
     args: &Args,
 ) -> ContaminationHandoff<'a> {
     let original_channels = (header.fft_point / 2).max(0) as usize;
@@ -307,11 +353,56 @@ fn build_handoff<'a>(
         f64::NAN
     };
     let total_integration_time_s = samples_per_visibility.max(1) as f32 * effective_integ_time;
+    let raw_frequency_mhz: Vec<f64> = (0..original_channels)
+        .map(|channel| (header.observing_frequency + channel as f64 * channel_width_hz) / 1.0e6)
+        .collect();
+    let raw_wavelength_m: Vec<f64> = raw_frequency_mhz
+        .iter()
+        .map(|frequency_mhz| C_M_PER_S / (frequency_mhz * 1.0e6))
+        .collect();
+    let raw_samples = samples_per_visibility.max(0) as usize;
+    let mut raw_mjd = Vec::with_capacity(raw_samples);
+    let mut raw_elapsed_s = Vec::with_capacity(raw_samples);
+    let mut raw_u_m = Vec::with_capacity(raw_samples);
+    let mut raw_v_m = Vec::with_capacity(raw_samples);
+    let mut raw_w_m = Vec::with_capacity(raw_samples);
+    for sample in 0..raw_samples {
+        let elapsed_s = sample as f64 * effective_integ_time as f64;
+        let sample_time =
+            window_start_time + Duration::nanoseconds((elapsed_s * 1.0e9).round() as i64);
+        let (sample_u, sample_v, sample_w, _, _) = uvw_cal(
+            header.station1_position,
+            header.station2_position,
+            sample_time,
+            header.source_position_ra,
+            header.source_position_dec,
+            true,
+        );
+        raw_mjd.push(datetime_to_mjd(sample_time));
+        raw_elapsed_s.push(elapsed_s);
+        raw_u_m.push(sample_u);
+        raw_v_m.push(sample_v);
+        raw_w_m.push(sample_w);
+    }
 
+    let bandpass_real = bandpass_data
+        .map(|values| values.iter().map(|value| value.re).collect())
+        .unwrap_or_default();
+    let bandpass_imag = bandpass_data
+        .map(|values| values.iter().map(|value| value.im).collect())
+        .unwrap_or_default();
+    let expected_raw_values = raw_samples.saturating_mul(original_channels);
+    assert_eq!(
+        raw_visibility.len(),
+        expected_raw_values,
+        "raw contamination visibility shape does not match the .cor window"
+    );
+    let raw_visibility_real = raw_visibility.iter().map(|value| value.re).collect();
+    let raw_visibility_imag = raw_visibility.iter().map(|value| value.im).collect();
     ContaminationHandoff {
         product: "frinZ_contamination_handoff",
-        format_version: 3,
-        note: "One NPZ contains the exact complex time-domain fringe value reported by frinZ for one --length window. flux performs scalar point-source subtraction; full channel spectra are available separately through frinZ --spectrum.",
+        format_version: 5,
+        note: "One NPZ contains the exact complex time-domain fringe scalar and the unmodified time-by-frequency complex visibility read from .cor. flux uses target and gain-calibrator handoffs to construct a contaminant model directly in the original .cor frame.",
         input_cor: input_path.display().to_string(),
         source: SourceInfo {
             name: &header.source_name,
@@ -336,6 +427,8 @@ fn build_handoff<'a>(
             channel_width_hz,
             frequency_mhz: vec![reference_frequency_mhz],
             wavelength_m: vec![reference_wavelength_m],
+            raw_frequency_mhz,
+            raw_wavelength_m,
         },
         time_axis: TimeAxis {
             start_utc: window_start_time.to_rfc3339(),
@@ -344,6 +437,8 @@ fn build_handoff<'a>(
             samples_per_visibility,
             mjd: vec![datetime_to_mjd(window_start_time)],
             elapsed_s: vec![0.0],
+            raw_mjd,
+            raw_elapsed_s,
         },
         uvw_m: UvwSeries {
             description: "UVW and derivatives in meters at the start of the analyzed --length window. The scalar visibility integrates forward from this epoch for effective_integration_time_s.",
@@ -352,6 +447,9 @@ fn build_handoff<'a>(
             w_m: vec![w],
             du_dt_m_per_s: vec![du_dt],
             dv_dt_m_per_s: vec![dv_dt],
+            raw_u_m,
+            raw_v_m,
+            raw_w_m,
         },
         phase_correction: PhaseCorrectionSeries {
             description: "Manual delay/rate corrections, if specified, have already been applied before frinZ selects the reported time-domain fringe cell. Searched residual rate is referenced to the first sample of the --length window, the same epoch as MJD/UVW. The handoff stores that exact complex scalar.",
@@ -379,7 +477,7 @@ fn build_handoff<'a>(
             analysis_rows: (samples_per_visibility.max(1) as usize).next_power_of_two(),
             rate_padding: args.rate_padding.max(1),
             rfi_specs: args.rfi.clone(),
-            bandpass_applied: args.bandpass.is_some(),
+            bandpass_applied: bandpass_data.is_some(),
             exact_peak_indices_available: false,
         },
         visibility: VisibilitySeries {
@@ -393,6 +491,10 @@ fn build_handoff<'a>(
             phase_model: "flux fits all frinZ complex scalars with V_i=A_i*exp(i*theta_target)+S_contam*exp(i*(G_i+theta_contam))+N_i, with A_i>=0 free per epoch and independent constant phases per band; no first-sample phase anchoring or delay/rate reprocessing is used.",
             amplitude_model: "A(nu) is flux density converted to correlation units by flux using the phase-center/gain-calibrator flux calibration products.",
         },
+        bandpass_real,
+        bandpass_imag,
+        raw_visibility_real,
+        raw_visibility_imag,
     }
 }
 
@@ -424,6 +526,7 @@ mod tests {
         };
         let start = Utc.with_ymd_and_hms(2025, 11, 10, 14, 46, 0).unwrap();
         let peak = num_complex::Complex::new(0.0125, -0.003);
+        let raw_visibility = vec![num_complex::Complex::new(0.0, 0.0); 480 * 512];
         let correction = ContaminationPhaseCorrectionInput {
             manual_delay_sample: 0.0,
             manual_rate_hz: 0.0,
@@ -448,10 +551,12 @@ mod tests {
             20.0,
             0.0005,
             correction,
+            None,
+            &raw_visibility,
             &Args::default(),
         );
 
-        assert_eq!(handoff.format_version, 3);
+        assert_eq!(handoff.format_version, 5);
         assert_eq!(handoff.projection.analysis_rows, 512);
         assert_eq!(handoff.projection.rate_padding, 1);
         assert!(!handoff.projection.bandpass_applied);
@@ -465,6 +570,8 @@ mod tests {
         assert_eq!(handoff.uvw_m.u_m.len(), 1);
         assert_eq!(handoff.time_axis.elapsed_s, vec![0.0]);
         assert_eq!(handoff.phase_correction.search_start_time_offset_s, 0.0);
+        assert_eq!(handoff.raw_visibility_real.len(), 480 * 512);
+        assert_eq!(handoff.raw_visibility_imag.len(), 480 * 512);
         assert!((handoff.time_axis.mjd[0] - datetime_to_mjd(start)).abs() < 1.0e-12);
     }
 }

@@ -555,6 +555,11 @@ pub fn process_cor_file(
         }
 
         let physical_length = actual_length;
+        // Preserve exactly what was read from .cor.  The contamination
+        // handoff must describe the frame into which frinZ later subtracts;
+        // normalization, rebinning and fringe corrections below are analysis
+        // operations and must not alter this copy.
+        let raw_contamination_visibility = complex_vec.clone();
         // Every reported fringe value is referenced to the first sample of
         // this --length window.  Its timestamp must therefore be the window
         // start, not the integration midpoint.
@@ -807,6 +812,8 @@ pub fn process_cor_file(
                 analysis_results.delay_snr,
                 analysis_results.delay_noise,
                 correction,
+                bandpass_data.as_deref().filter(|values| !values.is_empty()),
+                &raw_contamination_visibility,
             )?;
         }
 

@@ -24,7 +24,10 @@
   --contamination [key:value ...]
        flux が複素コンタミモデルを推定するための圧縮 NPZ handoff を作成する。
        frinZ は元 .cor から、--length の積分開始MJD/UVW、積分時間、実際に採用した delay/rate セルの複素ピーク、
-       再投影条件を *_contamination.npz に保存する。この段階では天体信号を減算しない。
+       実際に使用した全セクタの時刻/UVW、元 .cor の全チャネル周波数、および .cor 読み込み直後の
+       時間×周波数複素ビジビリティを *_contamination.npz v5 に保存する。
+       raw visibilityはACF規格化、rebin、delay/rate補正、padding、bandpass補正より前の値である。
+       この段階では天体信号を減算しない。
        任意キー: output:<path> または out:<path> で NPZ 出力先を明示できる。
 
   --contamination-subtract <MODEL.npz>
@@ -32,6 +35,15 @@
        flux が通常出力と同じprefixで常に出力する obscode_***_contamisubt_model.npz を --input ORIGINAL.cor に適用し、
        元 .cor ディレクトリ直下の contamisubt/ へ *_contamisubt.cor を作成する。元 .cor は変更しない。
        モデル内の input_cor と --input を照合し、該当する積分区間だけを減算する。
+       v5 target/gain handoffが揃う場合、flux model v4に保存された元.corと同じshapeのdirect complex arrayを要素ごとに減算する。
+       fluxへ渡すglobにはtargetとgainの両方を含める。fluxは前後gainの実測複素スペクトルをtarget時刻へ補間する。
+       既知の位相中心天体は補正後の (delay,rate)=(0,0) 固定セルで判定する。全平面 --search のSNR 5--6はtrial factorを含み、単独では検出を意味しない。
+       定数位相オフセットは全チャネル・全時刻を同じ角度だけ回すため、delay/rateピーク位置やピーク分裂を作らない。
+       delayずれは周波数方向、rateずれは時間方向の位相傾斜である。
+
+       v5ではgain handoffのraw visibilityが複素bandpassと時間変化を同時に与えるため、別bandpass表は必須ではない。
+       v4以前のhandoffだけの場合はscalar逆投影へフォールバックする。flat complex bandpassしか無い場合は、scalarが一致しても
+       delay面に周波数依存残差・サイドローブ・分裂ピークが残り得るためWARN表示する。
 
   [コンタミ除去の観測条件（110 m基線）]
        長時間観測は必須ではないが、観測中にコンタミ天体の幾何位相が十分変化する必要がある。

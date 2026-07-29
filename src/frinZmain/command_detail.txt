@@ -34,7 +34,7 @@
   --contamisubt <MODEL.npz>            上記の短縮別名
        flux がC/Xそれぞれ通常出力と同じprefixで出力する obscode_***_{c,x}_contamisubt_model.npz と、対応bandの --input ORIGINAL.cor を同時に読み、
        private copy-on-writeメモリ上で減算してそのまま通常解析する。元 .cor は変更せず、*_contamisubt.cor も作らない。
-       解析結果の場所・名前は従来どおり contamisubt/frinZ/.../*_contamisubt_* を維持する。
+       解析結果は contamisubt/frinZ/... に保存し、名前は `*_<product>_contamisubt.<ext>` とする。
        モデル内の input_cor と --input を照合し、該当する積分区間だけを減算する。
        v5 target/gain handoffが揃う場合、flux model v5の小容量gain/geometry補正テーブルから各sector・channelの補正量を再構成する。
        fluxへ渡すglobにはtargetとgainの両方を含める。fluxは前後gainの実測複素スペクトルをtarget時刻へ補間する。
@@ -132,6 +132,10 @@
   --dynamic-spectrum, --raw-visibility, --uv [0|1], --uptimeplot
 
 [出力・グラフ補助]
+  出力名は基本stemのproduct名の後へ補正接尾辞を固定順 bp -> rfi -> contamisubt で付ける。
+  例: *_delay_rate_search_bp.txt, *_delay_rate_search_bp_rfi.txt,
+      *_delay_rate_search_bp_rfi_contamisubt.txt, *_SIGMAGEM_cumulate60_bp_rfi.png。
+  TXT/TSV/PNG/NPZおよびspectrum/bptable/dynamic/add-plot/cumulate/WWZ/STFFT/Allan/in-band/sidecarで共通。
   --add-plot                         Amp/SNR/位相/雑音の時系列
   --wwz                              各 loop の fringe-search 結果に対して WWZ を実行（frinZ/wwz/）
   --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）

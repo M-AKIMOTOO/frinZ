@@ -23,7 +23,8 @@ use crate::input_support::{open_input_data, open_input_data_copy_on_write};
 use crate::norm_acf::NormAcfContext;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::{
-    format_delay_output, format_freq_output, generate_output_names, output_header_info,
+    format_delay_output, format_freq_output, generate_output_names,
+    insert_product_before_processing_suffixes, output_header_info,
 };
 use crate::plot::{
     delay_plane, frequency_plane, plot_dynamic_spectrum_freq, plot_dynamic_spectrum_lag,
@@ -282,11 +283,16 @@ pub fn process_cor_file(
     } else {
         original_basename.to_string()
     };
-    let basename_for_output = if args.in_beam {
-        format!("{}_inbeam", basename)
-    } else {
-        basename.clone()
-    };
+    let mut basename_for_output = basename.clone();
+    if args.bandpass.is_some() {
+        basename_for_output.push_str("_bp");
+    }
+    if !args.rfi.is_empty() {
+        basename_for_output.push_str("_rfi");
+    }
+    if args.in_beam {
+        basename_for_output.push_str("_inbeam");
+    }
     let mut label: Vec<String> = basename.split('_').map(String::from).collect();
     if label.len() > 3 {
         let tail = label[3..].join("_");
@@ -840,8 +846,12 @@ pub fn process_cor_file(
 
         if args.spectrum {
             if let Some(path) = &spectrum_output_path {
-                let output_file_path = path.join(format!("{}_spectrum.npz", base_filename));
-                let _ = fs::remove_file(path.join(format!("{}_cross.spec", base_filename)));
+                let output_stem =
+                    insert_product_before_processing_suffixes(&base_filename, "spectrum");
+                let output_file_path = path.join(format!("{output_stem}.npz"));
+                let legacy_stem =
+                    insert_product_before_processing_suffixes(&base_filename, "cross");
+                let _ = fs::remove_file(path.join(format!("{legacy_stem}.spec")));
                 let npz_path = write_spectrum_npz(
                     &output_file_path,
                     "spectrum",
@@ -864,8 +874,10 @@ pub fn process_cor_file(
 
         if args.bandpass_table {
             if let Some(path) = &bandpass_output_path {
-                let output_file_path = path.join(format!("{}_bptable.npz", base_filename));
-                let _ = fs::remove_file(path.join(format!("{}_bptable.bin", base_filename)));
+                let output_stem =
+                    insert_product_before_processing_suffixes(&base_filename, "bptable");
+                let output_file_path = path.join(format!("{output_stem}.npz"));
+                let _ = fs::remove_file(path.join(format!("{output_stem}.bin")));
                 let npz_path = write_spectrum_npz(
                     &output_file_path,
                     "bptable",
@@ -914,8 +926,11 @@ pub fn process_cor_file(
             let truncated_vec = complex_vec[..usable_len].to_vec();
             let spectrum_array =
                 Array::from_shape_vec((usable_rows, fft_point_half), truncated_vec).unwrap();
-            let output_path_freq = dynamic_spectrum_dir
-                .join(format!("{}_dynamic_spectrum_frequency.png", base_filename));
+            let frequency_stem = insert_product_before_processing_suffixes(
+                &base_filename,
+                "dynamic_spectrum_frequency",
+            );
+            let output_path_freq = dynamic_spectrum_dir.join(format!("{frequency_stem}.png"));
             plot_dynamic_spectrum_freq(
                 output_path_freq.to_str().unwrap(),
                 &spectrum_array,
@@ -960,8 +975,11 @@ pub fn process_cor_file(
                     lag_data[[i, j]] = val.norm();
                 }
             }
-            let output_path_lag = dynamic_spectrum_dir
-                .join(format!("{}_dynamic_spectrum_time_lag.png", base_filename));
+            let lag_stem = insert_product_before_processing_suffixes(
+                &base_filename,
+                "dynamic_spectrum_time_lag",
+            );
+            let output_path_lag = dynamic_spectrum_dir.join(format!("{lag_stem}.png"));
             plot_dynamic_spectrum_lag(
                 output_path_lag.to_str().unwrap(),
                 &lag_data,
@@ -1054,18 +1072,11 @@ pub fn process_cor_file(
                     };
                     fs::create_dir_all(&out_dir)?;
                     let output_basename = first_output_basename.as_ref().unwrap_or(&base_filename);
-                    let output_basename = if args.in_beam {
-                        output_basename
-                            .strip_suffix("_inbeam")
-                            .unwrap_or(output_basename.as_str())
-                    } else {
-                        output_basename.as_str()
-                    };
-                    let output_file_path = if args.in_beam {
-                        out_dir.join(format!("{}_delay_rate_search_inbeam.txt", output_basename))
-                    } else {
-                        out_dir.join(format!("{}_delay_rate_search.txt", output_basename))
-                    };
+                    let output_stem = insert_product_before_processing_suffixes(
+                        output_basename,
+                        "delay_rate_search",
+                    );
+                    let output_file_path = out_dir.join(format!("{output_stem}.txt"));
                     fs::write(output_file_path, &delay_output_str)?;
                 }
             }
@@ -1115,18 +1126,11 @@ pub fn process_cor_file(
                     };
                     fs::create_dir_all(&out_dir)?;
                     let output_basename = first_output_basename.as_ref().unwrap_or(&base_filename);
-                    let output_basename = if args.in_beam {
-                        output_basename
-                            .strip_suffix("_inbeam")
-                            .unwrap_or(output_basename.as_str())
-                    } else {
-                        output_basename.as_str()
-                    };
-                    let output_file_path = if args.in_beam {
-                        out_dir.join(format!("{}_freq_rate_search_inbeam.txt", output_basename))
-                    } else {
-                        out_dir.join(format!("{}_freq_rate_search.txt", output_basename))
-                    };
+                    let output_stem = insert_product_before_processing_suffixes(
+                        output_basename,
+                        "freq_rate_search",
+                    );
+                    let output_file_path = out_dir.join(format!("{output_stem}.txt"));
                     fs::write(output_file_path, &freq_output_str)?;
                 }
             }
@@ -1157,26 +1161,14 @@ pub fn process_cor_file(
                     path.join(format!("freq_domain/len{}s", length_label))
                 };
                 fs::create_dir_all(&plot_dir)?;
-                let base_for_plot = if args.in_beam {
-                    base_filename
-                        .strip_suffix("_inbeam")
-                        .unwrap_or(base_filename.as_str())
+                let product = if args.frequency {
+                    "freq_rate_search"
                 } else {
-                    base_filename.as_str()
+                    "delay_rate_search"
                 };
-                let output_filename = if !args.frequency {
-                    if args.in_beam {
-                        plot_dir.join(format!("{}_delay_rate_search_inbeam.png", base_for_plot))
-                    } else {
-                        plot_dir.join(format!("{}_delay_rate_search.png", base_for_plot))
-                    }
-                } else {
-                    if args.in_beam {
-                        plot_dir.join(format!("{}_freq_rate_search_inbeam.png", base_for_plot))
-                    } else {
-                        plot_dir.join(format!("{}_freq_rate_search.png", base_for_plot))
-                    }
-                };
+                let output_stem =
+                    insert_product_before_processing_suffixes(&base_filename, product);
+                let output_filename = plot_dir.join(format!("{output_stem}.png"));
 
                 if args.npz && !args.frequency {
                     let rate_axis: Vec<f64> = analysis_results

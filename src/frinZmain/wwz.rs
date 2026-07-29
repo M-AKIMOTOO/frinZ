@@ -1,6 +1,6 @@
 use crate::args::Args;
 use crate::npy_output::{NamedNpz, NpyMeta};
-use crate::output::generate_output_names;
+use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
 use crate::utils;
@@ -444,11 +444,12 @@ fn write_wwz_npz(
     transform: &WwzTransform,
     result: &ProcessResult,
 ) -> Result<(), Box<dyn Error>> {
-    let _ =
-        fs::remove_file(output_dir.join(format!("{}_wwz_{}.tsv", base_filename, series.suffix)));
-    let _ = fs::remove_file(
-        output_dir.join(format!("{}_wwz_{}_ridge.tsv", base_filename, series.suffix)),
-    );
+    let series_product = format!("wwz_{}", series.suffix);
+    let series_stem = insert_product_before_processing_suffixes(base_filename, &series_product);
+    let _ = fs::remove_file(output_dir.join(format!("{series_stem}.tsv")));
+    let ridge_product = format!("wwz_{}_ridge", series.suffix);
+    let ridge_stem = insert_product_before_processing_suffixes(base_filename, &ridge_product);
+    let _ = fs::remove_file(output_dir.join(format!("{ridge_stem}.tsv")));
     for legacy in [
         format!("{}_wwz_{}.npz", base_filename, series.suffix),
         format!("{}_wwa_{}.npz", base_filename, series.suffix),
@@ -485,7 +486,7 @@ fn write_wwz_npz(
     let ridge_period_s: Vec<f64> = transform.peak_period.clone();
     npz.add_f64_1d("ridge_power", &ridge_power);
     npz.add_f64_1d("ridge_period_s", &ridge_period_s);
-    npz.write(&output_dir.join(format!("{}_wwz_{}.npz", base_filename, series.suffix)))?;
+    npz.write(&output_dir.join(format!("{series_stem}.npz")))?;
     Ok(())
 }
 
@@ -502,10 +503,9 @@ fn plot_wwz_heatmap(
         WwzYAxis::PeriodLog => "logperiod",
         WwzYAxis::FrequencyLinear => "freq",
     };
-    let output_path = output_dir.join(format!(
-        "{}_wwz_{}_{}.png",
-        base_filename, series.suffix, axis_suffix
-    ));
+    let product = format!("wwz_{}_{}", series.suffix, axis_suffix);
+    let output_stem = insert_product_before_processing_suffixes(base_filename, &product);
+    let output_path = output_dir.join(format!("{output_stem}.png"));
     let root = BitMapBackend::new(&output_path, (1100, 760)).into_drawing_area();
     root.fill(&WHITE)?;
 

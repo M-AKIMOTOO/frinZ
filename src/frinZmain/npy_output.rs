@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::output::insert_product_before_processing_suffixes;
+
 const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
 const FORMAT_VERSION: u32 = 2;
 
@@ -48,11 +50,8 @@ pub fn npz_sidecar_path(output_path: &Path, flag: &str) -> PathBuf {
         .and_then(|v| v.to_str())
         .unwrap_or("analysis");
     let flag = flag.trim_start_matches('-').replace('-', "_");
-    if stem.ends_with(&flag) {
-        parent.join(format!("{stem}.npz"))
-    } else {
-        parent.join(format!("{stem}_{flag}.npz"))
-    }
+    let output_stem = insert_product_before_processing_suffixes(stem, &flag);
+    parent.join(format!("{output_stem}.npz"))
 }
 
 #[allow(dead_code)]
@@ -534,6 +533,13 @@ mod tests {
         assert_eq!(
             npz_sidecar_path(Path::new("/tmp/x_bptable.bin"), "bptable"),
             PathBuf::from("/tmp/x_bptable.npz")
+        );
+        assert_eq!(
+            npz_sidecar_path(
+                Path::new("/tmp/x_delay_rate_search_bp_rfi_contamisubt.png"),
+                "plot_delay_rate",
+            ),
+            PathBuf::from("/tmp/x_delay_rate_search_plot_delay_rate_bp_rfi_contamisubt.npz")
         );
     }
     #[test]

@@ -6,7 +6,7 @@
 // - multi-sideband summary plot (merged from former plot_msb.rs)
 use crate::args::Args;
 use crate::npy_output::{npz_sidecar_path, write_named_real_1d_npz, NamedNpz, NpyMeta};
-use crate::output::generate_output_names;
+use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
 use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
 use crate::utils::safe_arg;
@@ -957,6 +957,8 @@ pub fn write_cumulate_outputs(
         &result.obs_time,
         args.cumulate,
         args.in_beam,
+        !args.rfi.is_empty(),
+        args.bandpass.is_some(),
     )?;
     if args.npz
         && !result.cumulate_len.is_empty()
@@ -967,7 +969,9 @@ pub fn write_cumulate_outputs(
             .iter()
             .map(|&value| value as f64)
             .collect();
-        let npy_path = path.join(format!("{}_cumulate.npz", make_base_filename(args, result)));
+        let base_filename = make_base_filename(args, result);
+        let output_stem = insert_product_before_processing_suffixes(&base_filename, "cumulate");
+        let npy_path = path.join(format!("{output_stem}.npz"));
         let mut npz = NamedNpz::new(NpyMeta::new(
             "cumulate",
             result.header.fft_point as u32,
@@ -997,7 +1001,8 @@ pub fn write_add_plot_outputs(
     };
     std::fs::create_dir_all(&path)?;
     let add_plot_filepath = path.join(&base_filename);
-    let _ = std::fs::remove_file(path.join(format!("{}_add_plot_data.tsv", base_filename)));
+    let legacy_stem = insert_product_before_processing_suffixes(&base_filename, "add_plot_data");
+    let _ = std::fs::remove_file(path.join(format!("{legacy_stem}.tsv")));
 
     if !result.add_plot_times.is_empty() {
         let first_time = result.add_plot_times[0];
@@ -1133,7 +1138,8 @@ pub fn add_plot(
         if data.is_empty() {
             continue;
         }
-        let file_path = format!("{}_{}{}", output_path, filename_suffix, ".png");
+        let output_stem = insert_product_before_processing_suffixes(output_path, filename_suffix);
+        let file_path = format!("{output_stem}.png");
         let root = BitMapBackend::new(&file_path, (900, 600)).into_drawing_area();
         root.fill(&WHITE)?;
 
@@ -1216,23 +1222,24 @@ pub fn cumulate_plot(
     obs_time: &chrono::DateTime<chrono::Utc>,
     cumulate_arg: i32,
     in_beam: bool,
+    is_rfi_filtered: bool,
+    is_bandpass_corrected: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut base_filename = crate::output::generate_output_names(
         header,
         obs_time,
         label,
+        is_rfi_filtered,
         false,
-        false,
-        false,
+        is_bandpass_corrected,
         cumulate_arg,
     );
     if in_beam && !base_filename.ends_with("_inbeam") {
         base_filename.push_str("_inbeam");
     }
-    let cumulate_filename = format!(
-        "{}_{}_cumulate{}.png",
-        base_filename, header.source_name, cumulate_arg
-    );
+    let product = format!("{}_cumulate{}", header.source_name, cumulate_arg);
+    let output_stem = insert_product_before_processing_suffixes(&base_filename, &product);
+    let cumulate_filename = format!("{output_stem}.png");
     let cumulate_filepath = cumulate_path.join(cumulate_filename);
 
     let root = BitMapBackend::new(&cumulate_filepath, (900, 600)).into_drawing_area();

@@ -1,6 +1,6 @@
 [package]
 name = "frinZ"
-version = "4.11.0"
+version = "4.12.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Masanori AKIMOTO <masanori.akimoto.ac@gmail.com>"]

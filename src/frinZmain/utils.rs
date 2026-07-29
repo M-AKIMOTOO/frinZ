@@ -11,6 +11,7 @@ use num_complex::Complex;
 
 use crate::header::CorHeader;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
+use crate::output::insert_product_before_processing_suffixes;
 use crate::plot;
 
 const C: f64 = 299792458.0; // Speed of light in m/s
@@ -299,7 +300,8 @@ pub fn write_allan_deviation_outputs(
     fs::create_dir_all(&allan_dir)?;
 
     let adev_data = calculate_allan_deviation(phases, tau0, obs_freq_hz);
-    let adev_basename = format!("{}_{}_allan", base_filename, source_name);
+    let product = format!("{source_name}_allan");
+    let adev_basename = insert_product_before_processing_suffixes(base_filename, &product);
 
     let _ = fs::remove_file(allan_dir.join(format!("{}.txt", adev_basename)));
 

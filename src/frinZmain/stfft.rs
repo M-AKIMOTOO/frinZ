@@ -1,5 +1,6 @@
 use crate::args::Args;
 use crate::npy_output::{write_named_real_1d_npz, NpyMeta};
+use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
 use crate::processing::ProcessResult;
 use crate::utils::mjd_cal;
 use chrono::Duration;
@@ -75,14 +76,26 @@ pub fn write_output(
         .join("frinZ")
         .join("stfft");
     fs::create_dir_all(&output_dir)?;
-    let stem = input_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("frinZ");
-    let path = output_dir.join(format!(
-        "{}_len{}s_hop{}s_stfft.npz",
-        stem, plan.window, plan.hop
-    ));
+    let labels = result
+        .label
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    let mut base_filename = generate_output_names(
+        &result.header,
+        &result.obs_time,
+        &labels,
+        !args.rfi.is_empty(),
+        args.frequency,
+        args.bandpass.is_some(),
+        plan.window,
+    );
+    if args.in_beam && !base_filename.ends_with("_inbeam") {
+        base_filename.push_str("_inbeam");
+    }
+    let product = format!("hop{}s_stfft", plan.hop);
+    let output_stem = insert_product_before_processing_suffixes(&base_filename, &product);
+    let path = output_dir.join(format!("{output_stem}.npz"));
     let rows = [
         result.add_plot_times.len(),
         result.add_plot_amp.len(),

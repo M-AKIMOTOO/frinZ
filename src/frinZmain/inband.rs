@@ -10,7 +10,7 @@ use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
-use crate::output::generate_output_names;
+use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
 use crate::read::read_visibility_data;
 use crate::search;
 
@@ -519,7 +519,8 @@ pub fn run_inband_analysis(
     output.push_str(&data_rows);
 
     let output_basename = first_output_basename.unwrap_or_else(|| basename.to_string());
-    let output_path = output_dir.join(format!("{}_inband.txt", output_basename));
+    let output_stem = insert_product_before_processing_suffixes(&output_basename, "inband");
+    let output_path = output_dir.join(format!("{output_stem}.txt"));
     fs::write(&output_path, output)?;
     println!(
         "In-band fringe search saved to: {} ({} rows)",

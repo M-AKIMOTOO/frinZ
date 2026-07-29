@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::args::Args;
 use crate::header::CorHeader;
 use crate::npy_output::{NamedNpz, NpyMeta};
+use crate::output::insert_product_before_processing_suffixes;
 use crate::utils::uvw_cal;
 
 const C_M_PER_S: f64 = 299_792_458.0;
@@ -308,9 +309,10 @@ fn contamination_output_path(
     } else {
         basename
     };
+    let output_stem = insert_product_before_processing_suffixes(stem, "contamination");
     Ok(frinz_dir
         .join("contamination")
-        .join(format!("{stem}_contamination.npz")))
+        .join(format!("{output_stem}.npz")))
 }
 
 fn build_handoff<'a>(

@@ -15,7 +15,10 @@ pub fn output_header_info(
     output_dir: &Path,
     basename: &str,
 ) -> io::Result<String> {
-    let header_file_path = output_dir.join(format!("{}_header.txt", basename));
+    let header_file_path = output_dir.join(format!(
+        "{}.txt",
+        insert_product_before_processing_suffixes(basename, "header")
+    ));
     let header_info = format!(
         "### header region information
 
@@ -104,8 +107,6 @@ pub fn generate_output_names(
     length: i32,
 ) -> String {
     let yyyydddhhmmss2 = obs_time.format("%Y%j%H%M%S").to_string();
-    let rfi_suffix = if is_rfi_filtered { "_rfi" } else { "" };
-    let bp_suffix = if is_bandpass_corrected { "_bp" } else { "" };
     let _mode_suffix = if is_frequency_mode { "_freq" } else { "_time" };
     let observing_band = if (6600.0..=7112.0).contains(&(header.observing_frequency as f32 / 1e6)) {
         "c"
@@ -117,19 +118,87 @@ pub fn generate_output_names(
         "n"
     };
     let label_segment = label.get(3).copied().unwrap_or("");
+    let (label_segment, is_contamisubt) = label_segment
+        .strip_suffix("_contamisubt")
+        .map_or((label_segment, false), |label| (label, true));
 
-    let base = format!(
-        "{}_{}_{}_{}_{}_len{}s{}{}",
+    let mut base = format!(
+        "{}_{}_{}_{}_{}_len{}s",
         header.station1_name,
         header.station2_name,
         yyyydddhhmmss2,
         label_segment,
         observing_band,
-        length,
-        rfi_suffix,
-        bp_suffix
+        length
+    );
+    append_processing_suffixes(
+        &mut base,
+        is_bandpass_corrected,
+        is_rfi_filtered,
+        is_contamisubt,
+        false,
     );
     base
+}
+
+fn append_processing_suffixes(
+    output: &mut String,
+    bandpass: bool,
+    rfi: bool,
+    contamisubt: bool,
+    inbeam: bool,
+) {
+    if bandpass {
+        output.push_str("_bp");
+    }
+    if rfi {
+        output.push_str("_rfi");
+    }
+    if contamisubt {
+        output.push_str("_contamisubt");
+    }
+    if inbeam {
+        output.push_str("_inbeam");
+    }
+}
+
+/// Inserts an analysis-product name before processing suffixes.
+///
+/// Processing suffixes always use the stable order
+/// `_bp_rfi_contamisubt_inbeam`, independent of their order in `base`.
+pub fn insert_product_before_processing_suffixes(base: &str, product: &str) -> String {
+    let mut core = base;
+    let mut bandpass = false;
+    let mut rfi = false;
+    let mut contamisubt = false;
+    let mut inbeam = false;
+
+    loop {
+        if let Some(value) = core.strip_suffix("_inbeam") {
+            core = value;
+            inbeam = true;
+        } else if let Some(value) = core.strip_suffix("_contamisubt") {
+            core = value;
+            contamisubt = true;
+        } else if let Some(value) = core.strip_suffix("_rfi") {
+            core = value;
+            rfi = true;
+        } else if let Some(value) = core.strip_suffix("_bp") {
+            core = value;
+            bandpass = true;
+        } else {
+            break;
+        }
+    }
+
+    let mut output = core.to_string();
+    let product = product.trim_matches('_');
+    if !product.is_empty() && core != product && !core.ends_with(&format!("_{product}")) {
+        output.push_str("_");
+        output.push_str(product);
+    }
+    append_processing_suffixes(&mut output, bandpass, rfi, contamisubt, inbeam);
+    output
 }
 
 pub fn format_delay_output(
@@ -230,4 +299,36 @@ pub fn write_phase_corrected_spectrum_binary(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::insert_product_before_processing_suffixes;
+
+    #[test]
+    fn product_precedes_bandpass_suffix() {
+        assert_eq!(
+            insert_product_before_processing_suffixes("observation_bp", "delay_rate_search"),
+            "observation_delay_rate_search_bp"
+        );
+    }
+
+    #[test]
+    fn processing_suffixes_are_canonicalized() {
+        assert_eq!(
+            insert_product_before_processing_suffixes("observation_rfi_bp_contamisubt", "cumulate"),
+            "observation_cumulate_bp_rfi_contamisubt"
+        );
+    }
+
+    #[test]
+    fn inbeam_remains_the_final_suffix() {
+        assert_eq!(
+            insert_product_before_processing_suffixes(
+                "observation_contamisubt_rfi_bp_inbeam",
+                "wwz_amp"
+            ),
+            "observation_wwz_amp_bp_rfi_contamisubt_inbeam"
+        );
+    }
 }

@@ -30,6 +30,12 @@ impl C64 {
     }
 }
 
+impl std::ops::Add for C64 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self::new(self.re + rhs.re, self.im + rhs.im)
+    }
+}
 impl std::ops::Mul for C64 {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
@@ -37,6 +43,12 @@ impl std::ops::Mul for C64 {
             self.re * rhs.re - self.im * rhs.im,
             self.re * rhs.im + self.im * rhs.re,
         )
+    }
+}
+impl std::ops::Mul<f64> for C64 {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self {
+        Self::new(self.re * rhs, self.im * rhs)
     }
 }
 impl std::ops::Div<f64> for C64 {
@@ -48,9 +60,13 @@ impl std::ops::Div<f64> for C64 {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelRecord {
+    #[serde(default)]
+    band: char,
     input_cor: PathBuf,
     start_mjd: f64,
     samples: usize,
+    #[serde(default)]
+    raw_mjd: Vec<f64>,
     analysis_rows: usize,
     rate_padding: u32,
     rfi_specs: Vec<String>,
@@ -80,6 +96,10 @@ struct ModelRecord {
     #[serde(default)]
     spectral_index: f64,
     #[serde(default)]
+    gain_flux_ratio: f64,
+    #[serde(default)]
+    compact_model_scale: Option<C64>,
+    #[serde(default)]
     bandpass_real: Vec<f64>,
     #[serde(default)]
     bandpass_imag: Vec<f64>,
@@ -91,21 +111,32 @@ struct ModelRecord {
     direct_model_imag: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct GainTransfer {
+    band: char,
+    midpoint_mjd: f64,
+    frequency_hz: Vec<f64>,
+    spectrum: Vec<C64>,
+}
+
 #[derive(Deserialize)]
 struct ModelFile {
     product: String,
     format_version: u32,
     records: Vec<ModelRecord>,
+    #[serde(default)]
+    gain_transfers: Vec<GainTransfer>,
 }
 
-pub fn run_contamination_subtract(
+pub fn apply_contamination_subtract(
+    bytes: &mut [u8],
     input: &Path,
     model_path: &Path,
     bandpass_override_path: Option<&Path>,
-) -> Result<PathBuf, Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let model = read_model(model_path, input)?;
     if model.product != "flux_contamination_subtraction_model"
-        || !matches!(model.format_version, 1 | 2 | 3 | 4)
+        || !matches!(model.format_version, 1 | 2 | 3 | 4 | 5)
     {
         return Err(format!(
             "unsupported contamination model {} version {}",
@@ -113,12 +144,8 @@ pub fn run_contamination_subtract(
         )
         .into());
     }
-    let input_name = input.file_name();
-    let mut records: Vec<ModelRecord> = model
-        .records
-        .into_iter()
-        .filter(|record| record.input_cor == input || record.input_cor.file_name() == input_name)
-        .collect();
+    let gain_transfers = model.gain_transfers;
+    let mut records = model.records;
     if records.is_empty() {
         return Err(format!(
             "{} contains no records for {}",
@@ -140,65 +167,48 @@ pub fn run_contamination_subtract(
     }
     let bandpass_override = bandpass_override_path.map(read_bandpass_file).transpose()?;
     for record in &records {
-        if record.bandpass_applied
+        if record.compact_model_scale.is_none()
+            && record.direct_model_entry.is_empty()
+            && record.bandpass_applied
             && (record.bandpass_real.len() != record.fft_point / 2
                 || record.bandpass_imag.len() != record.fft_point / 2)
         {
-            return Err("bandpass-applied contamination model does not contain one complex bandpass value per raw channel; regenerate the handoff and flux model".into());
+            return Err("bandpass-applied legacy contamination model does not contain one complex bandpass value per raw channel; regenerate the handoff and flux model".into());
         }
     }
-    if records
-        .iter()
-        .any(|record| !record.bandpass_applied && record.direct_model_entry.is_empty())
-        && bandpass_override.is_none()
-        && records
-            .iter()
-            .any(|record| record.direct_model_entry.is_empty() && record.bandpass_real.is_empty())
+    if records.iter().any(|record| {
+        record.compact_model_scale.is_none()
+            && record.direct_model_entry.is_empty()
+            && !record.bandpass_applied
+            && record.bandpass_real.is_empty()
+    }) && bandpass_override.is_none()
     {
         eprintln!(
-            "#WARN: contamination subtraction is assuming a flat complex bandpass for model window(s) without stored bandpass data; the integrated scalar is matched, but frequency-dependent residuals can remain in the delay plane"
+            "#WARN: legacy contamination model window(s) assume a flat complex bandpass; frequency-dependent residuals can remain in the delay plane"
         );
     }
 
-    let mut bytes = fs::read(input)?;
     for record in &records {
-        subtract_one_window(&mut bytes, record, bandpass_override.as_deref())?;
+        subtract_one_window(bytes, record, &gain_transfers, bandpass_override.as_deref())?;
     }
-    let stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("visibility");
-    let output_dir = input
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("contamisubt");
-    fs::create_dir_all(&output_dir)?;
-    let output = output_dir.join(format!("{stem}_contamisubt.cor"));
-    fs::write(&output, &bytes)?;
-    println!("Saved: {}", output.display());
+    let compact_windows = records
+        .iter()
+        .filter(|record| record.compact_model_scale.is_some())
+        .count();
     println!(
-        "# Contamination subtraction: {} model window(s) applied from {}",
+        "# Contamination correction table: {} window(s) applied in copy-on-write memory from {}",
         records.len(),
         model_path.display()
     );
-    let direct_windows = records
-        .iter()
-        .filter(|record| !record.direct_model_entry.is_empty())
-        .count();
-    if direct_windows > 0 {
+    if compact_windows > 0 {
         println!(
-            "# Contamination subtraction method: direct raw time-frequency complex model ({}/{})",
-            direct_windows,
+            "# Contamination subtraction method: compact gain/geometry table ({}/{})",
+            compact_windows,
             records.len()
         );
     }
-    if let Some(path) = bandpass_override_path {
-        println!(
-            "# Contamination subtraction bandpass template: {} (model normalized in the original uncalibrated scalar frame)",
-            path.display()
-        );
-    }
-    Ok(output)
+    println!("# No *_contamisubt.cor file is written");
+    Ok(())
 }
 
 fn read_model(path: &Path, input: &Path) -> Result<ModelFile, Box<dyn Error>> {
@@ -274,9 +284,82 @@ fn read_f32_npy_entry(
         .collect())
 }
 
+fn bracketing_gain_transfers<'a>(
+    transfers: &'a [GainTransfer],
+    band: char,
+    mjd: f64,
+) -> Result<(&'a GainTransfer, &'a GainTransfer, f64), Box<dyn Error>> {
+    let same_band: Vec<_> = transfers.iter().filter(|item| item.band == band).collect();
+    if same_band.is_empty() {
+        return Err(format!("no compact gain-transfer data for {band} band").into());
+    }
+    let before = same_band
+        .iter()
+        .copied()
+        .filter(|item| item.midpoint_mjd <= mjd)
+        .max_by(|a, b| a.midpoint_mjd.total_cmp(&b.midpoint_mjd))
+        .unwrap_or(same_band[0]);
+    let after = same_band
+        .iter()
+        .copied()
+        .filter(|item| item.midpoint_mjd >= mjd)
+        .min_by(|a, b| a.midpoint_mjd.total_cmp(&b.midpoint_mjd))
+        .unwrap_or(*same_band.last().expect("nonempty gain list"));
+    let span = after.midpoint_mjd - before.midpoint_mjd;
+    let fraction = if span.abs() < 1.0e-15 {
+        0.0
+    } else {
+        ((mjd - before.midpoint_mjd) / span).clamp(0.0, 1.0)
+    };
+    Ok((before, after, fraction))
+}
+
+fn interpolate_gain_spectrum(
+    transfers: &[GainTransfer],
+    band: char,
+    mjd: f64,
+    frequency_hz: &[f64],
+) -> Result<Vec<C64>, Box<dyn Error>> {
+    let (before, after, fraction) = bracketing_gain_transfers(transfers, band, mjd)?;
+    if before.spectrum.len() != frequency_hz.len()
+        || after.spectrum.len() != frequency_hz.len()
+        || before.frequency_hz.len() != frequency_hz.len()
+        || after.frequency_hz.len() != frequency_hz.len()
+    {
+        return Err("gain and target raw frequency axes differ".into());
+    }
+    for channel in 0..frequency_hz.len() {
+        if (before.frequency_hz[channel] - frequency_hz[channel]).abs() > 1.0
+            || (after.frequency_hz[channel] - frequency_hz[channel]).abs() > 1.0
+        {
+            return Err("gain and target frequency values differ".into());
+        }
+    }
+    if std::ptr::eq(before, after) {
+        return Ok(before.spectrum.clone());
+    }
+    let mut cross = C64::new(0.0, 0.0);
+    for channel in 1..frequency_hz.len() {
+        let left_conjugate = C64::new(before.spectrum[channel].re, -before.spectrum[channel].im);
+        cross = cross + left_conjugate * after.spectrum[channel];
+    }
+    let global_delta = cross.im.atan2(cross.re);
+    let align_after = C64::from_polar(1.0, -global_delta);
+    let restore_phase = C64::from_polar(1.0, fraction * global_delta);
+    Ok(before
+        .spectrum
+        .iter()
+        .zip(&after.spectrum)
+        .map(|(left, right)| {
+            (*left * (1.0 - fraction) + (*right * align_after) * fraction) * restore_phase
+        })
+        .collect())
+}
+
 fn subtract_one_window(
     bytes: &mut [u8],
     scan: &ModelRecord,
+    gain_transfers: &[GainTransfer],
     bandpass_override: Option<&[num_complex::Complex<f32>]>,
 ) -> Result<(), Box<dyn Error>> {
     if scan.fft_point < 4 || scan.fft_point % 2 != 0 || scan.samples == 0 {
@@ -298,6 +381,46 @@ fn subtract_one_window(
         .ok_or("no sectors in .cor")?;
     if start_sector + scan.samples > total_sectors {
         return Err("integration window exceeds .cor payload".into());
+    }
+
+    if let Some(model_scale) = scan.compact_model_scale {
+        if scan.band == char::from(0)
+            || scan.raw_mjd.len() != scan.samples
+            || scan.geometric_delay_s.len() != scan.samples
+            || scan.frequency_hz.len() != channels
+            || !scan.gain_flux_ratio.is_finite()
+            || scan.gain_flux_ratio <= 0.0
+            || !scan.reference_frequency_hz.is_finite()
+            || scan.reference_frequency_hz <= 0.0
+        {
+            return Err("invalid compact contamination correction table record".into());
+        }
+        for row in 0..scan.samples {
+            let gain_spectrum = interpolate_gain_spectrum(
+                gain_transfers,
+                scan.band,
+                scan.raw_mjd[row],
+                &scan.frequency_hz,
+            )?;
+            for channel in 1..channels {
+                let frequency_hz = scan.frequency_hz[channel];
+                let spectral_amplitude =
+                    (frequency_hz / scan.reference_frequency_hz).powf(scan.spectral_index);
+                let geometric_phase = 2.0 * PI * frequency_hz * scan.geometric_delay_s[row];
+                let q = gain_spectrum[channel]
+                    * (scan.gain_flux_ratio * spectral_amplitude)
+                    * C64::from_polar(1.0, geometric_phase)
+                    * model_scale;
+                let pos =
+                    FILE_HEADER + (start_sector + row) * sector_size + SECTOR_HEADER + channel * 8;
+                let re = f32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as f64 - q.re;
+                let im =
+                    f32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as f64 - q.im;
+                bytes[pos..pos + 4].copy_from_slice(&(re as f32).to_le_bytes());
+                bytes[pos + 4..pos + 8].copy_from_slice(&(im as f32).to_le_bytes());
+            }
+        }
+        return Ok(());
     }
 
     if !scan.direct_model_entry.is_empty() {

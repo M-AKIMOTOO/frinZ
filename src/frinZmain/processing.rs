@@ -13,12 +13,13 @@ use crate::analysis::analyze_results;
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, plot_bandpass_spectrum, read_bandpass_file};
 use crate::contamination::{write_contamination_handoff, ContaminationPhaseCorrectionInput};
+use crate::contamination_subtract::apply_contamination_subtract;
 use crate::fft::{
     apply_phase_correction_in_place, perform_ifft_on_vec, process_fft,
     process_fft_with_phase_correction, process_ifft,
 };
 use crate::header::{parse_header, CorHeader};
-use crate::input_support::open_input_data;
+use crate::input_support::{open_input_data, open_input_data_copy_on_write};
 use crate::norm_acf::NormAcfContext;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::{
@@ -261,19 +262,30 @@ pub fn process_cor_file(
     suppress_output: bool,
 ) -> Result<ProcessResult, Box<dyn Error>> {
     // --- File and Path Setup ---
-    let parent_dir = input_path.parent().unwrap_or_else(|| Path::new(""));
-    let frinz_dir = if args.in_beam {
-        parent_dir.join("frinZ").join("inbeamVLBI")
+    let original_parent = input_path.parent().unwrap_or_else(|| Path::new(""));
+    let contamination_mode = args.contamination_subtract.is_some();
+    let analysis_parent = if contamination_mode {
+        original_parent.join("contamisubt")
     } else {
-        parent_dir.join("frinZ")
+        original_parent.to_path_buf()
+    };
+    let frinz_dir = if args.in_beam {
+        analysis_parent.join("frinZ").join("inbeamVLBI")
+    } else {
+        analysis_parent.join("frinZ")
     };
     fs::create_dir_all(&frinz_dir)?;
 
-    let basename = input_path.file_stem().unwrap().to_str().unwrap();
+    let original_basename = input_path.file_stem().unwrap().to_str().unwrap();
+    let basename = if contamination_mode && !original_basename.ends_with("_contamisubt") {
+        format!("{}_contamisubt", original_basename)
+    } else {
+        original_basename.to_string()
+    };
     let basename_for_output = if args.in_beam {
         format!("{}_inbeam", basename)
     } else {
-        basename.to_string()
+        basename.clone()
     };
     let mut label: Vec<String> = basename.split('_').map(String::from).collect();
     if label.len() > 3 {
@@ -341,8 +353,17 @@ pub fn process_cor_file(
         spectrum_output_path = Some(path);
     }
 
-    // --- Read .cor File ---
-    let input_data = open_input_data(input_path)?;
+    // --- Read .cor and apply the compact table to a private copy-on-write mapping. ---
+    let input_data = if let Some(model_path) = &args.contamination_subtract {
+        let mut data = open_input_data_copy_on_write(input_path)?;
+        let bytes = data
+            .as_mut_slice()
+            .ok_or("contamination correction requires mutable copy-on-write input")?;
+        apply_contamination_subtract(bytes, input_path, model_path, args.bandpass.as_deref())?;
+        data
+    } else {
+        open_input_data(input_path)?
+    };
     let mut cursor = Cursor::new(input_data.as_slice());
 
     // --- Parse Header ---

@@ -325,6 +325,7 @@ pub struct Args {
     #[arg(long, num_args = 0.., value_name = "KEY:VALUE")]
     pub contamination: Option<Vec<String>>,
 
+    /// Apply a flux compact correction table in copy-on-write memory while analyzing --input.
     #[arg(long = "contamination-subtract", value_name = "MODEL_NPZ")]
     pub contamination_subtract: Option<PathBuf>,
 

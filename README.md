@@ -362,15 +362,15 @@ In stdout and `*_summary.txt`, these appear as:
 
 ## Contamination handoff (`--contamination`)
 
-`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` が通常出力と同じprefixの `obscode_***_contamisubt_model.npz` を常に生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` へモデルを適用し、元 `.cor` ディレクトリ直下の `contamisubt/` に `*_contamisubt.cor` を生成します。
+`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` が通常出力と同じprefixの `obscode_***_contamisubt_model.npz` を常に生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` と補正テーブルを同時に読み、private copy-on-writeメモリ上で減算して通常解析を続けます。元 `.cor` と出力ファイル名は維持し、`*_contamisubt.cor` は生成しません。
 
 format v5 handoff は、`--length` の積分開始 MJD/UVW、積分時間、中心周波数、および frinZ が通常のテキスト行へ出した delay/rate セルの複素値を1個保存します。MJDは積分中心ではなく開始時刻で、その時刻から `effective_integration_time_s` のデータを用います。fringe searchの位相基準も最初のsampleです。加えて `raw_mjd`, `raw_uv_{u,v,w}`, `raw_frequency_mhz`, `raw_visibility_real/imag` を保存します。raw visibilityは `.cor` 読み込み直後のrow-major `[sector,channel]` で、ACF規格化、rebin、delay/rate補正、padding、bandpass補正より前の値です。
 
-fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v4はこのdirect arrayを保持し、frinZ `--contamisubt` は元 `.cor` から要素ごとに直接減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
+fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v5はdirect arrayを保持せず、gain複素スペクトル、各sectorの時刻・幾何遅延、周波数軸、フラックス比、窓ごとの複素規格化係数だけを小容量テーブルとして保持します。frinZ `--contamisubt` は元 `.cor` のcopy-on-writeビュー上で同じ補正量を再構成して減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
 
 `flux --contamination` の `c:`/`x:` はこの `*_contamination.npz`（複数・ワイルドカード可）、`ra:HHMMSS`/`dec:DDMMSS` は位相中心基準の J2000 絶対座標、`flux:mJy` は基準周波数のフラックス、`alpha` は `S_nu ∝ nu^alpha` です。方向余弦は `l=cos(dec)*sin(ra-ra0)`、`m=sin(dec)*cos(dec0)-cos(dec)*sin(dec0)*cos(ra-ra0)` です。
 
-帯域 `b` の座標位相を `G_b(t)=phase_sign*2*pi*uv_sign*(u*l+v*m)` とすると、flux は全時刻を `V_i=A_i exp(i theta_target)+S_contam exp(i(G_i+theta_contam))+N_i` で複素fitします。`A_i>=0` は時刻ごとに自由で、C/X の `theta_target` と `theta_contam` は独立です。最初の観測位相への強制整列やdelay/rateの再探索は行いません。二天体fitは複素scalarで行い、補正 `.cor` の生成時だけv4の正確な生UVW・周波数グリッドを使用します。`fit:off` は外部座標を固定し、`fit:on` は同じ複素残差で位置も推定します。
+帯域 `b` の座標位相を `G_b(t)=phase_sign*2*pi*uv_sign*(u*l+v*m)` とすると、flux は全時刻を `V_i=A_i exp(i theta_target)+S_contam exp(i(G_i+theta_contam))+N_i` で複素fitします。`A_i>=0` は時刻ごとに自由で、C/X の `theta_target` と `theta_contam` は独立です。最初の観測位相への強制整列やdelay/rateの再探索は行いません。二天体fitは複素scalarで行い、補正テーブルの生成と適用には正確な生UVW・時刻・周波数グリッドを使用します。`fit:off` は外部座標を固定し、`fit:on` は同じ複素残差で位置も推定します。
 
 複素減算は `Vobs=Vtarget+Vcontam+N`、`Vclean=Vobs-Vcontam`。`before` は減算前、`after` は複素減算後の振幅です。
 
@@ -383,13 +383,11 @@ frinZ --input gain_after.cor  --length 480 --loop 1 --contamination
 # 2. flux がコンタミモデルを推定（元 .cor は読まない）
 flux ... --contamination ... ra:... dec:... flux:10 fit:on
 
-# 3. frinZ がモデルを元 .cor に適用
+# 3. 元 .cor へテーブルをメモリ内適用し、そのまま通常解析
 frinZ --input ant1_ant2_yyyydddhhmmss_c.cor \
-  --contamination-subtract i25314x_frinZ_x_all_SIGMAGEM_x_contamisubt_model.npz
+  --contamination-subtract i25314x_frinZ_x_all_SIGMAGEM_x_contamisubt_model.npz \
+  --length 480 --loop 3
 # 短縮別名: --contamisubt
-
-# 4. 補正済み .cor を通常解析
-frinZ --input contamisubt/ant1_ant2_yyyydddhhmmss_c_contamisubt.cor --length 480 --loop 3
 ```
 
 同じdelay/rateセルのfrinZ複素値へ同じtarget−gain位相回転を適用すると、fluxのclean scalarと一致します。raw `.cor` はgain-reference前なので、未回転の位相角は直接比較しません。既知の位相中心天体は補正後の `(delay,rate)=(0,0)` 固定セルで評価します。全平面 `--search` の最大SNRはtrial factorを含み、SNR 5--6だけでは検出ではありません。非ゼロセルは未モデル成分、RFI、雑音最大点として別途検証します。定数位相オフセットは複素平面を一様回転するだけでdelay/rate座標を変えません。delayずれは周波数位相傾斜、rateずれは時間位相傾斜です。
@@ -403,7 +401,7 @@ python3 tools/npz_open.py --npz result_bptable.npz
 python3 tools/npz_open.py --npz result_bptable.npz --output --ext pdf --nofig
 ```
 
-`--output` writes `result_bptable.tsv` and the selected figure format (default `png`). Analysis modes no longer emit duplicate BIN/TSV data files when the same arrays are present in requested NPZ sidecars; text summaries, `.cor` products, and model metadata remain separate. Without `--nofig`, the figure is also shown with `plt.show()`.
+`--output` writes `result_bptable.tsv` and the selected figure format (default `png`). Analysis modes no longer emit duplicate BIN/TSV data files when the same arrays are present in requested NPZ sidecars; text summaries and model metadata remain separate. Without `--nofig`, the figure is also shown with `plt.show()`.
 
 frinZ creates organized output directories:
 

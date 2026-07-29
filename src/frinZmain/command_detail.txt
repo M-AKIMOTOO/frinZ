@@ -32,16 +32,17 @@
 
   --contamination-subtract <MODEL.npz>
   --contamisubt <MODEL.npz>            上記の短縮別名
-       flux が通常出力と同じprefixで常に出力する obscode_***_contamisubt_model.npz を --input ORIGINAL.cor に適用し、
-       元 .cor ディレクトリ直下の contamisubt/ へ *_contamisubt.cor を作成する。元 .cor は変更しない。
+       flux が通常出力と同じprefixで常に出力する obscode_***_contamisubt_model.npz と --input ORIGINAL.cor を同時に読み、
+       private copy-on-writeメモリ上で減算してそのまま通常解析する。元 .cor は変更せず、*_contamisubt.cor も作らない。
+       解析結果の場所・名前は従来どおり contamisubt/frinZ/.../*_contamisubt_* を維持する。
        モデル内の input_cor と --input を照合し、該当する積分区間だけを減算する。
-       v5 target/gain handoffが揃う場合、flux model v4に保存された元.corと同じshapeのdirect complex arrayを要素ごとに減算する。
+       v5 target/gain handoffが揃う場合、flux model v5の小容量gain/geometry補正テーブルから各sector・channelの補正量を再構成する。
        fluxへ渡すglobにはtargetとgainの両方を含める。fluxは前後gainの実測複素スペクトルをtarget時刻へ補間する。
        既知の位相中心天体は補正後の (delay,rate)=(0,0) 固定セルで判定する。全平面 --search のSNR 5--6はtrial factorを含み、単独では検出を意味しない。
        定数位相オフセットは全チャネル・全時刻を同じ角度だけ回すため、delay/rateピーク位置やピーク分裂を作らない。
        delayずれは周波数方向、rateずれは時間方向の位相傾斜である。
 
-       v5ではgain handoffのraw visibilityが複素bandpassと時間変化を同時に与えるため、別bandpass表は必須ではない。
+       model v5ではgain handoffのraw visibilityが複素bandpassと時間変化を同時に与えるため、別bandpass表は必須ではない。
        v4以前のhandoffだけの場合はscalar逆投影へフォールバックする。flat complex bandpassしか無い場合は、scalarが一致しても
        delay面に周波数依存残差・サイドローブ・分裂ピークが残り得るためWARN表示する。
 

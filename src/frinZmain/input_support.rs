@@ -1,4 +1,4 @@
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Read;
@@ -7,6 +7,7 @@ use zstd::stream::read::Decoder;
 
 pub enum InputData {
     Mmap(Mmap),
+    CopyOnWrite(MmapMut),
     Buffer(Vec<u8>),
 }
 
@@ -14,7 +15,16 @@ impl InputData {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             Self::Mmap(mmap) => &mmap[..],
+            Self::CopyOnWrite(mmap) => &mmap[..],
             Self::Buffer(buffer) => buffer.as_slice(),
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        match self {
+            Self::CopyOnWrite(mmap) => Some(&mut mmap[..]),
+            Self::Buffer(buffer) => Some(buffer.as_mut_slice()),
+            Self::Mmap(_) => None,
         }
     }
 }
@@ -58,6 +68,16 @@ pub fn open_input_data(path: &Path) -> Result<InputData, Box<dyn Error>> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         Ok(InputData::Mmap(mmap))
+    }
+}
+
+pub fn open_input_data_copy_on_write(path: &Path) -> Result<InputData, Box<dyn Error>> {
+    if is_zstd_input(path) {
+        Ok(InputData::Buffer(read_input_bytes(path)?))
+    } else {
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().map_copy(&file)? };
+        Ok(InputData::CopyOnWrite(mmap))
     }
 }
 

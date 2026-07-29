@@ -360,6 +360,36 @@ In stdout and `*_summary.txt`, these appear as:
 - Recent versions intentionally reduce redundant CSV/PNG generation to shorten runtime and reduce disk usage.
 - Legacy files from older naming/output schemes are cleaned up automatically when running `pulsar_gating`.
 
+## Contamination handoff (`--contamination`)
+
+`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` が通常出力と同じprefixの `obscode_***_contamisubt_model.npz` を常に生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` へモデルを適用し、元 `.cor` ディレクトリ直下の `contamisubt/` に `*_contamisubt.cor` を生成します。
+
+format v3 handoff は、`--length` の積分開始 MJD/UVW、積分時間、中心周波数、および frinZ が実際に採用して通常のテキスト行へ出した delay/rate セルの複素値を1個保存します。MJDは積分中心ではなく開始時刻であり、その時刻から `effective_integration_time_s` のデータを用いたことを表します。fringe search で求めた residual rate の位相基準も積分区間の最初のサンプル（`elapsed_s=0`）です。したがって、NPZ の複素位相、MJD、UVW は同一の積分開始 epoch を表します。手動補正やbandpassはfrinZ内で適用済みで、fluxはsearch delay/rateを再適用しません。通常handoffに周波数チャネル配列は保存せず、必要な場合だけ独立した `--spectrum` を使用します。v3は `.cor` への随伴減算を再現するため `analysis_rows`、`rate_padding`、RFI指定、bandpass使用有無も保存します。
+
+`flux --contamination` の `c:`/`x:` はこの `*_contamination.npz`（複数・ワイルドカード可）、`ra:HHMMSS`/`dec:DDMMSS` は位相中心基準の J2000 絶対座標、`flux:mJy` は基準周波数のフラックス、`alpha` は `S_nu ∝ nu^alpha` です。方向余弦は `l=cos(dec)*sin(ra-ra0)`、`m=sin(dec)*cos(dec0)-cos(dec)*sin(dec0)*cos(ra-ra0)` です。
+
+帯域 `b` の座標位相を `G_b(t)=phase_sign*2*pi*uv_sign*(u*l+v*m)` とすると、flux は全時刻を `V_i=A_i exp(i theta_target)+S_contam exp(i(G_i+theta_contam))+N_i` で複素fitします。`A_i>=0` は時刻ごとに自由で、C/X の `theta_target` と `theta_contam` は独立です。最初の観測位相への強制整列、delay/rate の再補正、周波数チャネル処理は行いません。`fit:off` は外部座標を固定し、`fit:on` は同じ複素残差で位置も推定します。
+
+複素減算は `Vobs=Vtarget+Vcontam+N`、`Vclean=Vobs-Vcontam`。`before` は減算前、`after` は複素減算後の振幅です。
+
+```bash
+# 1. frinZ handoff を作成
+frinZ --input ant1_ant2_yyyydddhhmmss_c.cor --length 480 --loop 3 --contamination
+
+# 2. flux がコンタミモデルを推定（元 .cor は読まない）
+flux ... --contamination ... ra:... dec:... flux:10 fit:on
+
+# 3. frinZ がモデルを元 .cor に適用
+frinZ --input ant1_ant2_yyyydddhhmmss_c.cor \
+  --contamination-subtract i25314x_frinZ_x_all_SIGMAGEM_x_contamisubt_model.npz
+# 短縮別名: --contamisubt
+
+# 4. 補正済み .cor を通常解析
+frinZ --input contamisubt/ant1_ant2_yyyydddhhmmss_c_contamisubt.cor --length 480 --loop 3
+```
+
+同じdelay/rateセルのfrinZ複素値へ同じtarget−gain位相回転を適用すると、fluxのclean scalarと一致します。raw `.cor` はgain-reference前なので、未回転の位相角は直接比較しません。再度 `--search` して別セルが最大になった場合は、コンタミ除去後の新しいピークとして別に評価します。
+
 ## Output Files
 
 With `--npz`, analysis/plot modes also write compressed self-describing NumPy sidecars (`*.npz`) containing a primitive `complex64` `data` array plus `flag`, coordinate axes and units, `fft_point`, `pp`, and array shape. Inspect or export one file with:
@@ -460,3 +490,20 @@ This program is licensed under the MIT License.
 ## Related Projects
 
 - [frinZ.py](https://github.com/M-AKIMOTOO/frinZ.py) - Original Python implementation
+
+### Contamination handoff NPZ
+
+`--contamination` は可読な JSON/TXT sidecar を生成せず、圧縮された `*_contamination.npz` handoff のみを書き出します。NPZ はキー付き NumPy 配列で構成され、スキャンごとの数値を効率よく保存します。Python からは次のように読み出せます。
+
+```python
+import numpy as np
+z = np.load("*_contamination.npz")
+u = z["uv_u"]                 # integration-start baseline U [m], shape (1,)
+v = z["uv_v"]                 # integration-start baseline V [m], shape (1,)
+vis = z["frinz_complex_vis"]  # exact selected fringe cell, shape (1,)
+freq = z["frequency_mhz"]     # representative frequency [MHz], shape (1,)
+mjd = z["mjd"]                # integration start MJD, shape (1,)
+duration = z["effective_integration_time_s"]  # data length from mjd [s]
+```
+
+format v2/v3 の `complex_vis`、`visibility_real`、`visibility_imag` も同じ1個の複素フリンジピークです。Additional arrays include start-time `uv_w`, `du_dt_m_per_s`, `dv_dt_m_per_s`, `elapsed_s=0`, representative `wavelength_m`, `peak_delay_sample`, `peak_rate_hz`, `peak_snr`, and `peak_noise`. Scalar/header values are stored as one-element arrays (`phase_center_ra_rad`, `phase_center_dec_rad`, `observing_frequency_hz`, `effective_integration_time_s`); text metadata is available as UTF-8 byte arrays (`source_name`, `input_cor`) and the complete handoff is retained in `metadata_json`. 外部 JSON ファイルは廃止され、`flux --contamination` も NPZ のみを受け付けます。

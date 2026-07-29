@@ -5,6 +5,8 @@ pub mod api;
 pub mod args;
 pub mod bandpass;
 pub mod bispectrum;
+pub mod contamination;
+pub mod contamination_subtract;
 pub mod fft;
 pub mod fitting;
 pub mod folding;

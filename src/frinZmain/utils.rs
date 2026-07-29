@@ -346,11 +346,12 @@ pub fn uvw_cal(
         ant2_pos[2] - ant1_pos[2],
     );
 
-    // Get geodetic latitude/longitude for planar correction and hour angle
+    // The baseline components above are ECEF (Earth-fixed, Greenwich-referenced) XYZ coordinates.
+    // Only latitude is needed for the optional planar correction; using the station
+    // longitude here would mix an ECEF baseline with a local hour angle.
     let ecef_position = ECEF::new(ant1_pos[0], ant1_pos[1], ant1_pos[2]);
     let wgs84_position: WGS84<f64> = ecef_position.into();
     let latitude_rad = wgs84_position.latitude_radians();
-    let longitude_rad = wgs84_position.longitude_radians();
 
     let v_offset = if !include_vertical {
         let offset = b_z * latitude_rad.cos();
@@ -371,7 +372,7 @@ pub fn uvw_cal(
     };
     let julian_day = time::julian_day(&date);
     let mean_sidereal = time::mn_sidr(julian_day);
-    let hour_angle = coords::hr_angl_frm_observer_long(mean_sidereal, -longitude_rad, obs_ra_rad);
+    let hour_angle = coords::hr_angl_frm_observer_long(mean_sidereal, 0.0, obs_ra_rad);
     let east_positive_hour_angle = -hour_angle;
 
     let sin_h = east_positive_hour_angle.sin();

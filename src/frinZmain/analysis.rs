@@ -131,6 +131,9 @@ pub struct AnalysisResults {
     pub delay_range: Array1<f32>,
     pub visibility: Array1<f32>,
     pub delay_rate: Array1<f32>,
+    /// Exact complex value at the delay/rate cell used for the reported
+    /// time-domain fringe result.
+    pub delay_peak_complex: C32,
     pub delay_max_amp: f32,
     pub delay_phase: f32,
     pub delay_snr: f32,
@@ -314,11 +317,12 @@ pub fn analyze_results(
         positive_or_epsilon(delay_noise_raw)
     };
 
-    let delay_max_amp = if skip_delay_plane_analysis {
-        0.0
+    let delay_peak_complex = if skip_delay_plane_analysis {
+        C32::new(0.0, 0.0)
     } else {
-        norm_at(delay_rate_array, peak_rate_idx, peak_delay_idx)
+        delay_rate_array[[peak_rate_idx, peak_delay_idx]]
     };
+    let delay_max_amp = delay_peak_complex.norm();
     let delay_phase = if skip_delay_plane_analysis {
         0.0
     } else {
@@ -722,6 +726,7 @@ pub fn analyze_results(
         delay_range,
         visibility,
         delay_rate: delay_rate_slice,
+        delay_peak_complex,
         delay_max_amp,
         delay_phase,
         delay_snr,

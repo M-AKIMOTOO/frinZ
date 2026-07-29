@@ -12,6 +12,7 @@ use num_complex::Complex;
 use crate::analysis::analyze_results;
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, plot_bandpass_spectrum, read_bandpass_file};
+use crate::contamination::{write_contamination_handoff, ContaminationPhaseCorrectionInput};
 use crate::fft::{
     apply_phase_correction_in_place, perform_ifft_on_vec, process_fft,
     process_fft_with_phase_correction, process_ifft,
@@ -554,12 +555,10 @@ pub fn process_cor_file(
         }
 
         let physical_length = actual_length;
-        let midpoint_offset_us = (0.5_f64
-            * physical_length.saturating_sub(1) as f64
-            * effective_integ_time as f64
-            * 1_000_000.0)
-            .round() as i64;
-        let phase_obs_time = current_obs_time + Duration::microseconds(midpoint_offset_us);
+        // Every reported fringe value is referenced to the first sample of
+        // this --length window.  Its timestamp must therefore be the window
+        // start, not the integration midpoint.
+        let phase_obs_time = current_obs_time;
 
         if let Some(norm_ctx) = &norm_acf_context {
             norm_ctx.normalize_cross_visibility(
@@ -773,6 +772,42 @@ pub fn process_cor_file(
         }
         if first_output_basename.is_none() {
             first_output_basename = Some(base_filename.clone());
+        }
+
+        if args.contamination.is_some() {
+            let manual_start_time_offset_sec = current_obs_time
+                .signed_duration_since(file_start_time)
+                .num_milliseconds() as f32
+                / 1000.0;
+            let search_start_time_offset_sec = 0.0;
+            let correction = ContaminationPhaseCorrectionInput {
+                manual_delay_sample: manual_delay_correct,
+                manual_rate_hz: manual_rate_correct,
+                manual_acel_hz_per_s: manual_acel_correct,
+                manual_jerk_hz_per_s2: args.jerk_correct,
+                manual_snap_hz_per_s3: args.snap_correct,
+                manual_start_time_offset_s: manual_start_time_offset_sec,
+                search_delay_sample: analysis_results.residual_delay,
+                search_rate_hz: analysis_results.residual_rate,
+                search_start_time_offset_s: search_start_time_offset_sec,
+                target_frame_rotation_deg: 0.0,
+            };
+            write_contamination_handoff(
+                input_path,
+                args,
+                &processing_header,
+                &frinz_dir,
+                &base_filename,
+                current_obs_time,
+                effective_integ_time,
+                physical_length,
+                analysis_results.delay_peak_complex,
+                analysis_results.residual_delay,
+                analysis_results.residual_rate,
+                analysis_results.delay_snr,
+                analysis_results.delay_noise,
+                correction,
+            )?;
         }
 
         if args.spectrum {
@@ -1727,17 +1762,14 @@ pub(crate) fn run_analysis_pipeline(
         .into());
     }
 
-    // For peak fringe-search, use the midpoint of the analyzed segment as the
-    // phase reference for residual rate correction, just like deep/deep2.
-    //
-    // If the absolute file-start time is used here, a tiny error in the peak
-    // residual-rate estimate is multiplied by the elapsed time from the file
-    // start and appears as a large, non-physical phase jump between loops.
-    // The midpoint reference keeps the reported phase local to each segment.
-    let use_midpoint_phase_reference =
+    // A searched residual rate is local to this analyzed segment. Reference
+    // it to the first sample so the reported complex fringe phase and MJD/UVW
+    // share the same epoch. Manual/static corrections retain their file-start
+    // reference below.
+    let use_window_start_phase_reference =
         search_mode == Some("peak") || base_args.primary_search_mode() == Some("peak");
-    let start_time_offset_sec = if use_midpoint_phase_reference {
-        -0.5_f32 * (physical_length.saturating_sub(1) as f32) * effective_integ_time
+    let start_time_offset_sec = if use_window_start_phase_reference {
+        0.0
     } else {
         current_obs_time
             .signed_duration_since(*file_start_time)

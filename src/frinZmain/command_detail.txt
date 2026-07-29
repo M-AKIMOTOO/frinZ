@@ -20,6 +20,44 @@
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
   --bandpass <BP.npz>                バンドパス適用 (--bptable で補正スペクトル保存)
+
+  --contamination [key:value ...]
+       flux が複素コンタミモデルを推定するための圧縮 NPZ handoff を作成する。
+       frinZ は元 .cor から、--length の積分開始MJD/UVW、積分時間、実際に採用した delay/rate セルの複素ピーク、
+       再投影条件を *_contamination.npz に保存する。この段階では天体信号を減算しない。
+       任意キー: output:<path> または out:<path> で NPZ 出力先を明示できる。
+
+  --contamination-subtract <MODEL.npz>
+  --contamisubt <MODEL.npz>            上記の短縮別名
+       flux が通常出力と同じprefixで常に出力する obscode_***_contamisubt_model.npz を --input ORIGINAL.cor に適用し、
+       元 .cor ディレクトリ直下の contamisubt/ へ *_contamisubt.cor を作成する。元 .cor は変更しない。
+       モデル内の input_cor と --input を照合し、該当する積分区間だけを減算する。
+
+  [コンタミ除去の観測条件（110 m基線）]
+       長時間観測は必須ではないが、観測中にコンタミ天体の幾何位相が十分変化する必要がある。
+       現行fluxの定数位相fitは各バンド最低3個の有効スキャンを必要とする。位相変化は最低約90 deg、
+       安定な分離には約180 degを目安とする。分離角0では両天体が同じ位相変化となり分離不能。
+
+       fit:off: VLASS等の既知RA/Decを固定する。短時間観測では通常こちらを使用する。
+                約1 beam離れていれば1--2 h、0.5 beamなら2--4 h、0.2 beamなら5--10 hが実用目安。
+                flux: と alpha: の精度も必要で、0.1 beam以下は現在のモデルでは不安定になりやすい。
+       fit:on : 1基線でRA/Decも推定する。短いUV軌跡では2次元位置が縮退するため、数時間以上、
+                可能なら約6 h以上の時角変化を推奨する。短時間では外部座標を用いたfit:offを使う。
+
+       幾何位相 phi(t)=2*pi*(u*l+v*m)/lambda。110 m基線の最良条件（投影係数q=1）は、
+         C 6 GHz: fringe spacing 1.56 arcmin、1 arcmin当たり最大60.5 deg/hour
+         X 8 GHz: fringe spacing 1.17 arcmin、1 arcmin当たり最大80.7 deg/hour
+       観測中に90 deg変化するための最小分離角（最良条件）：
+         duration       C band       X band
+          1 h           1.49 arcmin  1.12 arcmin
+          2 h           0.74 arcmin  0.56 arcmin
+          3 h           0.50 arcmin  0.37 arcmin
+          6 h           0.25 arcmin  0.19 arcmin
+       実際の必要分離角は表の値/q。時角・天体赤緯・基線方向によりq<1となり、q=0.5なら2倍必要。
+       i25314xの約2.7 arcminは分離角として十分。同程度の明るさでも、座標・flux・SNR・位相変化が
+       十分なら同じ二天体複素モデルで除去できる。遠方天体で積分中の位相回転が大きい場合は、
+       時間平均損失を抑えるためfrinZ --lengthを短くする。
+
   --norm-acf                         同ディレクトリの自己相関 .cor で相互相関振幅を規格化
 
 [補正・フラグ]

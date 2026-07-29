@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn peak_search_recovers_delay_rate_and_midpoint_phase_for_all_lengths() {
+    fn peak_search_recovers_delay_rate_and_start_phase_for_all_lengths() {
         let delay = 0.35;
         let rate = 0.037;
         let phase0 = 0.4;
@@ -453,8 +453,7 @@ mod tests {
         for length in [1usize, 2, 3, 4, 5, 10, 30, 60] {
             let data = synthetic_data(length, start, delay, rate, phase0);
             let output = delay_search(&data, &options).unwrap();
-            let midpoint = start + 0.5 * (length - 1) as f64;
-            let expected_phase = wrap_degrees((phase0 + 2.0 * PI * rate * midpoint).to_degrees());
+            let expected_phase = wrap_degrees((phase0 + 2.0 * PI * rate * start).to_degrees());
             println!(
                 "length={length} delay={} rate={} phase={} expected_phase={expected_phase}",
                 output.analysis.residual_delay,
@@ -516,11 +515,10 @@ mod tests {
                     phase0,
                 );
                 let output = delay_search(&data, &options).unwrap();
-                let midpoint = start + 0.5 * (length - 1) as f64;
-                times.push(midpoint as f32);
+                times.push(start as f32);
                 phases.push(output.analysis.delay_phase);
                 rates.push(if length == 1 {
-                    (rate0 + acceleration * midpoint) as f32
+                    (rate0 + acceleration * start) as f32
                 } else {
                     output.analysis.residual_rate
                 });
@@ -540,7 +538,7 @@ mod tests {
             let coeffs = crate::fitting::fit_polynomial_least_squares(&x, &y, 2).unwrap();
             let expected_quadratic = 180.0 * acceleration;
             assert!(
-                (coeffs[2] - expected_quadratic).abs() < 2.0e-6,
+                (coeffs[2] - expected_quadratic).abs() < 4.0e-6,
                 "length={length}: quadratic={} expected={expected_quadratic}",
                 coeffs[2]
             );

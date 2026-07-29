@@ -839,7 +839,8 @@ mod deep {
 
             Ok((
                 analysis_results,
-                self.args.frequency.then_some(final_freq_rate_array),
+                (self.args.frequency || self.args.contamination.is_some())
+                    .then_some(final_freq_rate_array),
                 final_delay_rate_2d_data_comp,
                 pre_bandpass_analysis_results,
             ))
@@ -975,23 +976,16 @@ mod deep {
         );
         */
 
-        // Use the midpoint of each analyzed segment as the phase reference
+        // Use the first sample of each analyzed segment as the phase reference
         // for residual rate correction.
         //
         // process_fft_with_phase_correction() evaluates the time for row_idx as
         //
         //   t = row_idx * effective_integ_time + start_time_offset_sec.
         //
-        // Therefore, choosing
-        //
-        //   start_time_offset_sec = -0.5 * (physical_length - 1) * dt
-        //
-        // makes the segment midpoint t=0. This keeps the displayed fringe
-        // phase local to each 2-s segment, which matches the conventional
-        // fringe output more closely than using the absolute time from the
-        // beginning of the file.
-        let start_time_offset_sec =
-            -0.5_f32 * (physical_length.saturating_sub(1) as f32) * effective_integ_time;
+        // Therefore start_time_offset_sec=0 makes row 0 the phase epoch. This
+        // is also the MJD/UVW epoch written to the scalar contamination NPZ.
+        let start_time_offset_sec = 0.0;
 
         if current_length <= 0 {
             return Err("有効なセクター長が 0 以下です".into());

@@ -107,6 +107,7 @@ const EXPLICIT_ALIASES: &[(&str, &[&str])] = &[
     ("drange", &["delay-w", "delay-win"]),
     ("rrange", &["rate-w", "rate-win"]),
     ("in_beam", &["inbeam", "in-beam-vlbi"]),
+    ("contamination_subtract", &["contamisubt"]),
     ("dynamic_spectrum", &["ds", "dynamic"]),
     ("bandpass", &["bp"]),
     ("bandpass_table", &["bptable"]),
@@ -320,6 +321,13 @@ pub struct Args {
     #[arg(long)]
     pub bandpass: Option<PathBuf>,
 
+    /// Analyze contamination-removal handoff data for flux.
+    #[arg(long, num_args = 0.., value_name = "KEY:VALUE")]
+    pub contamination: Option<Vec<String>>,
+
+    #[arg(long = "contamination-subtract", value_name = "MODEL_NPZ")]
+    pub contamination_subtract: Option<PathBuf>,
+
     /// Normalize by ACF.
     #[arg(long = "norm-acf")]
     pub norm_acf: bool,
@@ -428,6 +436,8 @@ impl Default for Args {
             iter: 5,
             dynamic_spectrum: false,
             bandpass: None,
+            contamination: None,
+            contamination_subtract: None,
             norm_acf: false,
             bandpass_table: false,
             cpu: 0,

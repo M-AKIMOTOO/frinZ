@@ -362,6 +362,8 @@ In stdout and `*_summary.txt`, these appear as:
 
 ## 出力ファイル名の補正接尾辞
 
+frinZ の解析結果はすべて元 `.cor` の親ディレクトリ直下の `frinZ/` にまとめます。bandpass、RFI、contamination subtractionなどの処理ごとに親直下へ別ディレクトリは作りません。
+
 frinZ の通常解析と派生解析は、基本stemの解析product名の後に補正接尾辞を付けます。接尾辞の順序は常に `bp` → `rfi` → `contamisubt`（in-beam解析では最後に `inbeam`）です。補正の組合せが変わってもproductまでの共通部分をワイルドカードで選択できます。
 
 - 補正なし: `..._len60s_delay_rate_search.txt`
@@ -374,7 +376,7 @@ frinZ の通常解析と派生解析は、基本stemの解析product名の後に
 
 ## Contamination handoff (`--contamination`)
 
-`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` がC/Xそれぞれ通常出力と同じprefixの `obscode_***_{c,x}_contamisubt_model.npz` を生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` と補正テーブルを同時に読み、private copy-on-writeメモリ上で減算して通常解析を続けます。元 `.cor` は維持し、`*_contamisubt.cor` は生成しません。減算解析の出力はproduct名の後に `_contamisubt` を付けます。
+`frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` がC/Xそれぞれ通常出力と同じprefixの `obscode_***_{c,x}_contamisubt_model.npz` を生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` と補正テーブルを同時に読み、private copy-on-writeメモリ上で減算して通常解析を続けます。元 `.cor` は維持し、`*_contamisubt.cor` は生成しません。減算解析も通常解析と同じ元 `.cor` 親の `frinZ/` 配下へ保存し、親直下に `contamisubt/` は作りません。出力名はproduct名の後に `_contamisubt` を付けて区別します。
 
 format v5 handoff は、`--length` の積分開始 MJD/UVW、積分時間、中心周波数、および frinZ が通常のテキスト行へ出した delay/rate セルの複素値を1個保存します。MJDは積分中心ではなく開始時刻で、その時刻から `effective_integration_time_s` のデータを用います。fringe searchの位相基準も最初のsampleです。加えて `raw_mjd`, `raw_uv_{u,v,w}`, `raw_frequency_mhz`, `raw_visibility_real/imag` を保存します。raw visibilityは `.cor` 読み込み直後のrow-major `[sector,channel]` で、ACF規格化、rebin、delay/rate補正、padding、bandpass補正より前の値です。
 

@@ -36,6 +36,17 @@ use crate::stfft;
 use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg};
 type C32 = Complex<f32>;
 
+pub fn frinz_output_dir(input_path: &Path, in_beam: bool) -> PathBuf {
+    let mut output_dir = input_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("frinZ");
+    if in_beam {
+        output_dir.push("inbeamVLBI");
+    }
+    output_dir
+}
+
 #[derive(Debug, Clone)]
 struct ScanCorrection {
     start_time: DateTime<Utc>,
@@ -263,18 +274,8 @@ pub fn process_cor_file(
     suppress_output: bool,
 ) -> Result<ProcessResult, Box<dyn Error>> {
     // --- File and Path Setup ---
-    let original_parent = input_path.parent().unwrap_or_else(|| Path::new(""));
     let contamination_mode = args.contamination_subtract.is_some();
-    let analysis_parent = if contamination_mode {
-        original_parent.join("contamisubt")
-    } else {
-        original_parent.to_path_buf()
-    };
-    let frinz_dir = if args.in_beam {
-        analysis_parent.join("frinZ").join("inbeamVLBI")
-    } else {
-        analysis_parent.join("frinZ")
-    };
+    let frinz_dir = frinz_output_dir(input_path, args.in_beam);
     fs::create_dir_all(&frinz_dir)?;
 
     let original_basename = input_path.file_stem().unwrap().to_str().unwrap();
@@ -1879,4 +1880,28 @@ pub(crate) fn run_analysis_pipeline(
         delay_rate_2d_data_comp,
         pre_bandpass_analysis_results,
     ))
+}
+
+#[cfg(test)]
+mod output_directory_tests {
+    use super::frinz_output_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn all_standard_results_share_the_input_parent_frinz_directory() {
+        let input = Path::new("/data/session/source.cor");
+        assert_eq!(
+            frinz_output_dir(input, false),
+            PathBuf::from("/data/session/frinZ")
+        );
+    }
+
+    #[test]
+    fn inbeam_is_nested_below_the_shared_frinz_directory() {
+        let input = Path::new("/data/session/source.cor");
+        assert_eq!(
+            frinz_output_dir(input, true),
+            PathBuf::from("/data/session/frinZ/inbeamVLBI")
+        );
+    }
 }

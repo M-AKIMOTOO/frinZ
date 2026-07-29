@@ -62,7 +62,7 @@ use crate::maser::run_maser_analysis;
 use crate::multisideband::run_multisideband_analysis;
 use crate::phsref::run_phase_reference_analysis;
 use crate::plot::{write_add_plot_outputs, write_cumulate_outputs};
-use crate::processing::process_cor_file;
+use crate::processing::{frinz_output_dir, process_cor_file};
 use crate::raw_visibility::run_raw_visibility_plot;
 use crate::search::run_acel_search_analysis;
 use crate::stfft::write_output as write_stfft_output;
@@ -660,27 +660,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let result =
             process_cor_file(input_path, &args, &time_flag_ranges, &pp_flag_ranges, false)?;
-        let original_parent = input_path.parent().unwrap_or_else(|| Path::new(""));
-        let analysis_parent = if args.contamination_subtract.is_some() {
-            original_parent.join("contamisubt")
-        } else {
-            original_parent.to_path_buf()
-        };
-        let frinz_dir = analysis_parent.join("frinZ");
-        let original_stem = input_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("visibility");
-        let analysis_input =
-            if args.contamination_subtract.is_some() && !original_stem.ends_with("_contamisubt") {
-                analysis_parent.join(format!("{}_contamisubt.cor", original_stem))
-            } else {
-                input_path.to_path_buf()
-            };
+        let frinz_dir = frinz_output_dir(input_path, false);
         write_cumulate_outputs(&args, &result, &frinz_dir)?;
         let base_filename = write_add_plot_outputs(&args, &result, &frinz_dir)?;
         write_wwz_outputs(&args, &result, &frinz_dir)?;
-        if let Some(path) = write_stfft_output(&analysis_input, &args, &result)? {
+        if let Some(path) = write_stfft_output(input_path, &args, &result)? {
             println!("STFFT data saved to: {}", path.display());
         }
         if args.allan_deviance {

@@ -13,14 +13,14 @@ mod acel {
     use num_complex::Complex;
 
     use crate::args::Args;
+    use crate::fft::apply_phase_correction_in_place_at_frequency;
     use crate::fitting;
     use crate::header::{parse_header, CorHeader};
     use crate::input_support::read_input_bytes;
     use crate::plot::plot_acel_search_result;
-    use crate::processing::run_analysis_pipeline;
     use crate::read::read_visibility_data;
     use crate::rfi::parse_rfi_ranges;
-    use crate::utils::unwrap_phase;
+    use crate::utils::unwrap_phase_with_rate;
 
     type C32 = Complex<f32>;
 
@@ -125,9 +125,22 @@ mod acel {
         if peak_args.iter < 4 {
             peak_args.iter = 4;
         }
+        // Apply the accumulated Taylor correction explicitly with the file-start
+        // epoch below. The per-window peak search must then see only residuals;
+        // otherwise run_analysis_pipeline references the correction to each
+        // window start and cannot flatten phase between windows.
+        peak_args.delay_correct = 0.0;
+        peak_args.rate_correct = 0.0;
+        peak_args.acel_correct = 0.0;
+        peak_args.jerk_correct = 0.0;
+        peak_args.snap_correct = 0.0;
 
         for data_point in collected_data {
-            let start_time_offset_sec = (data_point.obs_time - obs_time_start).num_seconds() as f32;
+            let start_time_offset_sec = data_point
+                .obs_time
+                .signed_duration_since(obs_time_start)
+                .num_milliseconds() as f32
+                / 1000.0;
 
             if data_point.sector_count <= 0 {
                 continue;
@@ -138,15 +151,28 @@ mod acel {
                 continue;
             }
             let effective_fft_point = (fft_point_half * 2) as i32;
-
-            let (analysis_results, _, _, _) = run_analysis_pipeline(
-                &data_point.complex_vec,
-                header,
-                &peak_args,
-                Some("peak"),
-                args.delay_correct,
+            let mut corrected_complex_vec = data_point.complex_vec.clone();
+            apply_phase_correction_in_place_at_frequency(
+                &mut corrected_complex_vec,
+                fft_point_half,
                 current_total_rate_correct,
+                args.delay_correct,
                 current_total_acel_correct,
+                args.jerk_correct,
+                args.snap_correct,
+                effective_integ_time,
+                header.sampling_speed as u32,
+                effective_fft_point as u32,
+                start_time_offset_sec,
+                header.observing_frequency,
+            );
+
+            // Use the same iterative peak search as the normal CLI path. A
+            // single FFT peak can select the 1/window-spacing rate alias and
+            // then gives the unwrap helper the wrong branch information.
+            let search_result = super::deep::run_peak_search(
+                &corrected_complex_vec,
+                header,
                 current_length,
                 current_length,
                 effective_integ_time,
@@ -154,11 +180,13 @@ mod acel {
                 &obs_time_start,
                 rfi_ranges,
                 bandpass_data,
-                false,
-                effective_fft_point,
+                &peak_args,
+                header.number_of_sector,
+                peak_args.cpu,
+                None,
             )?;
-
-            let phase_rad = analysis_results.delay_phase.to_radians() as f32;
+            let analysis_results = search_result.analysis_results;
+            let phase_rad = analysis_results.delay_phase.to_radians();
 
             phases_collected.push(phase_rad);
             times_collected.push(start_time_offset_sec as f64);
@@ -166,7 +194,19 @@ mod acel {
             residual_delays_samples.push(analysis_results.residual_delay);
         }
 
-        unwrap_phase(&mut phases_collected, true);
+        // Consecutive windows are separated by args.length seconds. Their
+        // wrapped phases alone cannot distinguish rates separated by
+        // 1/args.length Hz (0.1 Hz for 10-second windows). Use the independently
+        // searched residual rates to choose the correct integer phase turn.
+        let times_f32: Vec<f32> = times_collected.iter().map(|&time| time as f32).collect();
+        let phases_deg: Vec<f32> = phases_collected
+            .iter()
+            .map(|&phase| phase.to_degrees())
+            .collect();
+        phases_collected = unwrap_phase_with_rate(&phases_deg, &times_f32, &residual_rates_hz)
+            .into_iter()
+            .map(f32::to_radians)
+            .collect();
         Ok((
             times_collected,
             phases_collected,

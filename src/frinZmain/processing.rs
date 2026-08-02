@@ -259,6 +259,8 @@ pub struct ProcessResult {
     pub add_plot_amp: Vec<f32>,
     pub add_plot_snr: Vec<f32>,
     pub add_plot_phase: Vec<f32>,
+    /// Peak baseband frequency [MHz] for each `--frequency --add` window.
+    pub add_plot_freq: Vec<f32>,
     pub add_plot_noise: Vec<f32>,
     pub add_plot_res_delay: Vec<f32>,
     pub add_plot_res_rate: Vec<f32>,
@@ -528,6 +530,7 @@ pub fn process_cor_file(
     let mut wwz_times_sec: Vec<f32> = Vec::new();
     let mut add_plot_amp: Vec<f32> = Vec::new();
     let mut add_plot_phase: Vec<f32> = Vec::new();
+    let mut add_plot_freq: Vec<f32> = Vec::new();
     let mut add_plot_snr: Vec<f32> = Vec::new();
     let mut add_plot_noise: Vec<f32> = Vec::new();
     let mut add_plot_times: Vec<DateTime<Utc>> = Vec::new();
@@ -1142,6 +1145,7 @@ pub fn process_cor_file(
                 add_plot_amp.push(analysis_results.freq_max_amp * 100.0);
                 add_plot_snr.push(analysis_results.freq_snr);
                 add_plot_phase.push(analysis_results.freq_phase);
+                add_plot_freq.push(analysis_results.freq_freq);
                 add_plot_noise.push(analysis_results.freq_noise * 100.0);
                 add_plot_res_delay.push(analysis_results.residual_delay);
                 add_plot_res_rate.push(analysis_results.residual_rate);
@@ -1688,6 +1692,7 @@ pub fn process_cor_file(
         add_plot_amp,
         add_plot_snr,
         add_plot_phase,
+        add_plot_freq,
         add_plot_noise,
         add_plot_res_delay,
         add_plot_res_rate,

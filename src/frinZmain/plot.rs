@@ -1018,6 +1018,7 @@ pub fn write_add_plot_outputs(
             &result.add_plot_amp,
             &result.add_plot_snr,
             &result.add_plot_phase,
+            &result.add_plot_freq,
             &result.add_plot_noise,
             &result.add_plot_res_delay,
             &result.add_plot_res_rate,
@@ -1110,6 +1111,7 @@ pub fn add_plot(
     amp: &[f32],
     snr: &[f32],
     phase: &[f32],
+    freq: &[f32],
     noise: &[f32],
     res_delay: &[f32],
     res_rate: &[f32],
@@ -1124,6 +1126,7 @@ pub fn add_plot(
         (amp, "Amplitude [%]", "amp"),
         (snr, "SNR", "snr"),
         (phase, "Phase [deg]", "phase"),
+        (freq, "Peak Frequency [MHz]", "freq"),
         (
             phase_unwrapped_slice,
             "Phase (unwrapped) [deg]",
@@ -1149,6 +1152,10 @@ pub fn add_plot(
         if filename_suffix == "phase" {
             y_min = -180.0;
             y_max = 180.0;
+        } else if (y_max - y_min).abs() <= f32::EPSILON {
+            let margin = (y_min.abs() * 1.0e-6).max(1.0e-6);
+            y_min -= margin;
+            y_max += margin;
         }
 
         let x_range = if length.len() > 1 {
@@ -1183,6 +1190,8 @@ pub fn add_plot(
                 } else if filename_suffix == "snr" {
                     format!("{:.0}", v)
                 } else if filename_suffix == "resdelay" {
+                    format!("{:.3}", v)
+                } else if filename_suffix == "freq" {
                     format!("{:.3}", v)
                 } else if filename_suffix == "resrate" {
                     format!("{:.2e}", v)

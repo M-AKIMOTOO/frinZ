@@ -416,7 +416,7 @@ fn apply_phase_solution(
     }
 
     let mut corrected = complex_vec.to_vec();
-    fft::apply_phase_correction_in_place(
+    fft::apply_phase_correction_in_place_at_frequency(
         &mut corrected,
         fft_half,
         rate_hz,
@@ -428,6 +428,7 @@ fn apply_phase_solution(
         header.sampling_speed as u32,
         header.fft_point as u32,
         start_time_offset_sec,
+        header.observing_frequency,
     );
 
     corrected

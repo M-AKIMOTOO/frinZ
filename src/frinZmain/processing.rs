@@ -15,8 +15,8 @@ use crate::bandpass::{apply_bandpass_correction, plot_bandpass_spectrum, read_ba
 use crate::contamination::{write_contamination_handoff, ContaminationPhaseCorrectionInput};
 use crate::contamination_subtract::apply_contamination_subtract;
 use crate::fft::{
-    apply_phase_correction_in_place, perform_ifft_on_vec, process_fft,
-    process_fft_with_phase_correction, process_ifft,
+    apply_phase_correction_in_place_at_frequency, perform_ifft_on_vec, process_fft,
+    process_fft_with_phase_correction_at_frequency, process_ifft,
 };
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::{open_input_data, open_input_data_copy_on_write};
@@ -640,7 +640,7 @@ pub fn process_cor_file(
                 .num_milliseconds() as f32
                 / 1000.0;
 
-            apply_phase_correction_in_place(
+            apply_phase_correction_in_place_at_frequency(
                 &mut complex_vec,
                 fft_point_half_used,
                 manual_rate_correct,
@@ -652,6 +652,7 @@ pub fn process_cor_file(
                 header.sampling_speed as u32,
                 effective_fft_point as u32,
                 start_time_offset_sec,
+                processing_header.observing_frequency,
             );
         }
 
@@ -1803,7 +1804,7 @@ pub(crate) fn run_analysis_pipeline(
         || base_args.jerk_correct != 0.0
         || base_args.snap_correct != 0.0
     {
-        process_fft_with_phase_correction(
+        process_fft_with_phase_correction_at_frequency(
             complex_vec,
             physical_length,
             effective_fft_point,
@@ -1817,6 +1818,7 @@ pub(crate) fn run_analysis_pipeline(
             base_args.snap_correct,
             effective_integ_time,
             start_time_offset_sec,
+            header.observing_frequency,
         )
     } else {
         process_fft(

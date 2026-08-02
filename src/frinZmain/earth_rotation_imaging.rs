@@ -4,7 +4,7 @@
 
 use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
-use crate::fft::apply_phase_correction_in_place;
+use crate::fft::apply_phase_correction_in_place_at_frequency;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
@@ -1177,7 +1177,7 @@ fn collect_visibilities_from_cor(
         let start_time_offset_sec = 0.0;
 
         let mut corrected = complex_vec.clone();
-        apply_phase_correction_in_place(
+        apply_phase_correction_in_place_at_frequency(
             &mut corrected,
             fft_point_half_used,
             correction.rate,
@@ -1189,6 +1189,7 @@ fn collect_visibilities_from_cor(
             header.sampling_speed as u32,
             effective_fft_point as u32,
             start_time_offset_sec,
+            header.observing_frequency,
         );
 
         let averaged = average_complex_slice(&corrected);

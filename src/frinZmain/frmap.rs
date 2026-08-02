@@ -13,7 +13,9 @@ use num_complex::Complex;
 
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
-use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft_with_delay_padding};
+use crate::fft::{
+    apply_phase_correction_in_place_at_frequency, process_fft, process_ifft_with_delay_padding,
+};
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
@@ -484,7 +486,7 @@ pub fn run_fringe_rate_map_analysis(
             // Keep the phase origin at the first sample.  The complex sky-map
             // rephasing below uses the same epoch when combining segments.
             let start_time_offset_sec = 0.0;
-            apply_phase_correction_in_place(
+            apply_phase_correction_in_place_at_frequency(
                 &mut complex_vec,
                 (header.fft_point / 2) as usize,
                 args.rate_correct,
@@ -496,6 +498,7 @@ pub fn run_fringe_rate_map_analysis(
                 header.sampling_speed as u32,
                 header.fft_point as u32,
                 start_time_offset_sec,
+                header.observing_frequency,
             );
         }
 
@@ -833,7 +836,7 @@ fn run_frmap_maser(
 
             let start_time_offset_sec = 0.0;
 
-            apply_phase_correction_in_place(
+            apply_phase_correction_in_place_at_frequency(
                 &mut complex_vec,
                 (header.fft_point / 2) as usize,
                 args.rate_correct,
@@ -845,6 +848,7 @@ fn run_frmap_maser(
                 header.sampling_speed as u32,
                 header.fft_point as u32,
                 start_time_offset_sec,
+                header.observing_frequency,
             );
         }
 

@@ -8,7 +8,7 @@ use num_complex::Complex;
 use crate::analysis::analyze_results;
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
-use crate::fft::{apply_phase_correction_in_place, process_fft, process_ifft};
+use crate::fft::{apply_phase_correction_in_place_at_frequency, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
@@ -559,7 +559,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         }
 
         let c_start_time_offset_sec = 0.0;
-        apply_phase_correction_in_place(
+        apply_phase_correction_in_place_at_frequency(
             &mut c_complex_vec_sector,
             (c_band_header.fft_point / 2) as usize,
             0.0,
@@ -571,6 +571,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             c_band_header.sampling_speed as u32,
             c_band_header.fft_point as u32,
             c_start_time_offset_sec,
+            c_band_header.observing_frequency,
         );
 
         output_file.write_all(&c_sector_header[0])?;
@@ -605,7 +606,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         }
 
         let x_start_time_offset_sec = 0.0;
-        apply_phase_correction_in_place(
+        apply_phase_correction_in_place_at_frequency(
             &mut x_complex_vec_sector,
             (x_band_header.fft_point / 2) as usize,
             0.0,
@@ -617,6 +618,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             x_band_header.sampling_speed as u32,
             x_band_header.fft_point as u32,
             x_start_time_offset_sec,
+            x_band_header.observing_frequency,
         );
 
         for val in x_complex_vec_sector.iter_mut() {

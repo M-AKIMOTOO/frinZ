@@ -14,7 +14,7 @@ use num_complex::Complex;
 use crate::analysis::AnalysisResults;
 use crate::args::Args;
 use crate::bandpass;
-use crate::fft::apply_phase_correction_in_place;
+use crate::fft::apply_phase_correction_in_place_at_frequency;
 use crate::header::CorHeader;
 use crate::processing::run_analysis_pipeline;
 use crate::read::{
@@ -147,7 +147,7 @@ pub fn read_bandpass<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<C32>> {
 /// Apply delay/rate/acceleration correction in place to already-read visibility data.
 pub fn apply_delay_rate_correction(data: &mut CorData, correction: PhaseCorrection) {
     let fft_point_half = (data.header.fft_point / 2).max(0) as usize;
-    apply_phase_correction_in_place(
+    apply_phase_correction_in_place_at_frequency(
         &mut data.visibility,
         fft_point_half,
         correction.rate_hz,
@@ -159,6 +159,7 @@ pub fn apply_delay_rate_correction(data: &mut CorData, correction: PhaseCorrecti
         data.header.sampling_speed as u32,
         data.header.fft_point as u32,
         correction.start_time_offset_sec,
+        data.header.observing_frequency,
     );
 }
 
@@ -228,7 +229,7 @@ fn run_delay_rate(
     }
 
     if !options.correction.is_zero() {
-        apply_phase_correction_in_place(
+        apply_phase_correction_in_place_at_frequency(
             &mut complex_vec,
             fft_point_half,
             options.correction.rate_hz,
@@ -240,6 +241,7 @@ fn run_delay_rate(
             data.header.sampling_speed as u32,
             data.header.fft_point as u32,
             options.correction.start_time_offset_sec,
+            data.header.observing_frequency,
         );
         args.delay_correct = 0.0;
         args.rate_correct = 0.0;
@@ -407,12 +409,17 @@ mod tests {
         let visibility = (0..length)
             .flat_map(|row| {
                 (0..channels).map(move |channel| {
+                    let sampling_speed_hz = 64_000_000.0;
+                    let reference_frequency_hz = 8_400_000_000.0;
                     let time = start_sec + row as f64;
+                    let temporal_cycles = rate * time + 0.5 * acceleration * time * time;
+                    let baseband_frequency_hz =
+                        channel as f64 * sampling_speed_hz / fft_point as f64;
                     let phase = phase0
                         + 2.0
                             * PI
-                            * (rate * time
-                                + 0.5 * acceleration * time * time
+                            * (temporal_cycles
+                                * (1.0 + baseband_frequency_hz / reference_frequency_hz)
                                 + delay * channel as f64 / fft_point as f64);
                     C32::new(phase.cos() as f32, phase.sin() as f32)
                 })
@@ -462,9 +469,10 @@ mod tests {
             );
             let phase_error =
                 wrap_degrees(output.analysis.delay_phase as f64 - expected_phase).abs();
+            let expected_delay = delay + 64_000_000.0 * rate * start / 8_400_000_000.0;
             assert!(
-                (output.analysis.residual_delay as f64 - delay).abs() < 1.0e-3,
-                "length={length}: delay={}",
+                (output.analysis.residual_delay as f64 - expected_delay).abs() < 1.0e-3,
+                "length={length}: delay={} expected={expected_delay}",
                 output.analysis.residual_delay
             );
             if length == 1 {
@@ -582,6 +590,12 @@ mod tests {
                 Some((delay as f32, 0.05)),
             )
             .unwrap();
+            let expected_delay = delay + 64_000_000.0 * rate * 100.0 / 8_400_000_000.0;
+            assert!(
+                (result.analysis_results.residual_delay as f64 - expected_delay).abs() < 1.0e-3,
+                "delay at segment start was not recovered: expected={expected_delay}, delay={}",
+                result.analysis_results.residual_delay
+            );
             assert!(
                 (result.analysis_results.residual_rate as f64 - rate).abs() < 1.0e-4,
                 "stale seed was not reacquired: expected={rate}, rate={}",

@@ -560,7 +560,7 @@ mod deep {
     use crate::args::Args;
     use crate::bandpass::apply_bandpass_correction;
     use crate::fft::{
-        cached_fft_plan, process_fft, process_fft_with_phase_correction, process_ifft,
+        cached_fft_plan, process_fft, process_fft_with_phase_correction_at_frequency, process_ifft,
     };
     use crate::header::CorHeader;
     use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, positive_or_epsilon, rate_cal};
@@ -658,7 +658,7 @@ mod deep {
                     self.args.rate_padding,
                 )
             } else {
-                process_fft_with_phase_correction(
+                process_fft_with_phase_correction_at_frequency(
                     self.complex_vec,
                     self.physical_length,
                     self.effective_fft_point,
@@ -672,6 +672,7 @@ mod deep {
                     self.args.snap_correct,
                     self.effective_integ_time,
                     self.start_time_offset_sec,
+                    self.header.observing_frequency,
                 )
             }
         }
@@ -979,7 +980,7 @@ mod deep {
         // Use the first sample of each analyzed segment as the phase reference
         // for residual rate correction.
         //
-        // process_fft_with_phase_correction() evaluates the time for row_idx as
+        // process_fft_with_phase_correction_at_frequency() evaluates the time for row_idx as
         //
         //   t = row_idx * effective_integ_time + start_time_offset_sec.
         //

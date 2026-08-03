@@ -136,12 +136,12 @@
   全解析結果は元 .cor の親ディレクトリ直下の frinZ/ に保存する。
   補正方法ごとの兄弟ディレクトリは作らず、product名と補正接尾辞で区別する。
   出力名は基本stemのproduct名の後へ補正接尾辞を固定順 bp -> rfi -> contamisubt で付ける。
-  例: *_delay_rate_search_bp.txt, *_delay_rate_search_bp_rfi.txt,
-      *_delay_rate_search_bp_rfi_contamisubt.txt, *_SIGMAGEM_cumulate60_bp_rfi.png。
+  例: *_delay_rate_search_bp.tsv, *_delay_rate_search_bp_rfi.tsv,
+      *_delay_rate_search_bp_rfi_contamisubt.tsv, *_SIGMAGEM_cumulate60_bp_rfi.png。
   TXT/TSV/PNG/NPZおよびspectrum/bptable/dynamic/add-plot/cumulate/WWZ/STFFT/Allan/in-band/sidecarで共通。
   --add-plot                         Amp/SNR/位相/雑音の時系列
   --wwz                              各 loop の fringe-search 結果に対して WWZ を実行（frinZ/wwz/）
-  --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）
+  --cumulate <SEC>                   積分時間 vs S/N（両対数、フィット付き）と --add 相当の時系列PNG
   --bandpass-table                   補正後スペクトルを圧縮NPZ保存（frequency_mhz, real, imag, amplitude, phase_deg）
   --spectrum                         クロススペクトルを圧縮NPZ保存（frequency_mhz, real, imag, amplitude, phase_deg）
   --cor2bin                          生可視光度をバイナリ保存

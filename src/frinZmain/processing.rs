@@ -23,7 +23,8 @@ use crate::input_support::{open_input_data, open_input_data_copy_on_write};
 use crate::norm_acf::NormAcfContext;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::{
-    format_delay_output, format_freq_output, generate_output_names,
+    format_delay_output, format_delay_tsv_header, format_delay_tsv_row, format_freq_output,
+    format_freq_tsv_header, format_freq_tsv_row, generate_output_names,
     insert_product_before_processing_suffixes, output_header_info,
 };
 use crate::plot::{
@@ -523,8 +524,8 @@ pub fn process_cor_file(
         loop_count = available.saturating_add(args.cumulate - 1) / args.cumulate;
     }
 
-    let mut delay_output_str = String::new();
-    let mut freq_output_str = String::new();
+    let mut delay_tsv = String::new();
+    let mut freq_tsv = String::new();
     let mut cumulate_len: Vec<f32> = Vec::new();
     let mut cumulate_snr: Vec<f32> = Vec::new();
     let mut wwz_times_sec: Vec<f32> = Vec::new();
@@ -1029,12 +1030,26 @@ pub fn process_cor_file(
                 if !suppress_output {
                     print!("{}\n", header_str);
                 }
-                delay_output_str += &format!("{}\n", header_str);
+                if args.output {
+                    delay_tsv.push_str(&format_delay_tsv_header(
+                        &header.station1_name,
+                        &header.station2_name,
+                    ));
+                }
             }
             if !suppress_output {
                 print!("{}\n", delay_output_line);
             }
-            delay_output_str += &format!("{}\n", delay_output_line);
+            if args.output {
+                delay_tsv.push_str(&format_delay_tsv_row(
+                    &analysis_results,
+                    &label_str,
+                    &rfi_display,
+                    bandpass_active,
+                    norm_acf_context.is_some(),
+                ));
+                delay_tsv.push('\n');
+            }
 
             if args.cumulate != 0 {
                 // Use actual (unpadded) integration time for cumulation plot
@@ -1056,7 +1071,7 @@ pub fn process_cor_file(
             let complex_sample = Complex::from_polar(analysis_results.delay_max_amp, phase_rad);
             add_plot_complex.push(complex_sample);
 
-            if args.add_plot || args.stfft > 0 {
+            if args.add_plot || args.stfft > 0 || args.cumulate != 0 {
                 add_plot_snr.push(analysis_results.delay_snr);
                 add_plot_noise.push(analysis_results.delay_noise * 100.0);
                 add_plot_res_delay.push(analysis_results.residual_delay);
@@ -1081,8 +1096,8 @@ pub fn process_cor_file(
                         output_basename,
                         "delay_rate_search",
                     );
-                    let output_file_path = out_dir.join(format!("{output_stem}.txt"));
-                    fs::write(output_file_path, &delay_output_str)?;
+                    let output_file_path = out_dir.join(format!("{output_stem}.tsv"));
+                    fs::write(output_file_path, &delay_tsv)?;
                 }
             }
         } else {
@@ -1110,12 +1125,26 @@ pub fn process_cor_file(
                 if !suppress_output {
                     print!("{}\n", header_str);
                 }
-                freq_output_str += &format!("{}\n", header_str);
+                if args.output {
+                    freq_tsv.push_str(&format_freq_tsv_header(
+                        &header.station1_name,
+                        &header.station2_name,
+                    ));
+                }
             }
             if !suppress_output {
                 print!("{}\n", freq_output_line);
             }
-            freq_output_str += &format!("{}\n", freq_output_line);
+            if args.output {
+                freq_tsv.push_str(&format_freq_tsv_row(
+                    &analysis_results,
+                    &label_str,
+                    &rfi_display,
+                    bandpass_active,
+                    norm_acf_context.is_some(),
+                ));
+                freq_tsv.push('\n');
+            }
 
             if l1 == loop_count - 1 && args.output {
                 if let Some(path) = &output_path {
@@ -1135,12 +1164,18 @@ pub fn process_cor_file(
                         output_basename,
                         "freq_rate_search",
                     );
-                    let output_file_path = out_dir.join(format!("{output_stem}.txt"));
-                    fs::write(output_file_path, &freq_output_str)?;
+                    let output_file_path = out_dir.join(format!("{output_stem}.tsv"));
+                    fs::write(output_file_path, &freq_tsv)?;
                 }
             }
 
-            if args.add_plot || args.stfft > 0 {
+            if args.cumulate != 0 {
+                let integ_time = physical_length as f32 * effective_integ_time;
+                cumulate_len.push(integ_time);
+                cumulate_snr.push(analysis_results.freq_snr);
+            }
+
+            if args.add_plot || args.stfft > 0 || args.cumulate != 0 {
                 add_plot_times.push(phase_obs_time);
                 add_plot_amp.push(analysis_results.freq_max_amp * 100.0);
                 add_plot_snr.push(analysis_results.freq_snr);

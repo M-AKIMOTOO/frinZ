@@ -990,27 +990,70 @@ pub fn write_add_plot_outputs(
     frinz_dir: &Path,
 ) -> Result<String, Box<dyn Error>> {
     let base_filename = make_base_filename(args, result);
-    if !args.add_plot {
+    if !args.add_plot && args.cumulate == 0 {
         return Ok(base_filename);
     }
 
     let path: PathBuf = if args.in_beam {
         frinz_dir.to_path_buf()
+    } else if args.cumulate != 0 {
+        frinz_dir.join(format!("cumulate/len{}s", args.cumulate))
     } else {
         frinz_dir.join("add_plot")
     };
     std::fs::create_dir_all(&path)?;
-    let add_plot_filepath = path.join(&base_filename);
+    let add_plot_stem = if args.cumulate != 0 {
+        insert_product_before_processing_suffixes(&base_filename, "cumulate")
+    } else {
+        base_filename.clone()
+    };
+    let add_plot_filepath = path.join(&add_plot_stem);
     let legacy_stem = insert_product_before_processing_suffixes(&base_filename, "add_plot_data");
     let _ = std::fs::remove_file(path.join(format!("{legacy_stem}.tsv")));
+    if args.cumulate != 0 {
+        let legacy_add_plot_path = path.join(&base_filename);
+        for suffix in [
+            "amp",
+            "snr",
+            "phase",
+            "freq",
+            "phase_unwrapped",
+            "noise",
+            "resdelay",
+            "resrate",
+        ] {
+            let legacy_plot_stem = insert_product_before_processing_suffixes(
+                legacy_add_plot_path.to_str().unwrap(),
+                suffix,
+            );
+            let _ = std::fs::remove_file(format!("{legacy_plot_stem}.png"));
+        }
+        let legacy_tsv_stem = insert_product_before_processing_suffixes(
+            legacy_add_plot_path.to_str().unwrap(),
+            "add_plot",
+        );
+        let _ = std::fs::remove_file(format!("{legacy_tsv_stem}.tsv"));
+    }
 
     if !result.add_plot_times.is_empty() {
-        let first_time = result.add_plot_times[0];
-        let elapsed_times_f32: Vec<f32> = result
-            .add_plot_times
-            .iter()
-            .map(|dt| (*dt - first_time).num_seconds() as f32)
-            .collect();
+        let elapsed_times_f32: Vec<f32> = if args.cumulate != 0 {
+            if let Some(first_length) = result.cumulate_len.first() {
+                result
+                    .cumulate_len
+                    .iter()
+                    .map(|value| value - first_length)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            let first_time = result.add_plot_times[0];
+            result
+                .add_plot_times
+                .iter()
+                .map(|dt| (*dt - first_time).num_seconds() as f32)
+                .collect()
+        };
 
         add_plot(
             add_plot_filepath.to_str().unwrap(),
@@ -1025,6 +1068,22 @@ pub fn write_add_plot_outputs(
             &result.header.source_name,
             result.length_sec,
             &result.obs_time,
+        )?;
+
+        let tsv_stem = insert_product_before_processing_suffixes(
+            add_plot_filepath.to_str().unwrap(),
+            "add_plot",
+        );
+        write_add_plot_tsv(
+            &PathBuf::from(format!("{tsv_stem}.tsv")),
+            &elapsed_times_f32,
+            &result.add_plot_amp,
+            &result.add_plot_snr,
+            &result.add_plot_phase,
+            &result.add_plot_freq,
+            &result.add_plot_noise,
+            &result.add_plot_res_delay,
+            &result.add_plot_res_rate,
         )?;
 
         let axis: Vec<f64> = elapsed_times_f32
@@ -1103,6 +1162,61 @@ pub fn write_add_plot_outputs(
     }
 
     Ok(base_filename)
+}
+
+fn write_add_plot_tsv(
+    output_path: &Path,
+    length: &[f32],
+    amp: &[f32],
+    snr: &[f32],
+    phase: &[f32],
+    freq: &[f32],
+    noise: &[f32],
+    res_delay: &[f32],
+    res_rate: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    let rows = [
+        length.len(),
+        amp.len(),
+        snr.len(),
+        phase.len(),
+        noise.len(),
+        res_delay.len(),
+        res_rate.len(),
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0);
+
+    let mut file = File::create(output_path)?;
+    writeln!(
+        file,
+        "# Time\tAmp\tSNR\tPhase\tFrequency\tNoise-level\tRes-Delay\tRes-Rate"
+    )?;
+    writeln!(
+        file,
+        "# [s]\t[%]\t-\t[deg]\t[MHz]\t1-sigma[%]\t[sample]\t[Hz]"
+    )?;
+    for idx in 0..rows {
+        let frequency = if freq.len() == rows {
+            format!("{:.7}", freq[idx])
+        } else {
+            "-".to_string()
+        };
+        writeln!(
+            file,
+            "{:.5}\t{:.6}\t{:.1}\t{:.3}\t{}\t{:.5e}\t{:.8}\t{:.8}",
+            length[idx],
+            amp[idx],
+            snr[idx],
+            phase[idx],
+            frequency,
+            noise[idx],
+            res_delay[idx],
+            res_rate[idx]
+        )?;
+    }
+    Ok(())
 }
 
 pub fn add_plot(

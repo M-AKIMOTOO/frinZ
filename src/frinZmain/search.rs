@@ -1096,6 +1096,20 @@ mod deep {
         let mut current_rate = coarse_rate;
         let rate_denominator =
             physical_length.max(1) as f32 * effective_integ_time.abs().max(1.0e-9);
+        // The wideband rate correction produces a delay drift across the
+        // sampled band. Size the initial delay basin from that physical drift.
+        let initial_rate_range =
+            10.0 * search_params.rate_search_range_factor / (2.0 * rate_denominator);
+        let search_duration_sec =
+            physical_length.max(1) as f32 * effective_integ_time.abs().max(1.0e-9);
+        let dynamic_delay_range = delay_search_range_for_rate(
+            coarse_rate,
+            search_duration_sec,
+            header.sampling_speed,
+            header.observing_frequency,
+            initial_rate_range,
+            search_params.delay_search_range,
+        );
         let effective_cpu_count = determine_effective_cpu_count(cpu_count_arg);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(effective_cpu_count)
@@ -1113,10 +1127,8 @@ mod deep {
 
                 // 現在の階層での探索範囲とステップサイズを計算
                 let scale_factor = 10.0_f32.powi(iteration as i32);
-                let delay_range = search_params.delay_search_range / scale_factor;
-                let rate_range = search_params.rate_search_range_factor
-                    / (2.0 * rate_denominator)
-                    / scale_factor;
+                let delay_range = dynamic_delay_range / scale_factor;
+                let rate_range = initial_rate_range / scale_factor;
                 let delay_step = search_params.delay_fine_step / scale_factor;
                 let rate_step =
                     search_params.rate_fine_step_factor / (10.0 * rate_denominator) / scale_factor;
@@ -1136,8 +1148,10 @@ mod deep {
                 );
                 */
 
-                let (best_delay, best_rate, best_snr) = match algorithm {
-                    DeepSearchAlgorithm::FullGrid => parallel_grid_search(
+                let (best_delay, best_rate, best_snr) = if iteration == 0 {
+                    // The first pass must evaluate delay and rate together;
+                    // axis-only refinement can miss a coupled maximum.
+                    parallel_grid_search(
                         &context,
                         current_delay,
                         current_rate,
@@ -1146,9 +1160,10 @@ mod deep {
                         delay_step,
                         rate_step,
                         &pool,
-                    )?,
-                    DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish => {
-                        parallel_axis_search(
+                    )?
+                } else {
+                    match algorithm {
+                        DeepSearchAlgorithm::FullGrid => parallel_grid_search(
                             &context,
                             current_delay,
                             current_rate,
@@ -1157,7 +1172,19 @@ mod deep {
                             delay_step,
                             rate_step,
                             &pool,
-                        )?
+                        )?,
+                        DeepSearchAlgorithm::AxisThenLocal | DeepSearchAlgorithm::PeakPolish => {
+                            parallel_axis_search(
+                                &context,
+                                current_delay,
+                                current_rate,
+                                delay_range,
+                                rate_range,
+                                delay_step,
+                                rate_step,
+                                &pool,
+                            )?
+                        }
                     }
                 };
 
@@ -1269,6 +1296,31 @@ mod deep {
         } else {
             (cpu_count_arg as usize).clamp(1, num_available_cpus)
         }
+    }
+
+    fn delay_search_range_for_rate(
+        initial_rate: f32,
+        duration_sec: f32,
+        sampling_speed: i32,
+        observing_frequency: f64,
+        initial_rate_range: f32,
+        fallback_range: f32,
+    ) -> f32 {
+        let mut range = fallback_range.max(0.0);
+        if duration_sec.is_finite()
+            && duration_sec > 0.0
+            && sampling_speed > 0
+            && observing_frequency.is_finite()
+            && observing_frequency > 0.0
+        {
+            let max_rate = initial_rate.abs() + initial_rate_range;
+            let drift =
+                max_rate as f64 * duration_sec as f64 * sampling_speed as f64 / observing_frequency;
+            if drift.is_finite() && drift < f32::MAX as f64 {
+                range = range.max(drift as f32 + 0.5);
+            }
+        }
+        range
     }
 
     /// 並列グリッド探索
@@ -1604,11 +1656,14 @@ mod deep {
             current += step64;
         }
 
-        // 最大10点に制限（計算量制御）
-        if points.len() > 10 {
-            // Ensure step_by is at least 1 to avoid panic
-            let step_by = (points.len() / 10).max(1);
-            points = points.into_iter().step_by(step_by).collect();
+        // Keep a symmetric 11-point grid so the center and both bounds are
+        // represented even when the physical search range is wide.
+        if points.len() > 11 {
+            let start = points.first().copied().unwrap_or(center);
+            let end = points.last().copied().unwrap_or(center);
+            points = (0..11)
+                .map(|index| start + (end - start) * index as f32 / 10.0)
+                .collect();
         }
 
         points

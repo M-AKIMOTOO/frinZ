@@ -591,7 +591,8 @@ pub fn process_cor_file(
         // handoff must describe the frame into which frinZ later subtracts;
         // normalization, rebinning and fringe corrections below are analysis
         // operations and must not alter this copy.
-        let raw_contamination_visibility = complex_vec.clone();
+        let raw_contamination_visibility =
+            args.contamination.is_some().then(|| complex_vec.clone());
         // Every reported fringe value is referenced to the first sample of
         // this --length window.  Its timestamp must therefore be the window
         // start, not the integration midpoint.
@@ -684,7 +685,7 @@ pub fn process_cor_file(
 
         let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp, pre_bandpass_results) =
             match primary_search_mode {
-                Some("peak") | Some("deep") => {
+                Some("peak") | Some("deep") | Some("coherent") => {
                     // Unified fringe search path:
                     //   peak = fast AxisThenLocal search + final local polish
                     //   deep = full-grid hierarchical search
@@ -699,6 +700,22 @@ pub fn process_cor_file(
                     };
                     let mut search_result = if primary_search_mode == Some("deep") {
                         search::run_deep_search(
+                            &complex_vec,
+                            &processing_header,
+                            current_length,
+                            physical_length,
+                            effective_integ_time,
+                            &current_obs_time,
+                            &file_start_time,
+                            &rfi_ranges,
+                            &bandpass_data,
+                            &loop_args,
+                            pp,
+                            loop_args.cpu,
+                            search_seed,
+                        )?
+                    } else if primary_search_mode == Some("coherent") {
+                        search::run_coherent_search(
                             &complex_vec,
                             &processing_header,
                             current_length,
@@ -846,7 +863,9 @@ pub fn process_cor_file(
                 analysis_results.delay_noise,
                 correction,
                 bandpass_data.as_deref().filter(|values| !values.is_empty()),
-                &raw_contamination_visibility,
+                raw_contamination_visibility
+                    .as_deref()
+                    .ok_or("contamination visibility copy is unavailable")?,
             )?;
         }
 

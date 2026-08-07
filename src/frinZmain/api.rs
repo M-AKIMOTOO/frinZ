@@ -53,6 +53,7 @@ impl PhaseCorrection {
 pub enum SearchMode {
     Peak,
     Deep,
+    Coherent,
 }
 
 impl SearchMode {
@@ -60,6 +61,7 @@ impl SearchMode {
         match self {
             SearchMode::Peak => "peak",
             SearchMode::Deep => "deep",
+            SearchMode::Coherent => "coherent",
         }
     }
 }
@@ -272,6 +274,21 @@ fn run_delay_rate(
                 None,
             )?,
             SearchMode::Deep => search::run_deep_search(
+                &complex_vec,
+                &data.header,
+                current_length,
+                physical_length,
+                data.effective_integ_time,
+                &data.obs_time,
+                &file_start_time,
+                &options.rfi_channel_ranges,
+                &bandpass,
+                &args,
+                data.header.number_of_sector,
+                args.cpu,
+                None,
+            )?,
+            SearchMode::Coherent => search::run_coherent_search(
                 &complex_vec,
                 &data.header,
                 current_length,

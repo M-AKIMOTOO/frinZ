@@ -87,7 +87,7 @@ Basic:
   --length N                integration window length in correlator sectors
   --skip SEC                skip this many seconds from the file start
   --loop N                  number of consecutive windows/scans to analyze
-  --search [MODE]           run fringe search; peak is default, deep/acel are slower
+  --search [MODE]           run fringe search; peak is default, coherent uses direct sums
   --iter N                  number of refinement iterations for peak/deep search
   --frequency               use frequency-rate plane instead of delay-rate plane
   --plot                    save diagnostic plots for the selected analysis mode
@@ -140,7 +140,7 @@ Special modes:
   --in-beam                 run standard in-beam VLBI delay/rate workflow
 
 Other:
-  --cpu N                   number of CPU threads for deep/peak search; 0=auto
+  --cpu N                   number of CPU threads for deep/peak/coherent search; 0=auto
   --flagging SPEC ...       flag data by time ranges or sector/pp ranges
   --header                  print parsed .cor header information and exit
   --detail                  print detailed option guide, key:value syntax, examples
@@ -224,13 +224,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if matches!(args.primary_search_mode(), Some("peak") | Some("deep")) {
-        args.rate_padding = 8;
+    if matches!(
+        args.primary_search_mode(),
+        Some("peak") | Some("deep") | Some("coherent")
+    ) {
+        args.rate_padding = 4;
     } else if args.cumulate != 0 {
         // シンプルな仕様: --cumulate が指定されたら rate_padding は常に 1 にする
         args.rate_padding = 1;
     }
-    if matches!(args.primary_search_mode(), Some("peak") | Some("deep")) && !iter_explicit {
+    if matches!(
+        args.primary_search_mode(),
+        Some("peak") | Some("deep") | Some("coherent")
+    ) && !iter_explicit
+    {
         args.iter = 4;
     }
 

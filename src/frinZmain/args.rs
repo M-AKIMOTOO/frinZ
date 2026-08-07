@@ -300,7 +300,7 @@ pub struct Args {
         num_args = 0..=1,
         default_missing_value = "peak",
         value_name = "MODE",
-        value_parser = ["peak", "deep", "deep2", "rate", "acel"],
+        value_parser = ["peak", "deep", "deep2", "coherent", "rate", "acel"],
         action = ArgAction::Append
     )]
     pub search: Vec<String>,
@@ -393,7 +393,9 @@ impl Args {
     pub fn primary_search_mode(&self) -> Option<&str> {
         self.search
             .iter()
-            .find(|mode| *mode == "peak" || *mode == "deep" || *mode == "deep2")
+            .find(|mode| {
+                *mode == "peak" || *mode == "deep" || *mode == "deep2" || *mode == "coherent"
+            })
             .map(|s| s.as_str())
     }
 }

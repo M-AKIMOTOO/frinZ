@@ -172,11 +172,11 @@ frinZ --input data.cor --search --delay-window -10 10 --rate-window -0.1 0.1
 
 #### In-band Fringe Search
 ```bash
-# Split 512 MHz bandwidth into 128 MHz subbands and search each subband
+# Split 512 MHz bandwidth into 128 MHz subbands and read the zero-delay/rate cells
 frinZ --input data.cor --inband 128
 ```
 
-`--inband` takes a power-of-two width in MHz and writes `frinZ/inband/*_inband.txt`. If `--search` is omitted, peak search is used.
+`--inband` takes a power-of-two width in MHz and writes `frinZ/inband/*_inband<width>MHz.txt`, for example `*_inband256MHz.txt`. Without `--search`, no delay/rate search is performed and the zero-delay/zero-rate cell is reported. Add `--search peak` or `--search deep` to search each in-band subband.
 
 
 #### Manual Corrections
@@ -364,15 +364,29 @@ In stdout and `*_summary.txt`, these appear as:
 
 frinZ の解析結果はすべて元 `.cor` の親ディレクトリ直下の `frinZ/` にまとめます。bandpass、RFI、contamination subtractionなどの処理ごとに親直下へ別ディレクトリは作りません。
 
-frinZ の通常解析と派生解析は、基本stemの解析product名の後に補正接尾辞を付けます。接尾辞の順序は常に `bp` → `rfi` → `contamisubt`（in-beam解析では最後に `inbeam`）です。補正の組合せが変わってもproductまでの共通部分をワイルドカードで選択できます。
+frinZ の通常解析と派生解析は、基本stemの解析product名の後に補正接尾辞を付けます。接尾辞の順序は常に `bp` → `rfi` → `contamisubt` → `spike34`（in-beam解析では最後に `inbeam`）です。補正の組合せが変わってもproductまでの共通部分をワイルドカードで選択できます。
 
 - 補正なし: `..._len60s_delay_rate_search.txt`
 - bandpass: `..._len60s_delay_rate_search_bp.txt`
 - bandpass + RFI: `..._len60s_delay_rate_search_bp_rfi.txt`
-- bandpass + RFI + contamination subtraction: `..._len60s_delay_rate_search_bp_rfi_contamisubt.txt`
-- cumulate: `..._len60s_SIGMAGEM_cumulate60_bp_rfi_contamisubt.png`
+- bandpass + RFI + contamination subtraction + spike34: `..._len60s_delay_rate_search_bp_rfi_contamisubt_spike34.txt`
+- cumulate: `..._len60s_SIGMAGEM_cumulate60_bp_rfi_contamisubt_spike34.png`
 
 この規則はTXT/TSV/PNG/NPZを含む全通常出力に共通で、`delay_rate_search`、`freq_rate_search`、`spectrum`、`bptable`、dynamic spectrum、add plot、cumulate、WWZ、STFFT、Allan deviation、in-band、header、contamination handoff、およびNPZ sidecarへ適用されます。例えば `*_delay_rate_search*.txt` で補正の有無を問わず同じ解析productを、`*_delay_rate_search_bp_rfi.txt` でbandpass+RFIだけを選択できます。
+
+## YAMAGU34 spike correction diagnostics (`--spike34`)
+
+`--spike34 <YAMAGU34_AUTO.cor>`（旧名 `--spike34m` / `--spike34mcorr` も使用可能）は、YAMAGU34 自己相関に現れる周波数 spike を基準として、入力相互相関の spike 間サブバンドごとの delay/rate を推定する診断モードです。指定した自己相関ファイルはヘッダー上 `ant1=YAMAGU34` かつ `ant2=YAMAGU34` であること、ファイル名内の `yyyydddhhmmss` が `--input` と一致すること、さらに `--input` の ant1 または ant2 に YAMAGU34 を含むことを要求します。
+
+出力は `--input` の親ディレクトリ直下 `frinZ/spike34/` に保存します。`*_spike34_spikes.tsv` には検出した spike の channel、周波数、自己相関強度、周辺平均との差、SNR を、`*_spike34_delay_rate.tsv` には隣接 spike 間の各サブバンドで再推定した residual delay/rate を出します。比較用に、spike channel へ白線を重ねた `*_spike34_raw_visibility_amp.png` と `*_spike34_raw_visibility_phase.png`、spike間 delay/rate 補正後の `*_spike34_raw_visibility_corrected_amp.png` と `*_spike34_raw_visibility_corrected_phase.png` も生成します。通常解析の出力名にも `_spike34` を付けます。
+
+例:
+
+```bash
+frinZ --input YAMAGU34_HITACH32_yyyydddhhmmss.cor \
+      --spike34 YAMAGU34_YAMAGU34_yyyydddhhmmss.cor \
+      --raw-visibility
+```
 
 ## Contamination handoff (`--contamination`)
 

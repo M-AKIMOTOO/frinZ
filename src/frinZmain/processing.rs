@@ -33,6 +33,9 @@ use crate::plot::{
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
+use crate::spike34m::{
+    apply_safe_spike_residual_correction, detect_auto_spikes, read_all_spectra, SpikePeak,
+};
 use crate::stfft;
 use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg};
 type C32 = Complex<f32>;
@@ -294,6 +297,9 @@ pub fn process_cor_file(
     if !args.rfi.is_empty() {
         basename_for_output.push_str("_rfi");
     }
+    if args.spike34m.is_some() {
+        basename_for_output.push_str("_spike34");
+    }
     if args.in_beam {
         basename_for_output.push_str("_inbeam");
     }
@@ -475,6 +481,17 @@ pub fn process_cor_file(
 
     let scan_corrections = if let Some(path) = &args.scan_correct {
         Some(parse_scan_correct_file(path)?)
+    } else {
+        None
+    };
+
+    let spike34m_peaks: Option<Vec<SpikePeak>> = if let Some(spike_path) = &args.spike34m {
+        let (auto_header, auto_spectra, _) = read_all_spectra(spike_path)?;
+        let spikes = detect_auto_spikes(&auto_header, &auto_spectra);
+        if spikes.len() < 2 {
+            return Err("--spike34 found fewer than two YAMAGU34 auto-correlation spikes".into());
+        }
+        Some(spikes)
     } else {
         None
     };
@@ -661,6 +678,78 @@ pub fn process_cor_file(
             );
         }
 
+        // --spike34 uses the full-band fringe solution as the reference
+        // frame. Only after that global correction do we fit the residual
+        // phase/rate of every channel and smooth it between the detected
+        // YAMAGU34 spikes. Applying each sub-band search result independently
+        // would erase the physical full-band phase trend and can reduce SNR.
+        if let Some(spikes) = &spike34m_peaks {
+            let mut search_vec = complex_vec.clone();
+            let search_length =
+                pad_time_rows_to_power_of_two(&mut search_vec, actual_length, fft_point_half_used);
+            let mut fullband_args = args.clone();
+            fullband_args.spike34m = None;
+            fullband_args.search = vec!["peak".to_string()];
+            fullband_args.frequency = false;
+            // Force the final FFT evaluation so the global solution has the
+            // same phase convention as the user-visible spectrum/search path.
+            fullband_args.spectrum = true;
+            fullband_args.plot = false;
+            fullband_args.raw_visibility = false;
+            fullband_args.delay_correct = 0.0;
+            fullband_args.rate_correct = 0.0;
+            fullband_args.acel_correct = 0.0;
+            fullband_args.jerk_correct = 0.0;
+            fullband_args.snap_correct = 0.0;
+            fullband_args.rate_padding = fullband_args.rate_padding.max(4);
+            let fullband = search::run_peak_search(
+                &search_vec,
+                &processing_header,
+                search_length,
+                physical_length,
+                effective_integ_time,
+                &current_obs_time,
+                &file_start_time,
+                &rfi_ranges,
+                &bandpass_data,
+                &fullband_args,
+                pp,
+                fullband_args.cpu,
+                None,
+            )?;
+            let fullband_delay = fullband.analysis_results.residual_delay;
+            let fullband_rate = if physical_length > 1 {
+                fullband.analysis_results.residual_rate
+            } else {
+                0.0
+            };
+            apply_phase_correction_in_place_at_frequency(
+                &mut complex_vec,
+                fft_point_half_used,
+                fullband_rate,
+                fullband_delay,
+                0.0,
+                0.0,
+                0.0,
+                effective_integ_time,
+                header.sampling_speed as u32,
+                effective_fft_point as u32,
+                0.0,
+                processing_header.observing_frequency,
+            );
+            let spectra: Vec<Vec<C32>> = complex_vec
+                .chunks(fft_point_half_used)
+                .map(|row| row.to_vec())
+                .collect();
+            let corrected_spectra = apply_safe_spike_residual_correction(
+                &processing_header,
+                &spectra,
+                effective_integ_time,
+                spikes,
+            );
+            complex_vec = corrected_spectra.into_iter().flatten().collect();
+        }
+
         let current_length =
             pad_time_rows_to_power_of_two(&mut complex_vec, actual_length, fft_point_half_used);
 
@@ -822,6 +911,9 @@ pub fn process_cor_file(
             args.bandpass.is_some(),
             filename_length,
         );
+        if args.spike34m.is_some() && !base_filename.ends_with("_spike34") {
+            base_filename.push_str("_spike34");
+        }
         if args.in_beam && !base_filename.ends_with("_inbeam") {
             base_filename.push_str("_inbeam");
         }
@@ -940,6 +1032,9 @@ pub fn process_cor_file(
                 args.bandpass.is_some(),
                 filename_length,
             );
+            if args.spike34m.is_some() && !base_filename.ends_with("_spike34") {
+                base_filename.push_str("_spike34");
+            }
             if args.in_beam && !base_filename.ends_with("_inbeam") {
                 base_filename.push_str("_inbeam");
             }

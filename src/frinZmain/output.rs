@@ -137,6 +137,7 @@ pub fn generate_output_names(
         is_rfi_filtered,
         is_contamisubt,
         false,
+        false,
     );
     base
 }
@@ -146,6 +147,7 @@ fn append_processing_suffixes(
     bandpass: bool,
     rfi: bool,
     contamisubt: bool,
+    spike34: bool,
     inbeam: bool,
 ) {
     if bandpass {
@@ -157,6 +159,9 @@ fn append_processing_suffixes(
     if contamisubt {
         output.push_str("_contamisubt");
     }
+    if spike34 {
+        output.push_str("_spike34");
+    }
     if inbeam {
         output.push_str("_inbeam");
     }
@@ -165,18 +170,22 @@ fn append_processing_suffixes(
 /// Inserts an analysis-product name before processing suffixes.
 ///
 /// Processing suffixes always use the stable order
-/// `_bp_rfi_contamisubt_inbeam`, independent of their order in `base`.
+/// `_bp_rfi_contamisubt_spike34_inbeam`, independent of their order in `base`.
 pub fn insert_product_before_processing_suffixes(base: &str, product: &str) -> String {
     let mut core = base;
     let mut bandpass = false;
     let mut rfi = false;
     let mut contamisubt = false;
+    let mut spike34 = false;
     let mut inbeam = false;
 
     loop {
         if let Some(value) = core.strip_suffix("_inbeam") {
             core = value;
             inbeam = true;
+        } else if let Some(value) = core.strip_suffix("_spike34") {
+            core = value;
+            spike34 = true;
         } else if let Some(value) = core.strip_suffix("_contamisubt") {
             core = value;
             contamisubt = true;
@@ -197,7 +206,7 @@ pub fn insert_product_before_processing_suffixes(base: &str, product: &str) -> S
         output.push_str("_");
         output.push_str(product);
     }
-    append_processing_suffixes(&mut output, bandpass, rfi, contamisubt, inbeam);
+    append_processing_suffixes(&mut output, bandpass, rfi, contamisubt, spike34, inbeam);
     output
 }
 
@@ -448,6 +457,25 @@ mod filename_tests {
         assert_eq!(
             insert_product_before_processing_suffixes("observation_bp", "delay_rate_search"),
             "observation_delay_rate_search_bp"
+        );
+    }
+
+    #[test]
+    fn inband_width_product_precedes_processing_suffix() {
+        assert_eq!(
+            insert_product_before_processing_suffixes("observation_bp", "inband256MHz"),
+            "observation_inband256MHz_bp"
+        );
+    }
+
+    #[test]
+    fn spike34_suffix_stays_after_product() {
+        assert_eq!(
+            insert_product_before_processing_suffixes(
+                "observation_bp_spike34",
+                "delay_rate_search"
+            ),
+            "observation_delay_rate_search_bp_spike34"
         );
     }
 

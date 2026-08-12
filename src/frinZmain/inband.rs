@@ -11,6 +11,7 @@ use crate::bandpass::read_bandpass_file;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
 use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
+use crate::processing::run_analysis_pipeline;
 use crate::read::read_visibility_data;
 use crate::search;
 
@@ -201,12 +202,14 @@ pub fn run_inband_analysis(
         return Err("--inband currently cannot be combined with --scan-correct.".into());
     }
 
-    let requested_search = args.primary_search_mode().unwrap_or("peak");
-    if !matches!(requested_search, "peak" | "deep") {
-        return Err(
-            format!("--inband supports --search peak/deep, not {requested_search}.").into(),
-        );
+    if let Some(unsupported) = args
+        .search
+        .iter()
+        .find(|mode| !matches!(mode.as_str(), "peak" | "deep"))
+    {
+        return Err(format!("--inband supports --search peak/deep, not {unsupported}.").into());
     }
+    let requested_search = args.primary_search_mode();
 
     let input_data = open_input_data(input_path)?;
     let mut cursor = Cursor::new(input_data.as_slice());
@@ -347,48 +350,73 @@ pub fn run_inband_analysis(
             let bandpass = None;
 
             let mut local_args = args.clone();
-            if local_args.primary_search_mode().is_none() {
-                local_args.search.push("peak".to_string());
-            }
             local_args.frequency = false;
             local_args.inband = None;
 
-            let result = match requested_search {
-                "deep" => search::run_deep_search(
-                    &subband_vec,
-                    &sub_header,
-                    current_length,
-                    physical_length,
-                    effective_integ_time,
-                    &current_obs_time,
-                    &file_start_time,
-                    &local_rfi,
-                    &bandpass,
-                    &local_args,
-                    sub_header.number_of_sector,
-                    local_args.cpu,
-                    prev_solutions[band_idx],
-                )?,
-                "peak" => search::run_peak_search(
-                    &subband_vec,
-                    &sub_header,
-                    current_length,
-                    physical_length,
-                    effective_integ_time,
-                    &current_obs_time,
-                    &file_start_time,
-                    &local_rfi,
-                    &bandpass,
-                    &local_args,
-                    sub_header.number_of_sector,
-                    local_args.cpu,
-                    prev_solutions[band_idx],
-                )?,
+            let analysis = match requested_search {
+                Some("deep") => {
+                    search::run_deep_search(
+                        &subband_vec,
+                        &sub_header,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &local_rfi,
+                        &bandpass,
+                        &local_args,
+                        sub_header.number_of_sector,
+                        local_args.cpu,
+                        prev_solutions[band_idx],
+                    )?
+                    .analysis_results
+                }
+                Some("peak") => {
+                    search::run_peak_search(
+                        &subband_vec,
+                        &sub_header,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &local_rfi,
+                        &bandpass,
+                        &local_args,
+                        sub_header.number_of_sector,
+                        local_args.cpu,
+                        prev_solutions[band_idx],
+                    )?
+                    .analysis_results
+                }
+                None => {
+                    let (analysis_results, _, _, _) = run_analysis_pipeline(
+                        &subband_vec,
+                        &sub_header,
+                        &local_args,
+                        None,
+                        local_args.delay_correct,
+                        local_args.rate_correct,
+                        local_args.acel_correct,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &local_rfi,
+                        &bandpass,
+                        false,
+                        sub_header.fft_point,
+                    )?;
+                    analysis_results
+                }
                 _ => unreachable!(),
             };
 
-            let analysis = &result.analysis_results;
-            prev_solutions[band_idx] = Some((analysis.residual_delay, analysis.residual_rate));
+            if requested_search.is_some() {
+                prev_solutions[band_idx] = Some((analysis.residual_delay, analysis.residual_rate));
+            }
             if band_idx == 0 {
                 time_rows.push((time_index, analysis.yyyydddhhmmss1.clone(), analysis.mjd));
                 if source_name.is_none() {
@@ -464,11 +492,13 @@ pub fn run_inband_analysis(
 # inband_mhz: {}
 # bands: {}
 # rbw_mhz: {:.6}
+# search_mode: {}
 ",
         header.sampling_speed as f32 / 2.0 / 1_000_000.0,
         inband_mhz,
         band_count,
-        rbw_mhz
+        rbw_mhz,
+        requested_search.unwrap_or("none")
     ));
 
     output.push_str(
@@ -519,7 +549,8 @@ pub fn run_inband_analysis(
     output.push_str(&data_rows);
 
     let output_basename = first_output_basename.unwrap_or_else(|| basename.to_string());
-    let output_stem = insert_product_before_processing_suffixes(&output_basename, "inband");
+    let inband_product = format!("inband{inband_mhz}MHz");
+    let output_stem = insert_product_before_processing_suffixes(&output_basename, &inband_product);
     let output_path = output_dir.join(format!("{output_stem}.txt"));
     fs::write(&output_path, output)?;
     println!(

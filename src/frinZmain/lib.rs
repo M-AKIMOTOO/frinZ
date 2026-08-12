@@ -16,6 +16,7 @@ pub mod inband;
 pub mod input_support;
 pub mod maser;
 pub mod search;
+pub mod spike34m;
 pub mod stfft;
 
 pub mod earth_rotation_imaging;

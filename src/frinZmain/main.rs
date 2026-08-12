@@ -43,6 +43,7 @@ mod processing;
 mod raw_visibility;
 mod read;
 mod rfi;
+mod spike34m;
 mod uptimeplot;
 mod utils;
 mod uv;
@@ -65,6 +66,7 @@ use crate::plot::{write_add_plot_outputs, write_cumulate_outputs};
 use crate::processing::{frinz_output_dir, process_cor_file};
 use crate::raw_visibility::run_raw_visibility_plot;
 use crate::search::run_acel_search_analysis;
+use crate::spike34m::run_spike34m_analysis;
 use crate::stfft::write_output as write_stfft_output;
 use crate::uptimeplot::run_uptime_plot;
 use crate::uv::run_uv_plot;
@@ -101,6 +103,7 @@ Correction/search windows:
   --jerk-correct X          apply third-order phase/rate correction [Hz/s^2]
   --snap-correct X          apply fourth-order phase/rate correction [Hz/s^3]
   --scan-correct FILE       apply per-scan delay/rate corrections from CSV table
+  --spike34 FILE           require matching YAMAGU34 auto-correlation for spike correction
   --drange MIN MAX          restrict residual delay search/plot window [sample]
   --rrange MIN MAX          restrict residual fringe-rate search/plot window [Hz]
   --frange MIN MAX          restrict frequency search/plot range in MHz
@@ -118,7 +121,7 @@ Analysis:
   --bandpass-table          generate/save bandpass table spectrum as NPZ
   --cor2bin                 dump raw complex visibility spectra to binary file
   --fft-rebin N             average/rebin FFT channels before fringe analysis
-  --inband MHz              split total bandwidth into MHz chunks and search each
+  --inband MHz              split bandwidth into MHz chunks; search only with --search
   --stfft HOP               sliding-window fringe search; --length is the window
   --add-plot                plot per-loop amplitude, SNR, phase, noise, delay, rate
   --wwz                     run WWZ time-frequency analysis on per-loop results
@@ -149,6 +152,75 @@ Other:
 "#,
         version = env!("CARGO_PKG_VERSION")
     );
+}
+
+fn normalize_station_name(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+
+fn filename_timestamp_key(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| {
+            stem.split('_')
+                .find(|part| part.len() == 13 && part.chars().all(|c| c.is_ascii_digit()))
+                .map(str::to_string)
+        })
+}
+
+fn read_cor_header_from_path(path: &Path) -> Result<crate::header::CorHeader, Box<dyn Error>> {
+    let buffer = read_input_bytes(path)?;
+    let mut cursor = Cursor::new(buffer.as_slice());
+    Ok(crate::header::parse_header(&mut cursor)?)
+}
+
+fn validate_spike34m_arg(args: &Args) -> Result<(), Box<dyn Error>> {
+    let Some(spike_path) = &args.spike34m else {
+        return Ok(());
+    };
+    let input_path = args
+        .input
+        .as_ref()
+        .ok_or("--spike34 requires --input CROSS.cor")?;
+
+    let input_header = read_cor_header_from_path(input_path)?;
+    let spike_header = read_cor_header_from_path(spike_path)?;
+
+    let spike_station1 = normalize_station_name(&spike_header.station1_name);
+    let spike_station2 = normalize_station_name(&spike_header.station2_name);
+    if spike_station1 != "YAMAGU34" || spike_station2 != "YAMAGU34" {
+        return Err(format!(
+            "--spike34 must be a YAMAGU34 autocorrelation .cor; got {}-{}",
+            spike_header.station1_name.trim(),
+            spike_header.station2_name.trim()
+        )
+        .into());
+    }
+
+    let input_time = filename_timestamp_key(input_path)
+        .ok_or("--input filename does not contain yyyydddhhmmss timestamp")?;
+    let spike_time = filename_timestamp_key(spike_path)
+        .ok_or("--spike34 filename does not contain yyyydddhhmmss timestamp")?;
+    if input_time != spike_time {
+        return Err(format!(
+            "--spike34 timestamp must match --input: input={} spike34={}",
+            input_time, spike_time
+        )
+        .into());
+    }
+
+    let input_station1 = normalize_station_name(&input_header.station1_name);
+    let input_station2 = normalize_station_name(&input_header.station2_name);
+    if input_station1 != spike_station1 && input_station2 != spike_station1 {
+        return Err(format!(
+            "--input baseline {}-{} does not include the --spike34 station YAMAGU34",
+            input_header.station1_name.trim(),
+            input_header.station2_name.trim()
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 // --- Main Application Logic ---
@@ -195,6 +267,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.contamination_subtract.is_some() && args.contamination.is_some() {
         return Err("--contamination and --contamisubt cannot be used together".into());
     }
+    validate_spike34m_arg(&args)?;
 
     if args.wwz && args.frequency {
         eprintln!(
@@ -248,6 +321,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !matches!(args.rate_padding, 1 | 2 | 4 | 8) {
         eprintln!("Error: --rate-padding must be one of 1, 2, 4, or 8.");
         exit(1);
+    }
+
+    if args.spike34m.is_some() {
+        run_spike34m_analysis(&args)?;
     }
 
     if args.cor2bin {

@@ -235,6 +235,10 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub scan_correct: Option<PathBuf>,
 
+    /// YAMAGU34 autocorrelation file used to identify spike residual correction.
+    #[arg(long = "spike34", aliases = ["spike34m", "spike34mcorr"], value_name = "YAMAGU34_AUTO.cor")]
+    pub spike34m: Option<PathBuf>,
+
     /// Delay window.
     #[arg(
         long = "drange",
@@ -290,7 +294,7 @@ pub struct Args {
     #[arg(long, value_name = "POINTS")]
     pub fft_rebin: Option<i32>,
 
-    /// In-band search width [MHz].
+    /// In-band width [MHz]. Without --search, use the zero-delay/rate cell.
     #[arg(long, value_name = "MHz")]
     pub inband: Option<u32>,
 
@@ -441,6 +445,7 @@ impl Default for Args {
             bandpass: None,
             contamination: None,
             contamination_subtract: None,
+            spike34m: None,
             norm_acf: false,
             bandpass_table: false,
             cpu: 0,

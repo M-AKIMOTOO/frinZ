@@ -923,6 +923,9 @@ fn make_base_filename(args: &Args, result: &ProcessResult) -> String {
         args.bandpass.is_some(),
         result.length_arg,
     );
+    if args.spike34m.is_some() && !base.ends_with("_spike34") {
+        base.push_str("_spike34");
+    }
     if args.in_beam && !base.ends_with("_inbeam") {
         base.push_str("_inbeam");
     }
@@ -959,6 +962,7 @@ pub fn write_cumulate_outputs(
         args.in_beam,
         !args.rfi.is_empty(),
         args.bandpass.is_some(),
+        args.spike34m.is_some(),
     )?;
     if args.npz
         && !result.cumulate_len.is_empty()
@@ -1347,6 +1351,7 @@ pub fn cumulate_plot(
     in_beam: bool,
     is_rfi_filtered: bool,
     is_bandpass_corrected: bool,
+    is_spike34m_corrected: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut base_filename = crate::output::generate_output_names(
         header,
@@ -1357,6 +1362,9 @@ pub fn cumulate_plot(
         is_bandpass_corrected,
         cumulate_arg,
     );
+    if is_spike34m_corrected && !base_filename.ends_with("_spike34") {
+        base_filename.push_str("_spike34");
+    }
     if in_beam && !base_filename.ends_with("_inbeam") {
         base_filename.push_str("_inbeam");
     }
@@ -2237,6 +2245,7 @@ fn draw_heatmap_with_colorbar(
     num_color_bar_labels: usize,
     color_value_normalizer: impl Fn(f32) -> f64,
     color_bar_label_formatter: impl Fn(f32) -> String,
+    spike_channels: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (rows, cols) = (data.len(), data[0].len());
 
@@ -2281,6 +2290,21 @@ fn draw_heatmap_with_colorbar(
                 let color_value = color_value_normalizer(val);
                 let color = ViridisRGB.get_color(color_value);
                 Rectangle::new([(x, y), (x + 1, y + 1)], color.filled())
+            }),
+    )?;
+
+    let dash_len = (rows / 60).max(3);
+    let gap_len = dash_len;
+    chart.draw_series(
+        spike_channels
+            .iter()
+            .copied()
+            .filter(|&channel| channel < cols)
+            .flat_map(|channel| {
+                (0..rows).step_by(dash_len + gap_len).map(move |y0| {
+                    let y1 = (y0 + dash_len).min(rows);
+                    PathElement::new(vec![(channel, y0), (channel, y1)], WHITE.stroke_width(2))
+                })
             }),
     )?;
 
@@ -2400,6 +2424,7 @@ pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
             }
         },
         |v| format!("{:.1e}", v),
+        &[],
     )?;
 
     // --- Phase Heatmap ---
@@ -2420,6 +2445,7 @@ pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
         9,
         |v| ((v + 180.0) / 360.0) as f64,
         |v| format!("{:.0}", v),
+        &[],
     )?;
 
     root.present()?;
@@ -2472,6 +2498,7 @@ pub fn plot_spectrum_amplitude_heatmap<P: AsRef<Path>>(
             }
         },
         |v| format!("{:.1e}", v),
+        &[],
     )?;
 
     root.present()?;
@@ -2508,6 +2535,7 @@ pub fn plot_spectrum_phase_heatmap<P: AsRef<Path>>(
         9,
         |v| ((v + 180.0) / 360.0) as f64,
         |v| format!("{:.0}", v),
+        &[],
     )?;
 
     root.present()?;
@@ -3720,5 +3748,97 @@ pub fn frequency_plane_msb(
     }
 
     root.present()?;
+    Ok(())
+}
+
+pub fn plot_spectrum_amplitude_heatmap_with_spikes<P: AsRef<Path>>(
+    output_path: P,
+    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    sigma: f32,
+    spike_channels: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
+        return Err("Spectrum data for heatmap is empty".into());
+    }
+
+    let root = BitMapBackend::new(output_path.as_ref(), (915, 576)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let amplitudes_2d: Vec<Vec<f32>> = spectrum_data
+        .iter()
+        .map(|row| row.iter().map(|c| c.norm()).collect())
+        .collect();
+    let blurred_amplitudes = gaussian_blur_2d(&amplitudes_2d, sigma);
+    let max_amp = blurred_amplitudes
+        .iter()
+        .flatten()
+        .cloned()
+        .fold(0.0, f32::max);
+    let min_amp = blurred_amplitudes
+        .iter()
+        .flatten()
+        .cloned()
+        .fold(f32::MAX, f32::min);
+
+    draw_heatmap_with_colorbar(
+        &root,
+        &blurred_amplitudes,
+        "Channels",
+        "PP",
+        "Amplitude (a.u.)",
+        min_amp,
+        max_amp,
+        5,
+        |v| {
+            if max_amp > min_amp {
+                ((v - min_amp) / (max_amp - min_amp)) as f64
+            } else {
+                0.0
+            }
+        },
+        |v| format!("{:.1e}", v),
+        spike_channels,
+    )?;
+
+    root.present()?;
+    compress_png(output_path.as_ref());
+    Ok(())
+}
+
+pub fn plot_spectrum_phase_heatmap_with_spikes<P: AsRef<Path>>(
+    output_path: P,
+    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    sigma: f32,
+    spike_channels: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
+        return Err("Spectrum data for heatmap is empty".into());
+    }
+
+    let root = BitMapBackend::new(output_path.as_ref(), (915, 576)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let phases_2d: Vec<Vec<f32>> = spectrum_data
+        .iter()
+        .map(|row| row.iter().map(|c| safe_arg(c).to_degrees()).collect())
+        .collect();
+    let blurred_phases = gaussian_blur_2d(&phases_2d, sigma);
+
+    draw_heatmap_with_colorbar(
+        &root,
+        &blurred_phases,
+        "Channels",
+        "PP",
+        "Phase (deg)",
+        -180.0,
+        180.0,
+        9,
+        |v| ((v + 180.0) / 360.0) as f64,
+        |v| format!("{:.0}", v),
+        spike_channels,
+    )?;
+
+    root.present()?;
+    compress_png(output_path.as_ref());
     Ok(())
 }

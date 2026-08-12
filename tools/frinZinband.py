@@ -2,7 +2,7 @@
 """Plot light curves and spectra from frinZ --inband outputs.
 
 Inputs are frinZ --inband text files. Both the old flat table and the newer
-sectioned text format are supported.
+sectioned text format are supported, including concatenated v2 documents.
 """
 
 from __future__ import annotations
@@ -158,28 +158,26 @@ def parse_sectioned_rows(section_lines: dict[str, list[str]], metadata: dict[str
     return rows
 
 
-def parse_inband_txt(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def parse_inband_document(
+    lines: list[str], path: Path
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     metadata: dict[str, Any] = {}
     old_data_lines: list[str] = []
     section_lines: dict[str, list[str]] = defaultdict(list)
     current_section: str | None = None
 
-    with path.open("r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("#"):
-                parse_metadata_line(line[1:].strip(), metadata)
-                continue
-            if line.startswith("@"):
-                current_section = line[1:].strip().lower()
-                section_lines[current_section] = []
-                continue
-            if current_section is not None:
-                section_lines[current_section].append(line)
-            else:
-                old_data_lines.append(line)
+    for line in lines:
+        if line.startswith("#"):
+            parse_metadata_line(line[1:].strip(), metadata)
+            continue
+        if line.startswith("@"):
+            current_section = line[1:].strip().lower()
+            section_lines[current_section] = []
+            continue
+        if current_section is not None:
+            section_lines[current_section].append(line)
+        else:
+            old_data_lines.append(line)
 
     rows = (
         parse_sectioned_rows(section_lines, metadata)
@@ -191,6 +189,43 @@ def parse_inband_txt(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return metadata, rows
 
 
+def parse_inband_documents(path: Path) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Read one or more in-band documents from a file.
+
+    A v2 document starts with ``# In-band fringe search``. This also makes
+    concatenated v2 outputs usable: each document keeps its own metadata and
+    section tables instead of later sections replacing earlier ones.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    marker = "# In-band fringe search"
+
+    with path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == marker and current:
+                blocks.append(current)
+                current = []
+            current.append(line)
+
+    if current:
+        blocks.append(current)
+    if not blocks:
+        raise ValueError(f"no data rows found: {path}")
+
+    return [parse_inband_document(block, path) for block in blocks]
+
+
+def parse_inband_txt(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read an in-band file, including concatenated v2 outputs."""
+    documents = parse_inband_documents(path)
+    metadata = documents[0][0]
+    rows = [row for _document_metadata, document_rows in documents for row in document_rows]
+    return metadata, rows
+
+
 def source_key(name: str) -> str:
     return name.strip().lower().replace("_", "-")
 
@@ -198,11 +233,11 @@ def source_key(name: str) -> str:
 def read_rows(paths: list[Path]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in paths:
-        _meta, parsed = parse_inband_txt(path)
-        for row in parsed:
-            row = dict(row)
-            row["file"] = path.name
-            rows.append(row)
+        for _meta, parsed in parse_inband_documents(path):
+            for row in parsed:
+                row = dict(row)
+                row["file"] = path.name
+                rows.append(row)
     if not rows:
         raise ValueError("no inband rows were read")
     return rows
@@ -223,6 +258,16 @@ def amp_sigma(row: dict[str, Any]) -> float:
     return abs(amp / snr) if snr > 0.0 else 0.0
 
 
+def row_snr(row: dict[str, Any]) -> float:
+    if "target_snr" in row:
+        return float(row["target_snr"])
+    return float(row["snr"])
+
+
+def is_detection(row: dict[str, Any], snr_min: float) -> bool:
+    return row_snr(row) >= snr_min
+
+
 def weighted_mean(values: Iterable[tuple[float, float]]) -> tuple[float, float]:
     sw = 0.0
     sx = 0.0
@@ -238,27 +283,35 @@ def weighted_mean(values: Iterable[tuple[float, float]]) -> tuple[float, float]:
     return sx / sw, math.sqrt(1.0 / sw)
 
 
-def calibrator_table(rows: list[dict[str, Any]], snr_min: float) -> dict[int, dict[str, Any]]:
+def mean_amplitude_spectrum(rows: list[dict[str, Any]], snr_min: float) -> list[dict[str, Any]]:
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if float(row["snr"]) >= snr_min:
             grouped[int(row["band"])].append(row)
-    if not grouped:
-        raise ValueError("no calibrator rows remain after SNR filtering")
-    out: dict[int, dict[str, Any]] = {}
-    for band, group in grouped.items():
+
+    out: list[dict[str, Any]] = []
+    for band, group in sorted(grouped.items()):
         amp, err = weighted_mean((float(r["amp_percent"]), amp_sigma(r)) for r in group)
         first = group[0]
-        out[band] = {
-            "band": band,
-            "amp_percent": amp,
-            "amp_err_percent": err,
-            "center_mhz": float(first["center_mhz"]),
-            "band_start_mhz": float(first["band_start_mhz"]),
-            "band_end_mhz": float(first["band_end_mhz"]),
-            "n": len(group),
-        }
+        out.append(
+            {
+                "band": band,
+                "amp_percent": amp,
+                "amp_err_percent": err,
+                "center_mhz": float(first["center_mhz"]),
+                "band_start_mhz": float(first["band_start_mhz"]),
+                "band_end_mhz": float(first["band_end_mhz"]),
+                "n": len(group),
+            }
+        )
     return out
+
+
+def calibrator_table(rows: list[dict[str, Any]], snr_min: float) -> dict[int, dict[str, Any]]:
+    table = mean_amplitude_spectrum(rows, snr_min)
+    if not table:
+        raise ValueError("no calibrator rows remain after SNR filtering")
+    return {int(row["band"]): row for row in table}
 
 
 def calibrate_band(
@@ -271,8 +324,6 @@ def calibrate_band(
     cal = calibrator_table(cal_rows, snr_min)
     out: list[dict[str, Any]] = []
     for row in rows:
-        if float(row["snr"]) < snr_min:
-            continue
         band = int(row["band"])
         if band not in cal:
             continue
@@ -303,6 +354,7 @@ def calibrate_band(
                 "target_amp_percent": amp,
                 "cal_amp_percent": cal_amp,
                 "target_snr": float(row["snr"]),
+                "target_detection": "detection" if float(row["snr"]) >= snr_min else "non-detection",
                 "flux_mjy": flux,
                 "flux_err_mjy": flux_err,
             }
@@ -475,12 +527,23 @@ def savefig(fig, path: Path, pngquant: bool) -> None:
     compress_png(path, enabled=pngquant)
 
 
-def plot_lightcurves(c_lc, x_lc, out_prefix: Path, exts: list[str], show: bool, ref: int, mjd0: float, pngquant: bool) -> None:
+def plot_lightcurves(
+    c_lc,
+    x_lc,
+    out_prefix: Path,
+    exts: list[str],
+    show: bool,
+    ref: int,
+    mjd0: float,
+    c_range: str,
+    x_range: str,
+    pngquant: bool,
+) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import FormatStrFormatter
 
     display_scale, display_unit = flux_display_scale(c_lc + x_lc)
-    series = [(c_lc, "C", "s"), (x_lc, "X", "^")]
+    series = [(c_lc, f"C ({c_range})", "s"), (x_lc, f"X ({x_range})", "^")]
     for mode, xlabel, suffix in [
         ("mjd", f"MJD - {ref}", "lc_mjd"),
         ("hour", f"Hour on MJD {ref}", "lc_hrs"),
@@ -535,7 +598,7 @@ def plot_mean_spectrum(spectrum, out_prefix: Path, exts: list[str], show: bool, 
             ms=4,
             lw=1,
             capsize=2,
-            label=band_label,
+            label=f"{band_label} ({fmt_freq_range(rows)})",
         )
     ax.set_xlabel("Frequency (MHz)")
     if freq_tick_values:
@@ -554,46 +617,310 @@ def plot_mean_spectrum(spectrum, out_prefix: Path, exts: list[str], show: bool, 
     plt.close(fig)
 
 
-def plot_channel_lightcurves(c_rows, x_rows, out_prefix: Path, exts: list[str], show: bool, ref: int, pngquant: bool) -> None:
+def plot_source_amplitude_timeseries(
+    c_rows,
+    x_rows,
+    source_name: str,
+    snr_min: float,
+    ref: int,
+    out_prefix: Path,
+    output_suffix: str,
+    exts: list[str],
+    show: bool,
+    pngquant: bool,
+) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
+    from matplotlib.colors import BoundaryNorm
+    from matplotlib.lines import Line2D
+
+    fig, axes = plt.subplots(2, 1, figsize=(13.0, 10.0), sharex=True, constrained_layout=True)
+    for ax, rows, band_label in [(axes[0], x_rows, "X"), (axes[1], c_rows, "C")]:
+        if not rows:
+            ax.set_title(f"{source_name} {band_label}: no data")
+            continue
+        channels = channel_frequency_ranges(rows)
+        channel_index = {int(channel["band"]): index for index, channel in enumerate(channels)}
+        nchannel = len(channels)
+        channel_cmap = fixed_channel_cmap(plt, nchannel)
+        norm = BoundaryNorm(
+            [index - 0.5 for index in range(nchannel + 1)],
+            ncolors=nchannel,
+        )
+        grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            grouped[int(row["band"])].append(row)
+        for band in sorted(grouped):
+            group = sorted(grouped[band], key=lambda row: float(row["mjd"]))
+            color = channel_cmap(norm(channel_index[band]))
+            detected = [row for row in group if is_detection(row, snr_min)]
+            nondetected = [row for row in group if not is_detection(row, snr_min)]
+            if detected:
+                ax.errorbar(
+                    x_hour(detected),
+                    [float(row["amp_percent"]) for row in detected],
+                    yerr=[amp_sigma(row) for row in detected],
+                    fmt="o-",
+                    color=color,
+                    ms=3.5,
+                    lw=1.0,
+                    capsize=1.5,
+                )
+            if nondetected:
+                ax.errorbar(
+                    x_hour(nondetected),
+                    [float(row["amp_percent"]) for row in nondetected],
+                    yerr=[amp_sigma(row) for row in nondetected],
+                    fmt="x",
+                    linestyle="none",
+                    color=color,
+                    ms=5.0,
+                    mew=1.2,
+                    capsize=1.5,
+                )
+        ax.set_title(f"{source_name} {band_label} in-band correlation amplitude ({fmt_freq_range(rows)})")
+        ax.set_ylabel("Correlation amplitude (%)")
+        ax.legend(
+            handles=[
+                Line2D([], [], color="black", marker="o", linestyle="-", label="Detection"),
+                Line2D(
+                    [],
+                    [],
+                    color="black",
+                    marker="x",
+                    linestyle="none",
+                    label=f"Non-detection (SNR < {snr_min:g})",
+                ),
+            ],
+            frameon=False,
+            fontsize=11,
+            loc="best",
+        )
+        ax.grid(True, alpha=0.3)
+        sm = ScalarMappable(norm=norm, cmap=channel_cmap)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, pad=0.01)
+        cb.set_label("In-band frequency range (MHz)")
+        cb.set_ticks(list(range(nchannel)))
+        cb.set_ticklabels([format_channel_range(channel, unit=False) for channel in channels])
+        set_colorbar_fontsize(cb, size=10)
+
+    axes[-1].set_xlabel(f"Hour on MJD {ref}")
+    for ax in axes:
+        set_axis_fontsize(ax)
+    fig.suptitle(f"{source_name} in-band correlation amplitude")
+    for ext in exts:
+        savefig(fig, out_prefix.with_name(f"{out_prefix.name}_{output_suffix}.{ext}"), pngquant)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_band_amplitude_comparison(
+    target_rows,
+    calib_rows,
+    band_label: str,
+    target_name: str,
+    calib_name: str,
+    snr_min: float,
+    ref: int,
+    out_prefix: Path,
+    exts: list[str],
+    show: bool,
+    pngquant: bool,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import BoundaryNorm
+    from matplotlib.lines import Line2D
+
+    target_filtered = list(target_rows)
+    calib_filtered = list(calib_rows)
+    combined = target_filtered + calib_filtered
+    fig, ax = plt.subplots(figsize=(13.0, 7.0), constrained_layout=True)
+    if not combined:
+        ax.set_title(f"{band_label}: no data")
+    else:
+        ax_calib = ax.twinx()
+        channels = channel_frequency_ranges(combined)
+        channel_index = {int(channel["band"]): index for index, channel in enumerate(channels)}
+        nchannel = len(channels)
+        channel_cmap = fixed_channel_cmap(plt, nchannel)
+        norm = BoundaryNorm(
+            [index - 0.5 for index in range(nchannel + 1)],
+            ncolors=nchannel,
+        )
+        for rows, axis, linestyle, marker in [
+            (target_filtered, ax, "-", "o"),
+            (calib_filtered, ax_calib, "--", "s"),
+        ]:
+            grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                grouped[int(row["band"])].append(row)
+            for band in sorted(grouped):
+                group = sorted(grouped[band], key=lambda row: float(row["mjd"]))
+                color = channel_cmap(norm(channel_index[band]))
+                detected = [row for row in group if is_detection(row, snr_min)]
+                nondetected = [row for row in group if not is_detection(row, snr_min)]
+                if detected:
+                    axis.errorbar(
+                        x_hour(detected),
+                        [float(row["amp_percent"]) for row in detected],
+                        yerr=[amp_sigma(row) for row in detected],
+                        fmt=f"{marker}{linestyle}",
+                        color=color,
+                        ms=4,
+                        lw=1.0,
+                        capsize=1.5,
+                    )
+                if nondetected:
+                    axis.errorbar(
+                        x_hour(nondetected),
+                        [float(row["amp_percent"]) for row in nondetected],
+                        yerr=[amp_sigma(row) for row in nondetected],
+                        fmt="x",
+                        linestyle="none",
+                        color=color,
+                        ms=5.5,
+                        mew=1.2,
+                        capsize=1.5,
+                    )
+        ax.set_title(f"{band_label} in-band correlation amplitude ({fmt_freq_range(combined)})")
+        ax.set_ylabel(f"{target_name} correlation amplitude (%)", color="black")
+        ax_calib.set_ylabel(f"{calib_name} correlation amplitude (%)", color="black")
+        ax.tick_params(axis="y", labelcolor="black")
+        ax_calib.tick_params(axis="y", labelcolor="black")
+        ax.grid(True, alpha=0.3)
+        ax.legend(
+            handles=[
+                Line2D([], [], color="black", marker="o", linestyle="-", label=target_name),
+                Line2D([], [], color="black", marker="s", linestyle="--", label=calib_name),
+                Line2D(
+                    [],
+                    [],
+                    color="black",
+                    marker="x",
+                    linestyle="none",
+                    label=f"Non-detection (SNR < {snr_min:g})",
+                ),
+            ],
+            frameon=False,
+            fontsize=13,
+        )
+        sm = ScalarMappable(norm=norm, cmap=channel_cmap)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, pad=0.10)
+        cb.set_label("In-band frequency range (MHz)")
+        cb.set_ticks(list(range(nchannel)))
+        cb.set_ticklabels([format_channel_range(channel, unit=False) for channel in channels])
+        set_colorbar_fontsize(cb, size=10)
+
+    ax.set_xlabel(f"Hour on MJD {ref}")
+    set_axis_fontsize(ax)
+    for ext in exts:
+        savefig(fig, out_prefix.with_name(f"{out_prefix.name}_amp_compare_{band_label}.{ext}"), pngquant)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_channel_lightcurves(
+    c_rows,
+    x_rows,
+    out_prefix: Path,
+    exts: list[str],
+    show: bool,
+    ref: int,
+    snr_min: float,
+    pngquant: bool,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import BoundaryNorm
+    from matplotlib.lines import Line2D
     from matplotlib.ticker import FormatStrFormatter
 
     display_scale, display_unit = flux_display_scale(c_rows + x_rows)
-    cmap = plt.get_cmap("turbo")
 
     fig, axes = plt.subplots(2, 1, figsize=(13.0, 10.0), sharex=True, constrained_layout=True)
-    for ax, rows in [(axes[0], x_rows), (axes[1], c_rows)]:
-        freqs = [float(r["center_mhz"]) for r in rows]
-        norm = Normalize(vmin=min(freqs), vmax=max(freqs))
+    for ax, rows, label in [(axes[0], x_rows, "X"), (axes[1], c_rows, "C")]:
+        if not rows:
+            ax.set_title(f"{label}: no data")
+            continue
+        ax.set_title(f"{label} ({fmt_freq_range(rows)})")
+        channels = channel_frequency_ranges(rows)
+        channel_index = {int(channel["band"]): index for index, channel in enumerate(channels)}
+        nchannel = len(channels)
+        channel_cmap = fixed_channel_cmap(plt, nchannel)
+        norm = BoundaryNorm(
+            [index - 0.5 for index in range(nchannel + 1)],
+            ncolors=nchannel,
+        )
         grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
             grouped[int(row["band"])].append(row)
         for band in sorted(grouped):
             group = sorted(grouped[band], key=lambda r: float(r["mjd"]))
-            freq = float(group[0]["center_mhz"])
-            ax.errorbar(
-                x_hour(group),
-                [r["flux_mjy"] / display_scale for r in group],
-                yerr=[r["flux_err_mjy"] / display_scale for r in group],
-                color=cmap(norm(freq)),
-                lw=1.0,
-                alpha=0.9,
-                capsize=0,
-                label=f"{freq:.0f} MHz",
-            )
+            color = channel_cmap(norm(channel_index[band]))
+            detected = [row for row in group if row.get("target_detection") == "detection"]
+            nondetected = [row for row in group if row.get("target_detection") != "detection"]
+            if detected:
+                ax.errorbar(
+                    x_hour(detected),
+                    [r["flux_mjy"] / display_scale for r in detected],
+                    yerr=[r["flux_err_mjy"] / display_scale for r in detected],
+                    color=color,
+                    fmt="o",
+                    linestyle="none",
+                    ms=3.5,
+                    lw=0.8,
+                    elinewidth=0.8,
+                    alpha=0.9,
+                    capsize=2,
+                )
+            if nondetected:
+                ax.errorbar(
+                    x_hour(nondetected),
+                    [r["flux_mjy"] / display_scale for r in nondetected],
+                    yerr=[r["flux_err_mjy"] / display_scale for r in nondetected],
+                    color=color,
+                    fmt="x",
+                    linestyle="none",
+                    ms=5.0,
+                    mew=1.2,
+                    lw=0.8,
+                    elinewidth=0.8,
+                    alpha=0.9,
+                    capsize=2,
+                )
         ax.set_ylabel(f"Flux density ({display_unit})")
+        ax.legend(
+            handles=[
+                Line2D([], [], color="black", marker="o", linestyle="none", label="Detection"),
+                Line2D(
+                    [],
+                    [],
+                    color="black",
+                    marker="x",
+                    linestyle="none",
+                    label=f"Non-detection (SNR < {snr_min:g})",
+                ),
+            ],
+            frameon=False,
+            fontsize=11,
+            loc="best",
+        )
         if display_unit == "Jy":
             ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
         set_axis_fontsize(ax)
         ax.grid(True, alpha=0.25)
-        sm = ScalarMappable(norm=norm, cmap=cmap)
+        sm = ScalarMappable(norm=norm, cmap=channel_cmap)
         sm.set_array([])
         cb = fig.colorbar(sm, ax=ax, pad=0.01)
-        cb.set_label("Frequency (MHz)")
-        cb.set_ticks(freq_ticks(rows))
-        set_colorbar_fontsize(cb)
+        cb.set_label("In-band frequency range (MHz)")
+        cb.set_ticks(list(range(nchannel)))
+        cb.set_ticklabels([format_channel_range(channel, unit=False) for channel in channels])
+        set_colorbar_fontsize(cb, size=10)
     axes[1].set_xlabel(f"Hour on MJD {ref}")
     for ax in axes:
         set_axis_fontsize(ax)
@@ -611,21 +938,91 @@ def flux_display_scale(rows: list[dict[str, Any]]) -> tuple[float, str]:
     return 1.0, "mJy"
 
 
-def band_frequency_range(rows: list[dict[str, Any]]) -> tuple[float, float]:
-    lows: list[float] = []
-    highs: list[float] = []
+def absolute_band_bounds(row: dict[str, Any]) -> tuple[float, float]:
+    width = float(row["band_end_mhz"]) - float(row["band_start_mhz"])
+    center = float(row["center_mhz"])
+    return center - width / 2.0, center + width / 2.0
+
+
+def channel_frequency_ranges(rows: list[dict[str, Any]]) -> list[dict[str, float]]:
+    channels: dict[int, dict[str, float]] = {}
     for row in rows:
-        width = float(row["band_end_mhz"]) - float(row["band_start_mhz"])
-        center = float(row["center_mhz"])
-        lows.append(center - width / 2.0)
-        highs.append(center + width / 2.0)
-    return min(lows), max(highs)
+        band = int(row["band"])
+        low, high = absolute_band_bounds(row)
+        channel = channels.setdefault(
+            band,
+            {"band": float(band), "start_mhz": low, "end_mhz": high},
+        )
+        channel["start_mhz"] = min(channel["start_mhz"], low)
+        channel["end_mhz"] = max(channel["end_mhz"], high)
+    return sorted(channels.values(), key=lambda item: (item["start_mhz"], item["band"]))
+
+
+def format_frequency_range(low: float, high: float, unit: bool = True) -> str:
+    suffix = " MHz" if unit else ""
+    return f"{low:.0f}-{high:.0f}{suffix}"
+
+
+def format_channel_range(channel: dict[str, float], unit: bool = True) -> str:
+    return format_frequency_range(channel["start_mhz"], channel["end_mhz"], unit=unit)
+
+
+INBAND_CHANNEL_COLORS = [
+    "red",
+    "black",
+    "blue",
+    "orange",
+    "green",
+    "magenta",
+    "cyan",
+    "purple",
+    "brown",
+    "limegreen",
+    "deeppink",
+    "teal",
+    "gold",
+    "navy",
+    "darkorange",
+    "darkgreen",
+    "crimson",
+    "gray",
+    "darkviolet",
+    "royalblue",
+    "olive",
+    "hotpink",
+    "sienna",
+    "deepskyblue",
+    "maroon",
+    "turquoise",
+    "indigo",
+    "yellowgreen",
+    "chocolate",
+    "orchid",
+    "steelblue",
+    "firebrick",
+]
+
+
+def fixed_channel_cmap(plt, nchannel: int):
+    """Return a fixed high-contrast palette for up to 32 in-band channels."""
+    from matplotlib.colors import ListedColormap
+
+    if nchannel > len(INBAND_CHANNEL_COLORS):
+        raise ValueError(
+            f"{nchannel} in-band channels require more than the fixed "
+            f"{len(INBAND_CHANNEL_COLORS)}-color palette; use --inband 16 or wider."
+        )
+    return ListedColormap(INBAND_CHANNEL_COLORS[: max(1, nchannel)])
+
+
+def band_frequency_range(rows: list[dict[str, Any]]) -> tuple[float, float]:
+    channels = channel_frequency_ranges(rows)
+    return channels[0]["start_mhz"], channels[-1]["end_mhz"]
 
 
 def fmt_freq_range(rows: list[dict[str, Any]], unit: bool = True) -> str:
     low, high = band_frequency_range(rows)
-    suffix = " MHz" if unit else ""
-    return f"{low:.0f}-{high:.0f}{suffix}"
+    return format_frequency_range(low, high, unit=unit)
 
 
 def freq_ticks(rows: list[dict[str, Any]], step_mhz: float = 128.0) -> list[float]:
@@ -707,17 +1104,23 @@ def plot_channel_spectra(c_rows, x_rows, out_prefix: Path, exts: list[str], show
     plt.close(fig)
 
 
-def dynamic_grid(rows: list[dict[str, Any]]) -> tuple[list[float], list[float], Any]:
+def dynamic_grid(rows: list[dict[str, Any]]) -> tuple[list[float], list[float], list[float], Any]:
     import numpy as np
 
     times = sorted({float(r["mjd"]) for r in rows})
-    freqs = sorted({float(r["center_mhz"]) for r in rows})
+    channels = channel_frequency_ranges(rows)
+    bands = [int(channel["band"]) for channel in channels]
+    freqs = [
+        (channel["start_mhz"] + channel["end_mhz"]) / 2.0
+        for channel in channels
+    ]
+    f_edges = [channels[0]["start_mhz"]] + [channel["end_mhz"] for channel in channels]
     time_index = {value: i for i, value in enumerate(times)}
-    freq_index = {value: i for i, value in enumerate(freqs)}
+    band_index = {band: i for i, band in enumerate(bands)}
     z = np.full((len(freqs), len(times)), np.nan, dtype=float)
     for row in rows:
-        z[freq_index[float(row["center_mhz"])], time_index[float(row["mjd"])]] = float(row["flux_mjy"])
-    return times, freqs, z
+        z[band_index[int(row["band"])], time_index[float(row["mjd"])]] = float(row["flux_mjy"])
+    return times, freqs, f_edges, z
 
 
 def edge_values(centers: list[float]) -> list[float]:
@@ -741,9 +1144,9 @@ def plot_dynamic(c_rows, x_rows, out_prefix: Path, exts: list[str], show: bool, 
         if not rows:
             ax.set_title(f"{title}: no data")
             continue
-        times, freqs, z = dynamic_grid(rows)
+        ax.set_title(f"{title} ({fmt_freq_range(rows)})")
+        times, freqs, f_edges, z = dynamic_grid(rows)
         t_edges = [(v - math.floor(v)) * 24.0 for v in edge_values(times)]
-        f_edges = edge_values(freqs)
         mesh = ax.pcolormesh(t_edges, f_edges, z / display_scale, shading="auto", cmap="viridis")
         ax.set_ylabel("Frequency (MHz)")
         set_frequency_axis(ax, rows, axis="y")
@@ -804,8 +1207,9 @@ Data processing summary:
      argument may contain both target and calibrator files. Rows are selected by
      --target and --calib source names.
 
-  2. Apply SNR filtering. Rows with SNR < --snr are excluded for both target and
-     calibrator.
+  2. Apply SNR filtering to the calibrator mean used for flux calibration. Target
+     rows and per-time calibrator rows are retained; rows with SNR < --snr are
+     marked as non-detections and plotted with an x marker.
 
   3. Relative calibration is done independently for each frequency channel:
        target_flux_mJy(channel, time)
@@ -822,9 +1226,9 @@ Data processing summary:
        *_c_lc.tsv: C-band channels averaged at each epoch.
        *_x_lc.tsv: X-band channels averaged at each epoch.
      The average is weighted by 1/flux_err^2.
-     Figures are written as *_lc_hrs.<ext> and *_lc_mjd.<ext>, showing C and X band
-     light curves separately.
-     The *_lc_hrs.<ext> x-axis is (fractional MJD) * 24 [hour], labeled as Hour on MJD <ref>.
+     The integrated C/X light curves are written to *_c_lc.tsv and *_x_lc.tsv.
+     Integrated light-curve PNGs are not generated; the per-inband-channel
+     light curve is written as *_chlc.<ext> below.
 
   6. In-band channel comparison figures:
        *_chlc.<ext> compares the light curves of all in-band frequency channels
@@ -837,19 +1241,28 @@ Data processing summary:
        Line color indicates Hour on MJD <ref>. If all plotted fluxes exceed
        1000 mJy, flux-density graph displays are converted to Jy with %.1f tick labels.
 
-  7. Mean spectrum:
-       *_sp.tsv and *_sp.<ext> are made by averaging each frequency
-       channel over time, again weighted by 1/flux_err^2.
+  7. Correlation-amplitude comparison:
+       *_amp_target.<ext> shows the --target in-band amplitudes.
+       *_amp_calib.<ext> shows the --calib in-band amplitudes.
+       *_amp_compare_X.<ext> and *_amp_compare_C.<ext> compare target and
+       calibrator amplitudes with separate y axes for each source. All four
+       figures are epoch-by-epoch time series; each in-band channel is shown
+       separately and color-coded by its actual frequency range.
 
-  8. Dynamic spectrum:
+  8. Mean spectrum:
+       *_sp.tsv is made by averaging each frequency channel over time, again
+       weighted by 1/flux_err^2. The integrated spectrum PNG is not generated.
+
+  9. Dynamic spectrum:
        *_dynamic_sp.<ext> is not a time average. It is a color map of the
        calibrated target flux for each epoch and each in-band frequency channel.
        The upper panel is X band and the lower panel is C band.
 
-  9. Spectral index time series:
-       *_spidx.tsv and *_spidx.<ext> are made at each epoch by
+ 10. Spectral index time series:
+       *_spidx.tsv is made at each epoch by
        fitting log(flux_mJy) = alpha * log(freq_MHz) + constant using C+X channels.
        C and X are joined by epoch string, not by exact floating-point MJD equality.
+       The spectral-index PNG is not generated.
 
 Output extensions:
   --ext accepts one or more extensions. Example: --ext png eps ps
@@ -860,8 +1273,8 @@ PNG compression:
 
 Example:
   tools/frinZinband.py
-    --xdata target_x_inband.txt calibrator_x_inband.txt
-    --cdata target_c_inband.txt calibrator_c_inband.txt
+    --xdata target_x_inband256MHz.txt calibrator_x_inband256MHz.txt
+    --cdata target_c_inband256MHz.txt calibrator_c_inband256MHz.txt
     --target CYGX-3 --calib 2016+386 --snr 30
     --xflux-calib 418 --cflux-calib 381 --nofig
 """
@@ -907,6 +1320,8 @@ def main() -> None:
     exts = [ext.lstrip(".") for ext in args.ext]
     ref = mjd_ref(all_flux)
     mjd0 = first_mjd(all_flux)
+    c_range = fmt_freq_range(c_flux) if c_flux else "no data"
+    x_range = fmt_freq_range(x_flux) if x_flux else "no data"
 
     c_lc = make_lightcurve(c_flux)
     x_lc = make_lightcurve(x_flux)
@@ -927,6 +1342,7 @@ def main() -> None:
             "target_amp_percent",
             "cal_amp_percent",
             "target_snr",
+            "target_detection",
             "flux_mjy",
             "flux_err_mjy",
         ],
@@ -936,12 +1352,69 @@ def main() -> None:
     write_tsv(spectrum, out_prefix.with_name(f"{out_prefix.name}_sp.tsv"), ["band_label", "band", "center_mhz", "band_start_mhz", "band_end_mhz", "flux_mjy", "flux_err_mjy", "ntime"])
     write_tsv(alpha, out_prefix.with_name(f"{out_prefix.name}_spidx.tsv"), ["epoch", "mjd", "alpha", "alpha_err", "nchan"])
 
-    plot_lightcurves(c_lc, x_lc, out_prefix, exts, show=not args.nofig, ref=ref, mjd0=mjd0, pngquant=not args.no_pngquant)
-    plot_mean_spectrum(spectrum, out_prefix, exts, show=not args.nofig, pngquant=not args.no_pngquant)
-    plot_channel_lightcurves(c_flux, x_flux, out_prefix, exts, show=not args.nofig, ref=ref, pngquant=not args.no_pngquant)
+    # Integrated spectrum PNG is intentionally omitted; *_sp.tsv is retained.
+    plot_source_amplitude_timeseries(
+        c_target,
+        x_target,
+        args.target,
+        args.snr,
+        ref,
+        out_prefix,
+        "amp_target",
+        exts,
+        show=not args.nofig,
+        pngquant=not args.no_pngquant,
+    )
+    plot_source_amplitude_timeseries(
+        c_cal,
+        x_cal,
+        args.calib,
+        args.snr,
+        ref,
+        out_prefix,
+        "amp_calib",
+        exts,
+        show=not args.nofig,
+        pngquant=not args.no_pngquant,
+    )
+    plot_band_amplitude_comparison(
+        x_target,
+        x_cal,
+        "X",
+        args.target,
+        args.calib,
+        args.snr,
+        ref,
+        out_prefix,
+        exts,
+        show=not args.nofig,
+        pngquant=not args.no_pngquant,
+    )
+    plot_band_amplitude_comparison(
+        c_target,
+        c_cal,
+        "C",
+        args.target,
+        args.calib,
+        args.snr,
+        ref,
+        out_prefix,
+        exts,
+        show=not args.nofig,
+        pngquant=not args.no_pngquant,
+    )
+    plot_channel_lightcurves(
+        c_flux,
+        x_flux,
+        out_prefix,
+        exts,
+        show=not args.nofig,
+        ref=ref,
+        snr_min=args.snr,
+        pngquant=not args.no_pngquant,
+    )
     plot_channel_spectra(c_flux, x_flux, out_prefix, exts, show=not args.nofig, ref=ref, pngquant=not args.no_pngquant)
     plot_dynamic(c_flux, x_flux, out_prefix, exts, show=not args.nofig, ref=ref, mjd0=mjd0, pngquant=not args.no_pngquant)
-    plot_alpha(alpha, out_prefix, exts, show=not args.nofig, ref=ref, pngquant=not args.no_pngquant)
 
     print(f"Output prefix: {out_prefix}")
     print(f"MJD ref: {ref}")

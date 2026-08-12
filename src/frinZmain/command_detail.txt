@@ -11,7 +11,7 @@
   --frequency                        周波数ドメイン処理（未指定は時間ドメイン）
   --plot                             グラフ出力（--frequency 併用で周波数グラフ）
   --output                           frinZ/fringe_output/... に保存
-  --inband <MHz>                     観測帯域を指定幅(MHz, power of 2)で分割し、各サブバンドで fringe search。出力は frinZ/inband/*_inband.txt
+  --inband <MHz>                     観測帯域を指定幅(MHz, power of 2)で分割。--searchなしは遅延/レート0セルを出力し、--search peak/deep時だけ各サブバンドをサーチ。出力は frinZ/inband/*_inband<幅>MHz.txt（例: *_inband256MHz.txt）
 
 [入力・基本]
   --in <FILE>                        入力 .cor
@@ -80,6 +80,8 @@
   --rrange MIN MAX                   レート探索範囲
   --frange MIN MAX                   周波数探索/表示範囲（--frequency 用）
   --scan-correct <CSV>               start,integ,delay[samp],rate[Hz]
+  --spike34 <YAMAGU34_AUTO.cor>   YAMAGU34自己相関のspikeを検出し、spike間ごとのdelay/rateと、spike位置に白線を重ねたraw-visibility比較図を frinZ/spike34/ に出力。
+                                     spike34ファイルはYAMAGU34-YAMAGU34自己相関、inputとファイル名時刻yyyydddhhmmss一致、input基線にYAMAGU34を含むことを要求。
   --flagging time START END ...      時間スキップ
   --flagging pp START END ...        セクターをゼロ詰め
 
@@ -135,9 +137,9 @@
 [出力・グラフ補助]
   全解析結果は元 .cor の親ディレクトリ直下の frinZ/ に保存する。
   補正方法ごとの兄弟ディレクトリは作らず、product名と補正接尾辞で区別する。
-  出力名は基本stemのproduct名の後へ補正接尾辞を固定順 bp -> rfi -> contamisubt で付ける。
+  出力名は基本stemのproduct名の後へ補正接尾辞を固定順 bp -> rfi -> contamisubt -> spike34 で付ける。
   例: *_delay_rate_search_bp.tsv, *_delay_rate_search_bp_rfi.tsv,
-      *_delay_rate_search_bp_rfi_contamisubt.tsv, *_SIGMAGEM_cumulate60_bp_rfi.png。
+      *_delay_rate_search_bp_rfi_contamisubt_spike34.tsv, *_SIGMAGEM_cumulate60_bp_rfi_spike34.png。
   TXT/TSV/PNG/NPZおよびspectrum/bptable/dynamic/add-plot/cumulate/WWZ/STFFT/Allan/in-band/sidecarで共通。
   --add-plot                         Amp/SNR/位相/雑音の時系列
   --wwz                              各 loop の fringe-search 結果に対して WWZ を実行（frinZ/wwz/）

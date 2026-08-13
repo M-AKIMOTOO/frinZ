@@ -17,6 +17,7 @@ use plotters::backend::RGBPixel;
 use plotters::coord::Shift;
 use plotters::prelude::*;
 use plotters::style::colors::colormaps::ViridisRGB;
+use plotters::style::full_palette::PURPLE;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 use rayon::prelude::*;
 use std::error::Error;
@@ -3748,6 +3749,412 @@ pub fn frequency_plane_msb(
     }
 
     root.present()?;
+    Ok(())
+}
+
+pub fn plot_spike34_frequency_spectrum<P: AsRef<Path>>(
+    output_path: P,
+    frequency_mhz: &[f64],
+    fullband_corrected: &[Complex<f32>],
+    corrected: &[Complex<f32>],
+    spike_frequencies_mhz: &[f64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    plot_spike34_frequency_spectrum_with_phase(
+        output_path,
+        frequency_mhz,
+        fullband_corrected,
+        corrected,
+        spike_frequencies_mhz,
+        None,
+        None,
+    )
+}
+
+pub fn plot_spike34_frequency_spectrum_with_phase<P: AsRef<Path>>(
+    output_path: P,
+    frequency_mhz: &[f64],
+    fullband_corrected: &[Complex<f32>],
+    corrected: &[Complex<f32>],
+    spike_frequencies_mhz: &[f64],
+    before_phase_deg: Option<&[f32]>,
+    after_phase_deg: Option<&[f32]>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if frequency_mhz.is_empty()
+        || fullband_corrected.len() != frequency_mhz.len()
+        || corrected.len() != frequency_mhz.len()
+    {
+        return Err("spike34 frequency spectrum data has inconsistent lengths".into());
+    }
+    let x_min = *frequency_mhz.first().unwrap_or(&0.0);
+    let x_max = *frequency_mhz.last().unwrap_or(&1.0);
+    let x_range = if x_max > x_min {
+        x_min..x_max
+    } else {
+        (x_min - 1.0)..(x_max + 1.0)
+    };
+    let make_amp = |values: &[Complex<f32>]| -> Vec<(f64, f32)> {
+        frequency_mhz
+            .iter()
+            .zip(values)
+            .map(|(&x, value)| (x, value.norm()))
+            .collect()
+    };
+    let make_phase = |values: &[Complex<f32>]| -> Vec<(f64, f32)> {
+        frequency_mhz
+            .iter()
+            .zip(values)
+            .map(|(&x, value)| (x, safe_arg(value).to_degrees()))
+            .collect()
+    };
+    let fullband_amp = make_amp(fullband_corrected);
+    let corrected_amp = make_amp(corrected);
+    let fullband_phase = before_phase_deg
+        .filter(|values| values.len() == frequency_mhz.len())
+        .map(|values| {
+            frequency_mhz
+                .iter()
+                .zip(values)
+                .filter_map(|(&x, &value)| value.is_finite().then_some((x, value)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| make_phase(fullband_corrected));
+    let corrected_phase = after_phase_deg
+        .filter(|values| values.len() == frequency_mhz.len())
+        .map(|values| {
+            frequency_mhz
+                .iter()
+                .zip(values)
+                .filter_map(|(&x, &value)| value.is_finite().then_some((x, value)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| make_phase(corrected));
+    let amp_max = fullband_amp
+        .iter()
+        .chain(corrected_amp.iter())
+        .map(|(_, y)| *y)
+        .fold(0.0f32, f32::max)
+        .max(1.0e-12)
+        * 1.05;
+    let phase_values = fullband_phase
+        .iter()
+        .chain(corrected_phase.iter())
+        .map(|(_, value)| *value)
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    let (phase_min, phase_max) = if phase_values.is_empty() {
+        (-180.0, 180.0)
+    } else {
+        let min_value = phase_values.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_value = phase_values
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let margin = ((max_value - min_value) * 0.08).max(5.0);
+        (min_value - margin, max_value + margin)
+    };
+
+    let root = BitMapBackend::new(output_path.as_ref(), (1200, 800)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let (amp_area, phase_area) = root.split_vertically(400);
+
+    let mut amp_chart = ChartBuilder::on(&amp_area)
+        .caption(
+            "Spike34 frequency spectrum: before / after",
+            ("sans-serif", 30).into_font(),
+        )
+        .margin(14)
+        .x_label_area_size(4)
+        .y_label_area_size(105)
+        .build_cartesian_2d(x_range.clone(), 0.0f32..amp_max)?;
+    amp_chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_labels(0)
+        .y_desc("Amplitude")
+        .x_label_style(("sans-serif", 24).into_font())
+        .y_label_style(("sans-serif", 24).into_font())
+        .label_style(("sans-serif", 24).into_font())
+        .y_label_formatter(&|value| format!("{value:.1e}"))
+        .axis_style(BLACK.stroke_width(2))
+        .draw()?;
+    amp_chart
+        .draw_series(LineSeries::new(fullband_amp, GREEN.stroke_width(2)))?
+        .label("Before (full-band --search)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], GREEN.stroke_width(2)));
+    amp_chart
+        .draw_series(LineSeries::new(corrected_amp, BLUE.stroke_width(2)))?
+        .label("After (spike34)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(2)));
+    let amp_dash_step = (amp_max / 40.0).max(1.0e-12);
+    let mut amp_spike_lines = Vec::new();
+    for &frequency in spike_frequencies_mhz {
+        if frequency < x_min || frequency > x_max {
+            continue;
+        }
+        for segment in 0..20 {
+            let y0 = segment as f32 * amp_dash_step * 2.0;
+            let y1 = (y0 + amp_dash_step).min(amp_max);
+            amp_spike_lines.push(PathElement::new(
+                vec![(frequency, y0), (frequency, y1)],
+                BLACK.stroke_width(2),
+            ));
+        }
+    }
+    amp_chart.draw_series(amp_spike_lines)?;
+    amp_chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.9))
+        .border_style(BLACK.stroke_width(2))
+        .label_font(("sans-serif", 22).into_font())
+        .draw()?;
+
+    let mut phase_chart = ChartBuilder::on(&phase_area)
+        .margin(14)
+        .x_label_area_size(60)
+        .y_label_area_size(105)
+        .build_cartesian_2d(x_range, phase_min..phase_max)?;
+    phase_chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_desc("Frequency [MHz]")
+        .y_desc("Fringe phase [deg]")
+        .x_labels(8)
+        .x_label_style(("sans-serif", 24).into_font())
+        .y_label_style(("sans-serif", 24).into_font())
+        .label_style(("sans-serif", 24).into_font())
+        .y_label_formatter(&|value| format!("{value:.0}"))
+        .axis_style(BLACK.stroke_width(2))
+        .draw()?;
+    phase_chart
+        .draw_series(LineSeries::new(fullband_phase, GREEN.stroke_width(2)))?
+        .label("Before (full-band --search)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], GREEN.stroke_width(2)));
+    phase_chart
+        .draw_series(LineSeries::new(corrected_phase, BLUE.stroke_width(2)))?
+        .label("After (spike34)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(2)));
+    let phase_step = ((phase_max - phase_min) / 40.0).max(1.0);
+    let mut phase_spike_lines = Vec::new();
+    for &frequency in spike_frequencies_mhz {
+        if frequency < x_min || frequency > x_max {
+            continue;
+        }
+        for segment in 0..20 {
+            let y0 = phase_min + segment as f32 * phase_step * 2.0;
+            let y1 = (y0 + phase_step).min(phase_max);
+            phase_spike_lines.push(PathElement::new(
+                vec![(frequency, y0), (frequency, y1)],
+                BLACK.stroke_width(2),
+            ));
+        }
+    }
+    phase_chart.draw_series(phase_spike_lines)?;
+    phase_chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.9))
+        .border_style(BLACK.stroke_width(2))
+        .label_font(("sans-serif", 22).into_font())
+        .draw()?;
+
+    root.present()?;
+    compress_png(output_path.as_ref());
+    Ok(())
+}
+
+pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
+    output_path: P,
+    frequency_mhz: &[f64],
+    phase0_unwrapped_deg: &[f32],
+    global_fit_deg: &[f32],
+    interval_fit_deg: &[f32],
+    raw_phase_residual_deg: &[f32],
+    final_phase_residual_deg: &[f32],
+    raw_rate_residual_hz: &[f32],
+    spike_frequencies_mhz: &[f64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = frequency_mhz.len();
+    if n == 0
+        || phase0_unwrapped_deg.len() != n
+        || global_fit_deg.len() != n
+        || interval_fit_deg.len() != n
+        || raw_phase_residual_deg.len() != n
+        || final_phase_residual_deg.len() != n
+        || raw_rate_residual_hz.len() != n
+    {
+        return Err("spike34 fit/residual data has inconsistent lengths".into());
+    }
+    let x_min = *frequency_mhz.first().unwrap_or(&0.0);
+    let x_max = *frequency_mhz.last().unwrap_or(&1.0);
+    let x_range = if x_max > x_min {
+        x_min..x_max
+    } else {
+        (x_min - 1.0)..(x_max + 1.0)
+    };
+    let to_series = |values: &[f32]| -> Vec<(f64, f32)> {
+        frequency_mhz
+            .iter()
+            .zip(values)
+            .filter_map(|(&x, &value)| value.is_finite().then_some((x, value)))
+            .collect()
+    };
+    let phase0_series = to_series(phase0_unwrapped_deg);
+    let fit_series = to_series(global_fit_deg);
+    let interval_fit_series = to_series(interval_fit_deg);
+    let residual_series = to_series(raw_phase_residual_deg);
+    let final_residual_series = to_series(final_phase_residual_deg);
+    let rate_residual_series = to_series(raw_rate_residual_hz);
+    let bounds = |series: &[(f64, f32)], fallback: (f32, f32), min_margin: f32| -> (f32, f32) {
+        if series.is_empty() {
+            return fallback;
+        }
+        let min_value = series.iter().map(|(_, y)| *y).fold(f32::INFINITY, f32::min);
+        let max_value = series
+            .iter()
+            .map(|(_, y)| *y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let margin = ((max_value - min_value) * 0.10).max(min_margin);
+        (min_value - margin, max_value + margin)
+    };
+    let (phase_min, phase_max) = bounds(&phase0_series, (-180.0, 180.0), 5.0);
+    let residual_bounds_series: Vec<(f64, f32)> = residual_series
+        .iter()
+        .chain(final_residual_series.iter())
+        .copied()
+        .collect();
+    let (res_min, res_max) = bounds(&residual_bounds_series, (-10.0, 10.0), 1.0);
+    let (rate_min, rate_max) = bounds(&rate_residual_series, (-1.0e-3, 1.0e-3), 1.0e-6);
+
+    let root = BitMapBackend::new(output_path.as_ref(), (1200, 1050)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let (phase_area, remainder) = root.split_vertically(350);
+    let (residual_area, rate_area) = remainder.split_vertically(350);
+
+    let mut phase_chart = ChartBuilder::on(&phase_area)
+        .caption(
+            "Spike34 interval phase fit and residual",
+            ("sans-serif", 30).into_font(),
+        )
+        .margin(14)
+        .x_label_area_size(4)
+        .y_label_area_size(115)
+        .build_cartesian_2d(x_range.clone(), phase_min..phase_max)?;
+    phase_chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_labels(0)
+        .y_desc("Input phase0 [deg]")
+        .label_style(("sans-serif", 24).into_font())
+        .y_label_formatter(&|value| format!("{value:.0}"))
+        .axis_style(BLACK.stroke_width(2))
+        .draw()?;
+    phase_chart
+        .draw_series(LineSeries::new(phase0_series, GREEN.stroke_width(2)))?
+        .label("Input phase0 (unwrapped)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], GREEN.stroke_width(2)));
+    phase_chart
+        .draw_series(LineSeries::new(fit_series, BLUE.stroke_width(2)))?
+        .label("Global full-band linear fit")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(2)));
+    phase_chart
+        .draw_series(LineSeries::new(
+            interval_fit_series,
+            MAGENTA.stroke_width(2),
+        ))?
+        .label("Per-interval fit")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], MAGENTA.stroke_width(2)));
+
+    let mut residual_chart = ChartBuilder::on(&residual_area)
+        .margin(14)
+        .x_label_area_size(4)
+        .y_label_area_size(115)
+        .build_cartesian_2d(x_range.clone(), res_min..res_max)?;
+    residual_chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_labels(0)
+        .y_desc("Residual [deg]")
+        .label_style(("sans-serif", 24).into_font())
+        .y_label_formatter(&|value| format!("{value:.0}"))
+        .axis_style(BLACK.stroke_width(2))
+        .draw()?;
+    residual_chart.draw_series(std::iter::once(PathElement::new(
+        vec![(x_min, 0.0f32), (x_max, 0.0f32)],
+        BLACK.mix(0.45).stroke_width(1),
+    )))?;
+    residual_chart
+        .draw_series(LineSeries::new(residual_series, RED.stroke_width(2)))?
+        .label("Raw residual (input - global fit)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], RED.stroke_width(2)));
+    residual_chart
+        .draw_series(LineSeries::new(final_residual_series, BLUE.stroke_width(2)))?
+        .label("Final residual (input - interval fit)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(2)));
+
+    let mut rate_chart = ChartBuilder::on(&rate_area)
+        .margin(14)
+        .x_label_area_size(60)
+        .y_label_area_size(115)
+        .build_cartesian_2d(x_range.clone(), rate_min..rate_max)?;
+    rate_chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_desc("Frequency [MHz]")
+        .y_desc("Rate residual [Hz]")
+        .label_style(("sans-serif", 24).into_font())
+        .x_label_style(("sans-serif", 24).into_font())
+        .y_label_style(("sans-serif", 24).into_font())
+        .y_label_formatter(&|value| format!("{value:.3e}"))
+        .axis_style(BLACK.stroke_width(2))
+        .draw()?;
+    rate_chart.draw_series(std::iter::once(PathElement::new(
+        vec![(x_min, 0.0f32), (x_max, 0.0f32)],
+        BLACK.mix(0.45).stroke_width(1),
+    )))?;
+    rate_chart
+        .draw_series(LineSeries::new(
+            rate_residual_series,
+            PURPLE.stroke_width(2),
+        ))?
+        .label("Raw rate residual (rate - median)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], PURPLE.stroke_width(2)));
+
+    for chart_kind in 0..3 {
+        let (y_min, y_max) = match chart_kind {
+            0 => (phase_min, phase_max),
+            1 => (res_min, res_max),
+            _ => (rate_min, rate_max),
+        };
+        let step = ((y_max - y_min) / 40.0).max(1.0e-12);
+        let mut lines = Vec::new();
+        for &frequency in spike_frequencies_mhz {
+            if frequency < x_min || frequency > x_max {
+                continue;
+            }
+            for segment in 0..20 {
+                let y0 = y_min + segment as f32 * step * 2.0;
+                let y1 = (y0 + step).min(y_max);
+                lines.push(PathElement::new(
+                    vec![(frequency, y0), (frequency, y1)],
+                    BLACK.stroke_width(2),
+                ));
+            }
+        }
+        match chart_kind {
+            0 => phase_chart.draw_series(lines)?,
+            1 => residual_chart.draw_series(lines)?,
+            _ => rate_chart.draw_series(lines)?,
+        };
+    }
+    for chart in [&mut phase_chart, &mut residual_chart, &mut rate_chart] {
+        chart
+            .configure_series_labels()
+            .background_style(WHITE.mix(0.9))
+            .border_style(BLACK.stroke_width(2))
+            .label_font(("sans-serif", 20).into_font())
+            .draw()?;
+    }
+    root.present()?;
+    compress_png(output_path.as_ref());
     Ok(())
 }
 

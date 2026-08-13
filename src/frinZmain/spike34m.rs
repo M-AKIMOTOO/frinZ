@@ -12,6 +12,7 @@ use crate::input_support::read_input_bytes;
 use crate::output::insert_product_before_processing_suffixes;
 use crate::plot::{
     plot_spectrum_amplitude_heatmap_with_spikes, plot_spectrum_phase_heatmap_with_spikes,
+    plot_spike34_fit_residual, plot_spike34_frequency_spectrum_with_phase,
 };
 use crate::read::read_visibility_data;
 use crate::search;
@@ -384,12 +385,63 @@ fn write_spike_table(path: &Path, spikes: &[SpikePeak]) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub struct SpikeIntervalCorrection {
+    pub left_spike_mhz: f64,
+    pub right_spike_mhz: f64,
+    pub start_channel: usize,
+    pub end_channel: usize,
+    pub center_mhz: f64,
+    pub width_mhz: f64,
+    pub amp_percent: f64,
+    pub snr: f64,
+    pub phase_deg: f64,
+    pub delay_sample: f32,
+    pub rate_hz: f32,
+}
+
+fn spike_interval_ranges(
+    header: &CorHeader,
+    spikes: &[SpikePeak],
+    cols: usize,
+) -> Vec<(f64, f64, usize, usize)> {
+    if cols == 0 || spikes.is_empty() {
+        return Vec::new();
+    }
+    let frequency = frequency_axis_mhz(header, cols);
+    let mut ranges = Vec::new();
+    let first = spikes[0].channel.min(cols.saturating_sub(1));
+    if first > 0 {
+        ranges.push((frequency[0], spikes[0].frequency_mhz, 0, first - 1));
+    }
+    for pair in spikes.windows(2) {
+        let start = pair[0].channel.saturating_add(1);
+        let end = pair[1]
+            .channel
+            .saturating_sub(1)
+            .min(cols.saturating_sub(1));
+        if end > start {
+            ranges.push((pair[0].frequency_mhz, pair[1].frequency_mhz, start, end));
+        }
+    }
+    let last = spikes.last().unwrap().channel.min(cols.saturating_sub(1));
+    if last + 1 < cols {
+        ranges.push((
+            spikes.last().unwrap().frequency_mhz,
+            frequency[cols - 1],
+            last + 1,
+            cols - 1,
+        ));
+    }
+    ranges
+}
+
 pub fn write_interval_delay_rate_table(
     args: &Args,
     input_path: &Path,
     output_path: &Path,
     spikes: &[SpikePeak],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<SpikeIntervalCorrection>, Box<dyn Error>> {
     let buffer = read_input_bytes(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
@@ -417,16 +469,10 @@ pub fn write_interval_delay_rate_table(
     local_args.frequency = false;
     local_args.rate_padding = local_args.rate_padding.max(4);
 
-    let mut out = String::new();
-    out.push_str("# Delay/rate search for cross-correlation bands between YAMAGU34 auto spikes\n");
-    out.push_str("# input\t");
-    out.push_str(&input_path.display().to_string());
-    out.push('\n');
-    out.push_str("# columns: interval left_spike_MHz right_spike_MHz start_channel end_channel center_MHz width_MHz amp_percent snr phase_deg residual_delay_sample residual_rate_Hz\n");
-
-    for (idx, pair) in spikes.windows(2).enumerate() {
-        let start_chan = pair[0].channel.saturating_add(1);
-        let end_chan = pair[1].channel.saturating_sub(1);
+    let mut records = Vec::new();
+    for (left_mhz, right_mhz, start_chan, end_chan) in
+        spike_interval_ranges(&header, spikes, original_half)
+    {
         if end_chan <= start_chan || end_chan >= original_half {
             continue;
         }
@@ -458,28 +504,47 @@ pub fn write_interval_delay_rate_table(
             None,
         )?;
         let analysis = result.analysis_results;
-        let left = pair[0].frequency_mhz;
-        let right = pair[1].frequency_mhz;
+        let left = left_mhz;
+        let right = right_mhz;
         let center = (start_chan + end_chan) as f64 * 0.5 * rbw_mhz;
         let width = width_chan as f64 * rbw_mhz;
+        records.push(SpikeIntervalCorrection {
+            left_spike_mhz: left,
+            right_spike_mhz: right,
+            start_channel: start_chan,
+            end_channel: end_chan,
+            center_mhz: center,
+            width_mhz: width,
+            amp_percent: (analysis.delay_max_amp * 100.0) as f64,
+            snr: analysis.delay_snr as f64,
+            phase_deg: analysis.delay_phase as f64,
+            delay_sample: analysis.residual_delay,
+            rate_hz: analysis.residual_rate,
+        });
+    }
+
+    let mut out = String::from(
+        "interval\tleft_spike_MHz\tright_spike_MHz\tstart_channel\tend_channel\tcenter_MHz\twidth_MHz\tamp_percent\tsnr\tphase_deg\tresidual_delay_sample\tresidual_rate_Hz\n",
+    );
+    for (idx, record) in records.iter().enumerate() {
         out.push_str(&format!(
             "{}\t{:.9}\t{:.9}\t{}\t{}\t{:.9}\t{:.9}\t{:.6}\t{:.3}\t{:.3}\t{:.8}\t{:.8}\n",
             idx + 1,
-            left,
-            right,
-            start_chan,
-            end_chan,
-            center,
-            width,
-            analysis.delay_max_amp * 100.0,
-            analysis.delay_snr,
-            analysis.delay_phase,
-            analysis.residual_delay,
-            analysis.residual_rate
+            record.left_spike_mhz,
+            record.right_spike_mhz,
+            record.start_channel,
+            record.end_channel,
+            record.center_mhz,
+            record.width_mhz,
+            record.amp_percent,
+            record.snr,
+            record.phase_deg,
+            record.delay_sample,
+            record.rate_hz,
         ));
     }
     fs::write(output_path, out)?;
-    Ok(())
+    Ok(records)
 }
 
 fn weighted_line_fit(x: &[f64], y: &[f64], weight: &[f64]) -> Option<(f64, f64)> {
@@ -530,6 +595,10 @@ fn unwrap_series(values: &[f64]) -> Vec<f64> {
         prev = value;
     }
     out
+}
+
+fn wrap_phase(value: f64) -> f64 {
+    (value + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI
 }
 
 fn interpolate_valid(values: &[f64], frequency: &[f64], valid: &[bool]) -> Vec<f64> {
@@ -630,6 +699,53 @@ fn robust_frequency_line_fit(
     Some((slope, intercept, xmid))
 }
 
+fn circular_frequency_line_fit(
+    frequency: &[f64],
+    phase: &[f64],
+    weights: &[f64],
+) -> Option<(f64, f64)> {
+    if frequency.len() < 2 || frequency.len() != phase.len() || frequency.len() != weights.len() {
+        return None;
+    }
+    let total_weight: f64 = weights.iter().sum();
+    if !total_weight.is_finite() || total_weight <= 0.0 {
+        return None;
+    }
+    // Search the residual-delay slope on the circle first.  The search
+    // correction has already removed the large geometric delay, so this wide
+    // range covers the remaining fringe slopes while avoiding any 2π branch
+    // assumption in the initial fit.
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_slope = 0.0;
+    let mut best_intercept = 0.0;
+    let slope_min = -0.1;
+    let slope_max = 0.1;
+    let step = 0.00025;
+    let mut slope = slope_min;
+    while slope <= slope_max {
+        let mut sum_cos = 0.0;
+        let mut sum_sin = 0.0;
+        for ((&f, &p), &weight) in frequency.iter().zip(phase).zip(weights) {
+            let angle = p - slope * f;
+            sum_cos += weight * angle.cos();
+            sum_sin += weight * angle.sin();
+        }
+        let score = (sum_cos * sum_cos + sum_sin * sum_sin).sqrt();
+        if score > best_score {
+            best_score = score;
+            best_slope = slope;
+            best_intercept = sum_sin.atan2(sum_cos);
+        }
+        slope += step;
+    }
+    Some((best_slope, best_intercept))
+}
+
+fn align_phase_to_line(phase: f64, frequency: f64, slope: f64, intercept: f64) -> f64 {
+    let expected = slope * frequency + intercept;
+    phase + 2.0 * std::f64::consts::PI * ((expected - phase) / (2.0 * std::f64::consts::PI)).round()
+}
+
 fn pad_spectra_for_search(flat: &mut Vec<C32>, rows: usize, cols: usize) -> i32 {
     if rows == 0 || cols == 0 {
         return rows as i32;
@@ -646,12 +762,13 @@ fn apply_global_and_safe_spike_correction(
     spectra: &[Vec<C32>],
     effective_integ_time: f32,
     spikes: &[SpikePeak],
+    intervals: &[SpikeIntervalCorrection],
     args: &Args,
     current_obs_time: &chrono::DateTime<chrono::Utc>,
     file_start_time: &chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<Vec<C32>>, Box<dyn Error>> {
+) -> Result<(Vec<Vec<C32>>, Vec<Vec<C32>>, f32, f32), Box<dyn Error>> {
     if spectra.is_empty() || spectra[0].is_empty() {
-        return Ok(spectra.to_vec());
+        return Ok((spectra.to_vec(), spectra.to_vec(), 0.0, 0.0));
     }
     let cols = spectra[0].len();
     let rows = spectra.len();
@@ -709,12 +826,14 @@ fn apply_global_and_safe_spike_correction(
         header.observing_frequency,
     );
     let globally_corrected: Vec<Vec<C32>> = flat.chunks(cols).map(|row| row.to_vec()).collect();
-    Ok(apply_safe_spike_residual_correction(
+    let corrected = apply_interval_delay_rate_correction(
         header,
         &globally_corrected,
         effective_integ_time,
         spikes,
-    ))
+        intervals,
+    );
+    Ok((globally_corrected, corrected, delay, rate))
 }
 
 fn coherent_phase(spectra: &[Vec<C32>]) -> Option<f64> {
@@ -744,14 +863,39 @@ fn edge_taper(frequency_mhz: &[f64], last_spike_mhz: f64, width_mhz: f64) -> Vec
         .collect()
 }
 
-pub fn apply_safe_spike_residual_correction(
+#[derive(Clone, Debug)]
+pub struct SpikeFitDiagnostics {
+    pub frequency_mhz: Vec<f64>,
+    /// Phase intercept from the per-channel time fit, before frequency unwrap.
+    pub phase0_rad: Vec<f64>,
+    /// Unwrapped phase intercept for plotting; low-amplitude channels may be
+    /// present here even though they are excluded from the robust fit.
+    pub phase0_unwrapped_rad: Vec<f64>,
+    pub global_phase_fit_rad: Vec<f64>,
+    /// Piecewise linear phase fit within each adjacent-spike interval.
+    pub interval_phase_fit_rad: Vec<f64>,
+    /// Raw residual: unwrapped phase0 - full-band global linear fit.
+    pub raw_phase_residual_rad: Vec<f64>,
+    /// Residual left after the interval delay fit.
+    pub final_phase_residual_rad: Vec<f64>,
+    pub phase_correction_rad: Vec<f64>,
+    pub rate_hz: Vec<f64>,
+    /// Raw rate residual: rate - reliable-channel median rate.
+    pub raw_rate_residual_hz: Vec<f64>,
+    pub rate_residual_hz: Vec<f64>,
+    pub taper: Vec<f64>,
+    pub reliable: Vec<bool>,
+}
+
+pub fn estimate_spike_fit_diagnostics(
     header: &CorHeader,
     spectra: &[Vec<C32>],
     effective_integ_time: f32,
     spikes: &[SpikePeak],
-) -> Vec<Vec<C32>> {
+    intervals: &[SpikeIntervalCorrection],
+) -> Option<SpikeFitDiagnostics> {
     if spectra.is_empty() || spectra[0].is_empty() || spikes.is_empty() {
-        return spectra.to_vec();
+        return None;
     }
     let rows = spectra.len();
     let cols = spectra[0].len();
@@ -769,10 +913,10 @@ pub fn apply_safe_spike_residual_correction(
         let mut weights = Vec::new();
         let mut amps = Vec::new();
         for row in 0..rows {
-            let v = spectra[row][ch];
-            let amp = v.norm() as f64;
+            let value = spectra[row][ch];
+            let amp = value.norm() as f64;
             if amp.is_finite() && amp > 0.0 {
-                phases.push(v.arg() as f64);
+                phases.push(value.arg() as f64);
                 times.push(elapsed[row]);
                 weights.push(amp * amp);
                 amps.push(amp);
@@ -784,58 +928,111 @@ pub fn apply_safe_spike_residual_correction(
         median_amp[ch] = median(amps);
         let unwrapped = unwrap_series(&phases);
         if let Some((slope, intercept)) = weighted_line_fit(&times, &unwrapped, &weights) {
-            phase0[ch] = intercept;
+            // The time-domain phase unwrap chooses an arbitrary 2π branch for
+            // each channel. Keep the physically meaningful principal phase
+            // before doing the frequency-domain unwrap; otherwise a harmless
+            // branch choice becomes a false ±360° spectral jump.
+            phase0[ch] = wrap_phase(intercept);
             rate_hz[ch] = slope / (2.0 * std::f64::consts::PI);
         }
     }
 
     let reliable: Vec<bool> = (0..cols)
-        .map(|i| phase0[i].is_finite() && rate_hz[i].is_finite() && median_amp[i] >= 8.0e-7)
+        .map(|i| phase0[i].is_finite() && rate_hz[i].is_finite() && median_amp[i] >= 2.0e-7)
         .collect();
     if reliable.iter().filter(|&&ok| ok).count() < 50 {
-        return spectra.to_vec();
+        return None;
     }
     let reliable_idx: Vec<usize> = (0..cols).filter(|&i| reliable[i]).collect();
-    let reliable_phase_wrapped: Vec<f64> = reliable_idx.iter().map(|&i| phase0[i]).collect();
-    let reliable_phase_unwrapped = unwrap_series(&reliable_phase_wrapped);
     let x: Vec<f64> = reliable_idx.iter().map(|&i| frequency[i]).collect();
+    let phase: Vec<f64> = reliable_idx.iter().map(|&i| phase0[i]).collect();
     let amplitude: Vec<f64> = reliable_idx.iter().map(|&i| median_amp[i]).collect();
-    let Some((trend_slope, trend_intercept, trend_xmid)) =
-        robust_frequency_line_fit(&x, &reliable_phase_unwrapped, &amplitude)
-    else {
-        return spectra.to_vec();
-    };
-    let trend: Vec<f64> = frequency
+    let amplitude_weights: Vec<f64> = amplitude.iter().map(|value| value * value).collect();
+    let (seed_slope, seed_intercept) = circular_frequency_line_fit(&x, &phase, &amplitude_weights)?;
+    let reliable_phase_aligned: Vec<f64> = x
+        .iter()
+        .zip(&phase)
+        .map(|(&f, &p)| align_phase_to_line(p, f, seed_slope, seed_intercept))
+        .collect();
+    let (trend_slope, trend_intercept, trend_xmid) =
+        robust_frequency_line_fit(&x, &reliable_phase_aligned, &amplitude)?;
+    let global_phase_fit_rad: Vec<f64> = frequency
         .iter()
         .map(|&f| trend_slope * (f - trend_xmid) + trend_intercept)
         .collect();
-    let mut phase_residual = vec![f64::NAN; cols];
-    for (pos, &idx) in reliable_idx.iter().enumerate() {
-        phase_residual[idx] = reliable_phase_unwrapped[pos] - trend[idx];
+
+    // Every finite channel is put on the branch nearest the global fit. This
+    // keeps the low-frequency portion visible in the diagnostic plot without
+    // allowing weak-channel time-fit branches to move the whole unwrap by 2π.
+    let all_phase_idx: Vec<usize> = (0..cols).filter(|&idx| phase0[idx].is_finite()).collect();
+    let mut phase0_unwrapped = vec![f64::NAN; cols];
+    for &idx in &all_phase_idx {
+        phase0_unwrapped[idx] = align_phase_to_line(
+            phase0[idx],
+            frequency[idx],
+            trend_slope,
+            trend_intercept - trend_slope * trend_xmid,
+        );
     }
-    let phase_residual = moving_median(
-        &interpolate_valid(&phase_residual, &frequency, &reliable),
+    let mut raw_phase_residual = vec![f64::NAN; cols];
+    for idx in 0..cols {
+        if phase0_unwrapped[idx].is_finite() {
+            raw_phase_residual[idx] = phase0_unwrapped[idx] - global_phase_fit_rad[idx];
+        }
+    }
+    // Outside an interval there is no spike-specific correction; show the
+    // global trend itself there and retain the corresponding residual.
+    let mut interval_phase_fit_rad = global_phase_fit_rad.clone();
+    for interval in intervals {
+        let start = interval.start_channel.min(cols.saturating_sub(1));
+        let end = interval.end_channel.min(cols.saturating_sub(1));
+        if end <= start {
+            continue;
+        }
+        let indexes: Vec<usize> = (start..=end)
+            .filter(|&idx| reliable[idx] && raw_phase_residual[idx].is_finite())
+            .collect();
+        if indexes.len() < 2 {
+            continue;
+        }
+        let x: Vec<f64> = indexes.iter().map(|&idx| frequency[idx]).collect();
+        let y: Vec<f64> = indexes.iter().map(|&idx| raw_phase_residual[idx]).collect();
+        let amplitudes: Vec<f64> = indexes.iter().map(|&idx| median_amp[idx]).collect();
+        if let Some((slope, intercept, xmid)) = robust_frequency_line_fit(&x, &y, &amplitudes) {
+            // Evaluate the fitted residual over the whole interval.  The
+            // correction is applied to every time/frequency cell, not only to
+            // channels that happened to pass the fit reliability threshold.
+            for idx in start..=end {
+                interval_phase_fit_rad[idx] =
+                    global_phase_fit_rad[idx] + slope * (frequency[idx] - xmid) + intercept;
+            }
+        }
+    }
+    let mut final_phase_residual = vec![f64::NAN; cols];
+    for idx in 0..cols {
+        if phase0_unwrapped[idx].is_finite() && interval_phase_fit_rad[idx].is_finite() {
+            final_phase_residual[idx] = phase0_unwrapped[idx] - interval_phase_fit_rad[idx];
+        }
+    }
+    let phase_residual_rad = moving_median(
+        &interpolate_valid(&raw_phase_residual, &frequency, &reliable),
         41,
     );
 
     let common_rate = median(reliable_idx.iter().map(|&i| rate_hz[i]).collect());
-    let mut rate_residual = vec![f64::NAN; cols];
+    let mut raw_rate_residual = vec![f64::NAN; cols];
     for &idx in &reliable_idx {
-        rate_residual[idx] = rate_hz[idx] - common_rate;
+        raw_rate_residual[idx] = rate_hz[idx] - common_rate;
     }
-    let rate_residual = moving_median(
-        &interpolate_valid(&rate_residual, &frequency, &reliable),
-        41,
-    );
+    let interpolated_rate_residual = interpolate_valid(&raw_rate_residual, &frequency, &reliable);
+    let rate_residual_hz = moving_median(&interpolated_rate_residual, 41);
     let last_spike = spikes
         .iter()
         .map(|peak| peak.frequency_mhz)
         .fold(f64::NEG_INFINITY, f64::max);
     let taper = edge_taper(&frequency, last_spike, 5.0);
-    // Keep the absolute full-band phase established by the global fringe
-    // solution. The spike-only residual is a shape correction, so remove its
-    // amplitude-weighted constant phase component before applying it.
-    let mut phase_correction: Vec<f64> = phase_residual
+
+    let mut phase_correction_rad: Vec<f64> = phase_residual_rad
         .iter()
         .zip(&taper)
         .map(|(phase, edge)| phase * edge)
@@ -847,31 +1044,163 @@ pub fn apply_safe_spike_residual_correction(
         .collect();
     let phase_weight_sum: f64 = phase_weight.iter().sum();
     if phase_weight_sum.is_finite() && phase_weight_sum > 0.0 {
-        let phase_mean = phase_correction
+        let phase_mean = phase_correction_rad
             .iter()
             .zip(&phase_weight)
             .map(|(phase, weight)| phase * weight)
             .sum::<f64>()
             / phase_weight_sum;
-        for phase in &mut phase_correction {
+        for phase in &mut phase_correction_rad {
             *phase -= phase_mean;
         }
     }
 
-    let reference_phase = coherent_phase(spectra);
-    let mut corrected = spectra.to_vec();
-    for row in 0..rows {
-        let t = elapsed[row];
-        for ch in 0..cols {
-            let angle = phase_correction[ch]
-                + 2.0 * std::f64::consts::PI * rate_residual[ch] * t * taper[ch];
-            let factor = Complex::new((-angle).cos() as f32, (-angle).sin() as f32);
-            corrected[row][ch] *= factor;
+    Some(SpikeFitDiagnostics {
+        frequency_mhz: frequency,
+        phase0_rad: phase0,
+        phase0_unwrapped_rad: phase0_unwrapped,
+        global_phase_fit_rad,
+        interval_phase_fit_rad,
+        raw_phase_residual_rad: raw_phase_residual,
+        final_phase_residual_rad: final_phase_residual,
+        phase_correction_rad,
+        rate_hz,
+        raw_rate_residual_hz: raw_rate_residual,
+        rate_residual_hz,
+        taper,
+        reliable,
+    })
+}
+
+fn apply_interval_delay_rate_correction(
+    _header: &CorHeader,
+    spectra: &[Vec<C32>],
+    effective_integ_time: f32,
+    spikes: &[SpikePeak],
+    intervals: &[SpikeIntervalCorrection],
+) -> Vec<Vec<C32>> {
+    if spectra.is_empty() || spectra[0].is_empty() || intervals.is_empty() {
+        return spectra.to_vec();
+    }
+    let Some(diagnostics) =
+        estimate_spike_fit_diagnostics(_header, spectra, effective_integ_time, spikes, intervals)
+    else {
+        return spectra.to_vec();
+    };
+    let rows = spectra.len();
+    let cols = spectra[0].len();
+    let mut corrected_flat: Vec<C32> = spectra.iter().flat_map(|row| row.iter().copied()).collect();
+
+    // The full-band search has already removed the common delay/rate.  What
+    // remains is the interval residual model: a fitted frequency-dependent
+    // phase offset plus the residual time rate measured per channel.  Apply
+    // that model directly to every visibility cell.  A sub-band FFT
+    // correction followed by restoring the interval mean would cancel the
+    // phase jump at a YAMAGU34 spike that this operation is meant to remove.
+    for interval in intervals {
+        let start = interval.start_channel;
+        let end = interval.end_channel;
+        if start >= cols || end < start || end >= cols {
+            continue;
+        }
+        if end - start + 1 < 8 {
+            continue;
+        }
+        let indexes: Vec<usize> = (start..=end)
+            .filter(|&idx| {
+                diagnostics.interval_phase_fit_rad[idx].is_finite()
+                    && diagnostics.global_phase_fit_rad[idx].is_finite()
+                    && diagnostics.rate_hz[idx].is_finite()
+                    && diagnostics.reliable[idx]
+            })
+            .collect();
+        if indexes.len() < 2 {
+            continue;
+        }
+        let interval_rate_hz = median(
+            indexes
+                .iter()
+                .map(|&idx| diagnostics.rate_hz[idx])
+                .collect(),
+        );
+        for row in 0..rows {
+            let time = row as f64 * effective_integ_time as f64;
+            for ch in start..=end {
+                let phase_offset =
+                    diagnostics.interval_phase_fit_rad[ch] - diagnostics.global_phase_fit_rad[ch];
+                if !phase_offset.is_finite() {
+                    continue;
+                }
+                let phase = phase_offset + 2.0 * std::f64::consts::PI * interval_rate_hz * time;
+                let factor = C32::new((-phase).cos() as f32, (-phase).sin() as f32);
+                corrected_flat[row * cols + ch] *= factor;
+            }
         }
     }
-    // Preserve the phase reference delivered by the full-band correction.
-    // Spike residual fitting may improve coherence while introducing a
-    // harmless constant rotation; remove that rotation from the final data.
+
+    corrected_flat
+        .chunks(cols)
+        .map(|row| row.to_vec())
+        .collect()
+}
+
+pub fn apply_spike_interval_residual_correction(
+    header: &CorHeader,
+    spectra: &[Vec<C32>],
+    effective_integ_time: f32,
+    spikes: &[SpikePeak],
+) -> Vec<Vec<C32>> {
+    let intervals: Vec<SpikeIntervalCorrection> =
+        spike_interval_ranges(header, spikes, spectra[0].len())
+            .into_iter()
+            .map(
+                |(left_spike_mhz, right_spike_mhz, start_channel, end_channel)| {
+                    SpikeIntervalCorrection {
+                        left_spike_mhz,
+                        right_spike_mhz,
+                        start_channel,
+                        end_channel,
+                        center_mhz: 0.0,
+                        width_mhz: 0.0,
+                        amp_percent: 0.0,
+                        snr: 0.0,
+                        phase_deg: 0.0,
+                        delay_sample: 0.0,
+                        rate_hz: 0.0,
+                    }
+                },
+            )
+            .collect();
+    apply_interval_delay_rate_correction(header, spectra, effective_integ_time, spikes, &intervals)
+}
+
+pub fn apply_safe_spike_residual_correction(
+    header: &CorHeader,
+    spectra: &[Vec<C32>],
+    effective_integ_time: f32,
+    spikes: &[SpikePeak],
+) -> Vec<Vec<C32>> {
+    let Some(diagnostics) =
+        estimate_spike_fit_diagnostics(header, spectra, effective_integ_time, spikes, &[])
+    else {
+        return spectra.to_vec();
+    };
+    let cols = spectra[0].len();
+    let reference_phase = coherent_phase(spectra);
+    let mut corrected = spectra.to_vec();
+    for (row, values) in corrected.iter_mut().enumerate() {
+        let time = row as f64 * effective_integ_time as f64;
+        for (ch, value) in values.iter_mut().enumerate() {
+            let angle = diagnostics.phase_correction_rad[ch]
+                + 2.0
+                    * std::f64::consts::PI
+                    * diagnostics.rate_residual_hz[ch]
+                    * time
+                    * diagnostics.taper[ch];
+            let factor = Complex::new((-angle).cos() as f32, (-angle).sin() as f32);
+            *value *= factor;
+        }
+    }
     if let (Some(before), Some(after)) = (reference_phase, coherent_phase(&corrected)) {
         let angle = before - after;
         let factor = Complex::new(angle.cos() as f32, angle.sin() as f32);
@@ -881,7 +1210,99 @@ pub fn apply_safe_spike_residual_correction(
             }
         }
     }
+    debug_assert_eq!(cols, corrected.first().map_or(0, Vec::len));
     corrected
+}
+
+fn average_spectrum(spectra: &[Vec<C32>]) -> Vec<C32> {
+    if spectra.is_empty() || spectra[0].is_empty() {
+        return Vec::new();
+    }
+    let rows = spectra.len() as f32;
+    (0..spectra[0].len())
+        .map(|channel| {
+            spectra
+                .iter()
+                .map(|row| row[channel])
+                .fold(C32::new(0.0, 0.0), |sum, value| sum + value)
+                / rows
+        })
+        .collect()
+}
+
+fn write_frequency_spectrum_table(
+    path: &Path,
+    frequency_mhz: &[f64],
+    raw: &[C32],
+    fullband_corrected: &[C32],
+    corrected: &[C32],
+    search_delay: f32,
+    search_rate: f32,
+    fit_before_phase_deg: Option<&[f32]>,
+    fit_after_phase_deg: Option<&[f32]>,
+) -> Result<(), Box<dyn Error>> {
+    if frequency_mhz.len() != raw.len()
+        || raw.len() != fullband_corrected.len()
+        || raw.len() != corrected.len()
+        || fit_before_phase_deg.is_some_and(|values| values.len() != frequency_mhz.len())
+        || fit_after_phase_deg.is_some_and(|values| values.len() != frequency_mhz.len())
+    {
+        return Err("spike34 frequency spectrum table has inconsistent lengths".into());
+    }
+    let mut out = String::from(
+        "frequency_MHz\traw_amplitude\traw_phase_deg\tsearch_corrected_amplitude\tsearch_corrected_phase_deg\tspike34_corrected_amplitude\tspike34_corrected_phase_deg\tfit_before_phase_deg\tfit_after_phase_deg\tsearch_delay_sample\tsearch_rate_Hz\n",
+    );
+    for i in 0..frequency_mhz.len() {
+        let before = raw[i];
+        let searched = fullband_corrected[i];
+        let after = corrected[i];
+        let fit_before = fit_before_phase_deg
+            .map(|values| values[i])
+            .unwrap_or(f32::NAN);
+        let fit_after = fit_after_phase_deg
+            .map(|values| values[i])
+            .unwrap_or(f32::NAN);
+        out.push_str(&format!(
+            "{:.9}\t{:.9e}\t{:.6}\t{:.9e}\t{:.6}\t{:.9e}\t{:.6}\t{:.6}\t{:.6}\t{search_delay:.9}\t{search_rate:.9}\n",
+            frequency_mhz[i],
+            before.norm(),
+            before.arg().to_degrees(),
+            searched.norm(),
+            searched.arg().to_degrees(),
+            after.norm(),
+            after.arg().to_degrees(),
+            fit_before,
+            fit_after,
+        ));
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn write_fit_residual_table(
+    path: &Path,
+    diagnostics: &SpikeFitDiagnostics,
+) -> Result<(), Box<dyn Error>> {
+    let mut out = String::from(
+        "frequency_MHz\tphase0_wrapped_deg\tphase0_unwrapped_deg\tglobal_fit_deg\tinterval_fit_deg\traw_phase_residual_deg\tfinal_phase_residual_deg\trate_Hz\traw_rate_residual_Hz\ttaper\n",
+    );
+    for i in 0..diagnostics.frequency_mhz.len() {
+        out.push_str(&format!(
+            "{:.9}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.9e}\t{:.6}\n",
+            diagnostics.frequency_mhz[i],
+            diagnostics.phase0_rad[i].to_degrees(),
+            diagnostics.phase0_unwrapped_rad[i].to_degrees(),
+            diagnostics.global_phase_fit_rad[i].to_degrees(),
+            diagnostics.interval_phase_fit_rad[i].to_degrees(),
+            diagnostics.raw_phase_residual_rad[i].to_degrees(),
+            diagnostics.final_phase_residual_rad[i].to_degrees(),
+            diagnostics.rate_hz[i],
+            diagnostics.raw_rate_residual_hz[i],
+            diagnostics.taper[i],
+        ));
+    }
+    fs::write(path, out)?;
+    Ok(())
 }
 
 pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
@@ -909,14 +1330,19 @@ pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     let spike_table = out_dir.join(format!("{stem}_spikes.tsv"));
     let delay_rate_table = out_dir.join(format!("{stem}_delay_rate.tsv"));
     write_spike_table(&spike_table, &spikes)?;
-    write_interval_delay_rate_table(args, input_path, &delay_rate_table, &spikes)?;
+    let interval_corrections =
+        write_interval_delay_rate_table(args, input_path, &delay_rate_table, &spikes)?;
 
     let (input_header, cross_spectra, cross_effective_integ_time) = read_all_spectra(input_path)?;
     let spike_channels: Vec<usize> = spikes.iter().map(|peak| peak.channel).collect();
-    let amp_png = out_dir.join(format!("{stem}_raw_visibility_amp.png"));
-    let phase_png = out_dir.join(format!("{stem}_raw_visibility_phase.png"));
-    let corrected_amp_png = out_dir.join(format!("{stem}_raw_visibility_corrected_amp.png"));
-    let corrected_phase_png = out_dir.join(format!("{stem}_raw_visibility_corrected_phase.png"));
+    let amp_png = out_dir.join(format!("{stem}_rawvis_amp.png"));
+    let phase_png = out_dir.join(format!("{stem}_rawvis_phase.png"));
+    let corrected_amp_png = out_dir.join(format!("{stem}_rawvis_corrected_amp.png"));
+    let corrected_phase_png = out_dir.join(format!("{stem}_rawvis_corrected_phase.png"));
+    let spectrum_before_after_png = out_dir.join(format!("{stem}_spectrum_before_after.png"));
+    let spectrum_before_after_tsv = out_dir.join(format!("{stem}_spectrum_before_after.tsv"));
+    let fit_residual_png = out_dir.join(format!("{stem}_fit_residual.png"));
+    let fit_residual_tsv = out_dir.join(format!("{stem}_fit_residual.tsv"));
     let buffer = read_input_bytes(input_path)?;
     let mut time_cursor = Cursor::new(buffer.as_slice());
     let _time_header = parse_header(&mut time_cursor)?;
@@ -933,15 +1359,117 @@ pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         false,
         &[],
     )?;
-    let corrected_spectra = apply_global_and_safe_spike_correction(
+    let (fullband_spectra, corrected_spectra, search_delay, search_rate) =
+        apply_global_and_safe_spike_correction(
+            &input_header,
+            &cross_spectra,
+            cross_effective_integ_time,
+            &spikes,
+            &interval_corrections,
+            args,
+            &current_obs_time,
+            &file_start_time,
+        )?;
+    let raw_frequency_spectrum = average_spectrum(&cross_spectra);
+    let fullband_frequency_spectrum = average_spectrum(&fullband_spectra);
+    let corrected_frequency_spectrum = average_spectrum(&corrected_spectra);
+    let frequency_mhz = frequency_axis_mhz(&input_header, raw_frequency_spectrum.len());
+    let diagnostics = estimate_spike_fit_diagnostics(
         &input_header,
-        &cross_spectra,
+        &fullband_spectra,
         cross_effective_integ_time,
         &spikes,
-        args,
-        &current_obs_time,
-        &file_start_time,
+        &interval_corrections,
+    );
+    let (fit_before_phase_deg, fit_after_phase_deg) = if let Some(diagnostics) =
+        diagnostics.as_ref()
+    {
+        let before: Vec<f32> = diagnostics
+            .phase0_unwrapped_rad
+            .iter()
+            .map(|value| value.to_degrees() as f32)
+            .collect();
+        // Remove only the interval residual (interval fit - global fit). The
+        // global full-band trend is deliberately retained in the after series.
+        let after: Vec<f32> = diagnostics
+            .phase0_unwrapped_rad
+            .iter()
+            .zip(&diagnostics.global_phase_fit_rad)
+            .zip(&diagnostics.interval_phase_fit_rad)
+            .map(|((&phase, &global), &interval)| (phase - (interval - global)).to_degrees() as f32)
+            .collect();
+        (Some(before), Some(after))
+    } else {
+        (None, None)
+    };
+    write_frequency_spectrum_table(
+        &spectrum_before_after_tsv,
+        &frequency_mhz,
+        &raw_frequency_spectrum,
+        &fullband_frequency_spectrum,
+        &corrected_frequency_spectrum,
+        search_delay,
+        search_rate,
+        fit_before_phase_deg.as_deref(),
+        fit_after_phase_deg.as_deref(),
     )?;
+    plot_spike34_frequency_spectrum_with_phase(
+        &spectrum_before_after_png,
+        &frequency_mhz,
+        &fullband_frequency_spectrum,
+        &corrected_frequency_spectrum,
+        &spikes
+            .iter()
+            .map(|peak| peak.frequency_mhz)
+            .collect::<Vec<_>>(),
+        fit_before_phase_deg.as_deref(),
+        fit_after_phase_deg.as_deref(),
+    )?;
+    if let Some(diagnostics) = diagnostics {
+        write_fit_residual_table(&fit_residual_tsv, &diagnostics)?;
+        let phase0_unwrapped_deg: Vec<f32> = diagnostics
+            .phase0_unwrapped_rad
+            .iter()
+            .map(|value| value.to_degrees() as f32)
+            .collect();
+        let global_fit_deg: Vec<f32> = diagnostics
+            .global_phase_fit_rad
+            .iter()
+            .map(|value| value.to_degrees() as f32)
+            .collect();
+        let interval_fit_deg: Vec<f32> = diagnostics
+            .interval_phase_fit_rad
+            .iter()
+            .map(|value| value.to_degrees() as f32)
+            .collect();
+        let raw_phase_residual_deg: Vec<f32> = diagnostics
+            .raw_phase_residual_rad
+            .iter()
+            .map(|value| value.to_degrees() as f32)
+            .collect();
+        let final_phase_residual_deg: Vec<f32> = diagnostics
+            .final_phase_residual_rad
+            .iter()
+            .map(|value| value.to_degrees() as f32)
+            .collect();
+        let raw_rate_residual_hz: Vec<f32> = diagnostics
+            .raw_rate_residual_hz
+            .iter()
+            .map(|value| *value as f32)
+            .collect();
+        let spike_frequencies: Vec<f64> = spikes.iter().map(|peak| peak.frequency_mhz).collect();
+        plot_spike34_fit_residual(
+            &fit_residual_png,
+            &diagnostics.frequency_mhz,
+            &phase0_unwrapped_deg,
+            &global_fit_deg,
+            &interval_fit_deg,
+            &raw_phase_residual_deg,
+            &final_phase_residual_deg,
+            &raw_rate_residual_hz,
+            &spike_frequencies,
+        )?;
+    }
     plot_spectrum_amplitude_heatmap_with_spikes(&amp_png, &cross_spectra, 0.0, &spike_channels)?;
     plot_spectrum_phase_heatmap_with_spikes(&phase_png, &cross_spectra, 0.0, &spike_channels)?;
     plot_spectrum_amplitude_heatmap_with_spikes(
@@ -957,8 +1485,34 @@ pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         &spike_channels,
     )?;
 
-    println!("Spike34m output directory: {}", out_dir.display());
+    println!(
+        "Spike34 full-band --search correction: delay={:+.9} sample rate={:+.9} Hz",
+        search_delay, search_rate
+    );
+    println!("Spike34 output directory: {}", out_dir.display());
     println!("Spike table: {}", spike_table.display());
     println!("Spike delay/rate table: {}", delay_rate_table.display());
+    println!("Raw amplitude plot: {}", amp_png.display());
+    println!("Raw phase plot: {}", phase_png.display());
+    println!(
+        "Spike-interval corrected amplitude plot: {}",
+        corrected_amp_png.display()
+    );
+    println!(
+        "Spike-interval corrected phase plot: {}",
+        corrected_phase_png.display()
+    );
+    println!(
+        "Frequency spectrum before/after plot: {}",
+        spectrum_before_after_png.display()
+    );
+    println!(
+        "Frequency spectrum before/after TSV: {}",
+        spectrum_before_after_tsv.display()
+    );
+    if fit_residual_png.exists() {
+        println!("Spike34 fit/residual plot: {}", fit_residual_png.display());
+        println!("Spike34 fit/residual TSV: {}", fit_residual_tsv.display());
+    }
     Ok(())
 }

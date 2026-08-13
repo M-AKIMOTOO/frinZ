@@ -55,9 +55,12 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let amp_heatmap_filepath = output_dir.join(format!("{}_heatmap_amp.png", base_filename));
-    let phase_heatmap_filepath = output_dir.join(format!("{}_heatmap_phase.png", base_filename));
+    let amp_heatmap_filepath = output_dir.join(format!("{}_rawvis_heatmap_amp.png", base_filename));
+    let phase_heatmap_filepath =
+        output_dir.join(format!("{}_rawvis_heatmap_phase.png", base_filename));
     for legacy_filename in [
+        format!("{}_heatmap_amp.png", base_filename),
+        format!("{}_heatmap_phase.png", base_filename),
         format!("{}_heatmap_amp_phase.png", base_filename),
         format!("{}_scatter_real_imag.png", base_filename),
         format!("{}_scatter_amp_phase.png", base_filename),
@@ -74,7 +77,7 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         let time_axis: Vec<f64> = (0..rows).map(|index| index as f64).collect();
         let channel_axis: Vec<f64> = (0..cols).map(|index| index as f64).collect();
         let mut npz = NamedNpz::new(NpyMeta::new(
-            "raw_visibility",
+            "rawvis",
             header.fft_point as u32,
             header.number_of_sector as u32,
         ));
@@ -85,7 +88,7 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
             (rows, cols),
             all_spectra.iter().flatten().copied(),
         )?;
-        npz.write(&npz_sidecar_path(&amp_heatmap_filepath, "raw_visibility"))?;
+        npz.write(&npz_sidecar_path(&amp_heatmap_filepath, "rawvis"))?;
     }
 
     Ok(())

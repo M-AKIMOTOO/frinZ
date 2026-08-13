@@ -34,7 +34,7 @@ use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
 use crate::spike34m::{
-    apply_safe_spike_residual_correction, detect_auto_spikes, read_all_spectra, SpikePeak,
+    apply_spike_interval_residual_correction, detect_auto_spikes, read_all_spectra, SpikePeak,
 };
 use crate::stfft;
 use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg};
@@ -683,6 +683,8 @@ pub fn process_cor_file(
         // phase/rate of every channel and smooth it between the detected
         // YAMAGU34 spikes. Applying each sub-band search result independently
         // would erase the physical full-band phase trend and can reduce SNR.
+        let mut spike34_applied_delay = 0.0f32;
+        let mut spike34_applied_rate = 0.0f32;
         if let Some(spikes) = &spike34m_peaks {
             let mut search_vec = complex_vec.clone();
             let search_length =
@@ -723,6 +725,8 @@ pub fn process_cor_file(
             } else {
                 0.0
             };
+            spike34_applied_delay = fullband_delay;
+            spike34_applied_rate = fullband_rate;
             apply_phase_correction_in_place_at_frequency(
                 &mut complex_vec,
                 fft_point_half_used,
@@ -741,7 +745,7 @@ pub fn process_cor_file(
                 .chunks(fft_point_half_used)
                 .map(|row| row.to_vec())
                 .collect();
-            let corrected_spectra = apply_safe_spike_residual_correction(
+            let corrected_spectra = apply_spike_interval_residual_correction(
                 &processing_header,
                 &spectra,
                 effective_integ_time,
@@ -1774,7 +1778,7 @@ pub fn process_cor_file(
                         )
                     };
 
-                    let stat_keys = vec![
+                    let mut stat_keys = vec![
                         "Epoch (UTC)",
                         "Station 1 & 2",
                         "Source",
@@ -1786,7 +1790,7 @@ pub fn process_cor_file(
                         "SNR (1 σ [%])",
                         "Rate (residual) [mHz]",
                     ];
-                    let stat_vals = vec![
+                    let mut stat_vals = vec![
                         analysis_results.yyyydddhhmmss1.to_string(),
                         format!("{} & {}", header.station1_name, header.station2_name),
                         analysis_results.source_name.to_string(),
@@ -1802,6 +1806,14 @@ pub fn process_cor_file(
                         ),
                         format!("{:+.6}", analysis_results.residual_rate * 1000.0),
                     ];
+                    if args.spike34m.is_some() {
+                        stat_keys.push("Spike34 delay applied [sample]");
+                        stat_vals.push(format!("{:+.6}", spike34_applied_delay));
+                        stat_keys.push("Spike34 rate applied [mHz]");
+                        stat_vals.push(format!("{:+.6}", spike34_applied_rate * 1000.0));
+                        stat_keys.push("Spike34 interval residual correction");
+                        stat_vals.push("applied".to_string());
+                    }
                     let max_norm_freq = freq_rate_array
                         .iter()
                         .map(|c| c.norm())

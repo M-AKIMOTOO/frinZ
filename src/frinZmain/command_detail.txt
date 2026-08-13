@@ -80,7 +80,7 @@
   --rrange MIN MAX                   レート探索範囲
   --frange MIN MAX                   周波数探索/表示範囲（--frequency 用）
   --scan-correct <CSV>               start,integ,delay[samp],rate[Hz]
-  --spike34 <YAMAGU34_AUTO.cor>   YAMAGU34自己相関のspikeを検出し、spike間ごとのdelay/rateと、spike位置に白線を重ねたraw-visibility比較図を frinZ/spike34/ に出力。
+  --spike34 <YAMAGU34_AUTO.cor>   YAMAGU34自己相関のspikeを検出し、spike間ごとのdelay/rate TSV、補正前後の周波数スペクトル TSV/PNG、入力phase0・spike間線形fit・raw residual・rate residualのfit/residual TSV/PNG、spike位置に白線を重ねたraw-visibility比較図を frinZ/spike34/ に出力。周波数スペクトルPNGは全帯域search前後の2系列と黒破線のspike位置を表示する。
                                      spike34ファイルはYAMAGU34-YAMAGU34自己相関、inputとファイル名時刻yyyydddhhmmss一致、input基線にYAMAGU34を含むことを要求。
   --flagging time START END ...      時間スキップ
   --flagging pp START END ...        セクターをゼロ詰め

@@ -1131,7 +1131,18 @@ fn apply_interval_delay_rate_correction(
                 if !phase_offset.is_finite() {
                     continue;
                 }
-                let phase = phase_offset + 2.0 * std::f64::consts::PI * interval_rate_hz * time;
+                // Use the frequency-smoothed per-channel residual rate rather
+                // than one independently searched rate for the whole interval.
+                // The latter leaves a staircase/jagged rate pattern between
+                // YAMAGU34 spikes because weak channels and RFI perturb each
+                // sub-band's median. Keep the interval search as a fallback
+                // for channels that did not yield a reliable time fit.
+                let rate_hz = if diagnostics.rate_residual_hz[ch].is_finite() {
+                    diagnostics.rate_residual_hz[ch]
+                } else {
+                    interval_rate_hz
+                };
+                let phase = phase_offset + 2.0 * std::f64::consts::PI * rate_hz * time;
                 let factor = C32::new((-phase).cos() as f32, (-phase).sin() as f32);
                 corrected_flat[row * cols + ch] *= factor;
             }
@@ -1284,11 +1295,11 @@ fn write_fit_residual_table(
     diagnostics: &SpikeFitDiagnostics,
 ) -> Result<(), Box<dyn Error>> {
     let mut out = String::from(
-        "frequency_MHz\tphase0_wrapped_deg\tphase0_unwrapped_deg\tglobal_fit_deg\tinterval_fit_deg\traw_phase_residual_deg\tfinal_phase_residual_deg\trate_Hz\traw_rate_residual_Hz\ttaper\n",
+        "frequency_MHz\tphase0_wrapped_deg\tphase0_unwrapped_deg\tglobal_fit_deg\tinterval_fit_deg\traw_phase_residual_deg\tfinal_phase_residual_deg\trate_Hz\traw_rate_residual_Hz\tsmoothed_rate_residual_Hz\ttaper\n",
     );
     for i in 0..diagnostics.frequency_mhz.len() {
         out.push_str(&format!(
-            "{:.9}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.9e}\t{:.6}\n",
+            "{:.9}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.9e}\t{:.9e}\t{:.6}\n",
             diagnostics.frequency_mhz[i],
             diagnostics.phase0_rad[i].to_degrees(),
             diagnostics.phase0_unwrapped_rad[i].to_degrees(),
@@ -1298,6 +1309,7 @@ fn write_fit_residual_table(
             diagnostics.final_phase_residual_rad[i].to_degrees(),
             diagnostics.rate_hz[i],
             diagnostics.raw_rate_residual_hz[i],
+            diagnostics.rate_residual_hz[i],
             diagnostics.taper[i],
         ));
     }
@@ -1457,6 +1469,11 @@ pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|value| *value as f32)
             .collect();
+        let smoothed_rate_residual_hz: Vec<f32> = diagnostics
+            .rate_residual_hz
+            .iter()
+            .map(|value| *value as f32)
+            .collect();
         let spike_frequencies: Vec<f64> = spikes.iter().map(|peak| peak.frequency_mhz).collect();
         plot_spike34_fit_residual(
             &fit_residual_png,
@@ -1467,6 +1484,7 @@ pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             &raw_phase_residual_deg,
             &final_phase_residual_deg,
             &raw_rate_residual_hz,
+            &smoothed_rate_residual_hz,
             &spike_frequencies,
         )?;
     }

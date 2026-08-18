@@ -17,7 +17,6 @@ use plotters::backend::RGBPixel;
 use plotters::coord::Shift;
 use plotters::prelude::*;
 use plotters::style::colors::colormaps::ViridisRGB;
-use plotters::style::full_palette::PURPLE;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 use rayon::prelude::*;
 use std::error::Error;
@@ -3970,6 +3969,7 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
     raw_phase_residual_deg: &[f32],
     final_phase_residual_deg: &[f32],
     raw_rate_residual_hz: &[f32],
+    smoothed_rate_residual_hz: &[f32],
     spike_frequencies_mhz: &[f64],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let n = frequency_mhz.len();
@@ -3980,6 +3980,7 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
         || raw_phase_residual_deg.len() != n
         || final_phase_residual_deg.len() != n
         || raw_rate_residual_hz.len() != n
+        || smoothed_rate_residual_hz.len() != n
     {
         return Err("spike34 fit/residual data has inconsistent lengths".into());
     }
@@ -4002,7 +4003,8 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
     let interval_fit_series = to_series(interval_fit_deg);
     let residual_series = to_series(raw_phase_residual_deg);
     let final_residual_series = to_series(final_phase_residual_deg);
-    let rate_residual_series = to_series(raw_rate_residual_hz);
+    let raw_rate_residual_series = to_series(raw_rate_residual_hz);
+    let smoothed_rate_residual_series = to_series(smoothed_rate_residual_hz);
     let bounds = |series: &[(f64, f32)], fallback: (f32, f32), min_margin: f32| -> (f32, f32) {
         if series.is_empty() {
             return fallback;
@@ -4022,7 +4024,12 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
         .copied()
         .collect();
     let (res_min, res_max) = bounds(&residual_bounds_series, (-10.0, 10.0), 1.0);
-    let (rate_min, rate_max) = bounds(&rate_residual_series, (-1.0e-3, 1.0e-3), 1.0e-6);
+    let rate_bounds_series: Vec<(f64, f32)> = raw_rate_residual_series
+        .iter()
+        .chain(smoothed_rate_residual_series.iter())
+        .copied()
+        .collect();
+    let (rate_min, rate_max) = bounds(&rate_bounds_series, (-1.0e-3, 1.0e-3), 1.0e-6);
 
     let root = BitMapBackend::new(output_path.as_ref(), (1200, 1050)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -4112,11 +4119,20 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
     )))?;
     rate_chart
         .draw_series(LineSeries::new(
-            rate_residual_series,
-            PURPLE.stroke_width(2),
+            raw_rate_residual_series,
+            RED.mix(0.55).stroke_width(1),
         ))?
-        .label("Raw rate residual (rate - median)")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], PURPLE.stroke_width(2)));
+        .label("Raw rate residual (per-channel)")
+        .legend(|(x, y)| {
+            PathElement::new(vec![(x, y), (x + 28, y)], RED.mix(0.55).stroke_width(1))
+        });
+    rate_chart
+        .draw_series(LineSeries::new(
+            smoothed_rate_residual_series,
+            BLUE.stroke_width(3),
+        ))?
+        .label("Applied smoothed rate residual")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(3)));
 
     for chart_kind in 0..3 {
         let (y_min, y_max) = match chart_kind {

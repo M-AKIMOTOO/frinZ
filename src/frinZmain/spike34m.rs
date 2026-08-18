@@ -1097,6 +1097,15 @@ fn apply_interval_delay_rate_correction(
     // that model directly to every visibility cell.  A sub-band FFT
     // correction followed by restoring the interval mean would cancel the
     // phase jump at a YAMAGU34 spike that this operation is meant to remove.
+    let common_rate_hz = median(
+        diagnostics
+            .rate_hz
+            .iter()
+            .enumerate()
+            .filter(|(idx, rate)| diagnostics.reliable[*idx] && rate.is_finite())
+            .map(|(_, rate)| *rate)
+            .collect(),
+    );
     for interval in intervals {
         let start = interval.start_channel;
         let end = interval.end_channel;
@@ -1123,6 +1132,14 @@ fn apply_interval_delay_rate_correction(
                 .map(|&idx| diagnostics.rate_hz[idx])
                 .collect(),
         );
+        let target_rate_residual = interval_rate_hz - common_rate_hz;
+        let smoothed_interval_rate = median(
+            indexes
+                .iter()
+                .map(|&idx| diagnostics.rate_residual_hz[idx])
+                .filter(|rate| rate.is_finite())
+                .collect(),
+        );
         for row in 0..rows {
             let time = row as f64 * effective_integ_time as f64;
             for ch in start..=end {
@@ -1137,10 +1154,15 @@ fn apply_interval_delay_rate_correction(
                 // YAMAGU34 spikes because weak channels and RFI perturb each
                 // sub-band's median. Keep the interval search as a fallback
                 // for channels that did not yield a reliable time fit.
-                let rate_hz = if diagnostics.rate_residual_hz[ch].is_finite() {
-                    diagnostics.rate_residual_hz[ch]
+                let rate_hz = if diagnostics.rate_residual_hz[ch].is_finite()
+                    && smoothed_interval_rate.is_finite()
+                    && common_rate_hz.is_finite()
+                {
+                    // Preserve the independently measured interval median and
+                    // replace only its channel-to-channel jagged component.
+                    diagnostics.rate_residual_hz[ch] + target_rate_residual - smoothed_interval_rate
                 } else {
-                    interval_rate_hz
+                    target_rate_residual
                 };
                 let phase = phase_offset + 2.0 * std::f64::consts::PI * rate_hz * time;
                 let factor = C32::new((-phase).cos() as f32, (-phase).sin() as f32);

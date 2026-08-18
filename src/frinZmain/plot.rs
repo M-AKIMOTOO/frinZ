@@ -4122,7 +4122,7 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
             raw_rate_residual_series,
             RED.mix(0.55).stroke_width(1),
         ))?
-        .label("Raw rate residual (per-channel)")
+        .label("Measured raw rate residual (not applied)")
         .legend(|(x, y)| {
             PathElement::new(vec![(x, y), (x + 28, y)], RED.mix(0.55).stroke_width(1))
         });
@@ -4131,7 +4131,7 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
             smoothed_rate_residual_series,
             BLUE.stroke_width(3),
         ))?
-        .label("Applied smoothed rate residual")
+        .label("Smoothed rate diagnostic (not applied)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(3)));
 
     for chart_kind in 0..3 {

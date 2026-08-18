@@ -133,6 +133,8 @@
        size:<px>(既定 256), cell:<arcsec>, clean:0|1, gain:<f>,
        threshold:<Jy>, iter:<n>。
   --dynamic-spectrum, --raw-visibility, --uv [0|1], --uptimeplot
+       --raw-visibility は元データの heatmap を出力する。--delay/--rate（または高次Taylor補正）を指定した場合は、
+       元データ図に加えて *_rawvis_corrected_{delay|rate|delay_rate}_heatmap_{amp|phase}.png も出力する。
 
 [出力・グラフ補助]
   全解析結果は元 .cor の親ディレクトリ直下の frinZ/ に保存する。

@@ -114,19 +114,17 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
             .map(|row| row.to_vec())
             .collect();
 
-        let correction_kind = match (args.delay_correct != 0.0, args.rate_correct != 0.0) {
-            (true, true) => "delay_rate",
-            (true, false) => "delay",
-            (false, true) => "rate",
-            (false, false) => "taylor",
-        };
+        // Keep one stable product name regardless of which Taylor terms were
+        // supplied.  The image documents the result of the requested delay,
+        // rate, and optional higher-order corrections.
+        let correction_kind = "delay_rate";
         let corrected_amp_heatmap_filepath = output_dir.join(format!(
-            "{}_rawvis_corrected_{}_heatmap_amp.png",
-            base_filename, correction_kind
+            "{}_rawvis_corrected_delay_rate_heatmap_amp.png",
+            base_filename
         ));
         let corrected_phase_heatmap_filepath = output_dir.join(format!(
-            "{}_rawvis_corrected_{}_heatmap_phase.png",
-            base_filename, correction_kind
+            "{}_rawvis_corrected_delay_rate_heatmap_phase.png",
+            base_filename
         ));
         plot::plot_spectrum_amplitude_heatmap(
             &corrected_amp_heatmap_filepath,

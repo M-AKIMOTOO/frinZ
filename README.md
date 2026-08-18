@@ -392,7 +392,7 @@ frinZ --input YAMAGU34_HITACH32_yyyydddhhmmss.cor \
 
 `frinZ --contamination` は元 `.cor` を解析し、flux が複素コンタミモデルを推定するための `*_contamination.npz` handoff を作成します。この初回解析では天体信号を減算しません。次に `flux --contamination` がC/Xそれぞれ通常出力と同じprefixの `obscode_***_{c,x}_contamisubt_model.npz` を生成し、元 `.cor` は読みません。最後に `frinZ --input ORIGINAL.cor --contamination-subtract MODEL.npz`（別名 `--contamisubt`）が元 `.cor` と補正テーブルを同時に読み、private copy-on-writeメモリ上で減算して通常解析を続けます。元 `.cor` は維持し、`*_contamisubt.cor` は生成しません。減算解析も通常解析と同じ元 `.cor` 親の `frinZ/` 配下へ保存し、親直下に `contamisubt/` は作りません。出力名はproduct名の後に `_contamisubt` を付けて区別します。
 
-`--raw-visibility` の出力ディレクトリは `frinZ/rawvis/`、ファイル名は `_rawvis` 接尾辞です。raw visibilityは `.cor` 読み込み直後のrow-major `[sector,channel]` で、ACF規格化、rebin、padding、bandpass補正より前の値です。`--delay` または `--rate`（両方可）を指定すると、元データ図に加えて同じ補正を全時間・全周波数セルへ適用した `*_rawvis_corrected_delay_rate_heatmap_{amp,phase}.png` を出力します。
+`--raw-visibility` の出力ディレクトリは `frinZ/rawvis/`、ファイル名は `_rawvis` 接尾辞です。raw visibilityは `.cor` 読み込み直後のrow-major `[sector,channel]` で、ACF規格化、rebin、padding、bandpass補正より前の値です。`--delay` または `--rate`（両方可）を指定すると、元データ図に加えて同じ補正を全時間・全周波数セルへ適用した `*_rawvis_corrected_delay_rate_heatmap_{amp,phase}.png` を出力します。 `--npz` を付けると `*_rawvis.npz` に `freq`/`frequency_mhz`（MHz）、`time_sec`、`phase`（rad、[time,channel]）、`phase_deg`、複素 `visibility` を保存します。
 
 fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v5はC/X別ファイルで、direct arrayを保持せず、gain複素スペクトル、各sectorの時刻・幾何遅延、周波数軸、フラックス比、窓ごとの複素規格化係数だけを小容量テーブルとして保持します。frinZ `--contamisubt` は元 `.cor` のcopy-on-writeビュー上で同じ補正量を再構成して減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
 

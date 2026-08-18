@@ -5,13 +5,48 @@ use std::path::Path;
 
 use crate::args::Args;
 use crate::fft::apply_phase_correction_in_place_at_frequency;
-use crate::header::parse_header;
+use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
-use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
+use crate::npy_output::{NamedNpz, NpyMeta};
 use crate::plot;
 use crate::read::read_visibility_data;
 use num_complex::Complex;
 type C32 = Complex<f32>;
+
+fn add_visibility_analysis_arrays(
+    npz: &mut NamedNpz,
+    spectra: &[Vec<C32>],
+    header: &CorHeader,
+    effective_integ_time: f32,
+) -> Result<(), Box<dyn Error>> {
+    let rows = spectra.len();
+    let cols = spectra.first().map_or(0, Vec::len);
+    if rows == 0 || cols == 0 || spectra.iter().any(|row| row.len() != cols) {
+        return Err("raw visibility NPZ has inconsistent dimensions".into());
+    }
+    let rbw_mhz = header.sampling_speed as f64 / header.fft_point as f64 / 1.0e6;
+    let frequency_mhz: Vec<f64> = (0..cols).map(|channel| channel as f64 * rbw_mhz).collect();
+    let time_sec: Vec<f64> = (0..rows)
+        .map(|row| row as f64 * effective_integ_time as f64)
+        .collect();
+    let phase_rad = spectra
+        .iter()
+        .flat_map(|row| row.iter().map(|value| value.arg()))
+        .collect::<Vec<f32>>();
+    let phase_deg = phase_rad
+        .iter()
+        .map(|phase| phase.to_degrees())
+        .collect::<Vec<f32>>();
+
+    // Keep short, analysis-friendly names and explicit aliases for scripts
+    // that prefer units in the key name.
+    npz.add_f64_1d("freq", &frequency_mhz);
+    npz.add_f64_1d("frequency_mhz", &frequency_mhz);
+    npz.add_f64_1d("time_sec", &time_sec);
+    npz.add_f32_2d("phase", (rows, cols), phase_rad)?;
+    npz.add_f32_2d("phase_deg", (rows, cols), phase_deg)?;
+    Ok(())
+}
 
 /// Executes the raw visibility plotting.
 pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
@@ -156,15 +191,21 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
             let channel_axis: Vec<f64> = (0..cols).map(|index| index as f64).collect();
             corrected_npz.add_f64_1d("sector_index", &time_axis);
             corrected_npz.add_f64_1d("channel_index", &channel_axis);
+            add_visibility_analysis_arrays(
+                &mut corrected_npz,
+                &corrected_spectra,
+                &header,
+                effective_integ_time,
+            )?;
             corrected_npz.add_complex64_2d(
                 "visibility",
                 (rows, cols),
                 corrected_spectra.iter().flatten().copied(),
             )?;
-            corrected_npz.write(&npz_sidecar_path(
-                &corrected_phase_heatmap_filepath,
-                &correction_flag,
-            ))?;
+            let corrected_npz_path =
+                output_dir.join(format!("{}_rawvis_corrected_delay_rate.npz", base_filename));
+            corrected_npz.write(&corrected_npz_path)?;
+            println!("Corrected raw visibility NPZ: {:?}", corrected_npz_path);
         }
     }
     if args.npz && rows > 0 && cols > 0 && all_spectra.iter().all(|row| row.len() == cols) {
@@ -177,12 +218,15 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         ));
         npz.add_f64_1d("sector_index", &time_axis);
         npz.add_f64_1d("channel_index", &channel_axis);
+        add_visibility_analysis_arrays(&mut npz, &all_spectra, &header, effective_integ_time)?;
         npz.add_complex64_2d(
             "visibility",
             (rows, cols),
             all_spectra.iter().flatten().copied(),
         )?;
-        npz.write(&npz_sidecar_path(&amp_heatmap_filepath, "rawvis"))?;
+        let raw_npz_path = output_dir.join(format!("{}_rawvis.npz", base_filename));
+        npz.write(&raw_npz_path)?;
+        println!("Raw visibility NPZ: {:?}", raw_npz_path);
     }
 
     Ok(())

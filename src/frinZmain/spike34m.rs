@@ -811,12 +811,10 @@ fn apply_global_and_safe_spike_correction(
         0.0
     };
     let mut flat: Vec<C32> = spectra.iter().flat_map(|row| row.iter().copied()).collect();
-    // Keep the measured time/rate fringe term visible in --spike34
-    // diagnostics; only the common delay is removed here.
     apply_phase_correction_in_place_at_frequency(
         &mut flat,
         cols,
-        0.0,
+        rate,
         delay,
         0.0,
         0.0,
@@ -1093,13 +1091,21 @@ fn apply_interval_delay_rate_correction(
     let cols = spectra[0].len();
     let mut corrected_flat: Vec<C32> = spectra.iter().flat_map(|row| row.iter().copied()).collect();
 
-    // The full-band search has supplied the common solution.  Only the
-    // interval residual frequency-dependent phase offset
-    // (delay).  The residual time-rate term is deliberately not applied so
-    // the YAMAGU34 spike-induced rate splitting remains visible.  Apply the
-    // delay model directly to every visibility cell.  A sub-band FFT
+    // The full-band search has already removed the common delay/rate.  What
+    // remains is the interval residual model: a fitted frequency-dependent
+    // phase offset plus the residual time rate measured per channel.  Apply
+    // that model directly to every visibility cell.  A sub-band FFT
     // correction followed by restoring the interval mean would cancel the
     // phase jump at a YAMAGU34 spike that this operation is meant to remove.
+    let common_rate_hz = median(
+        diagnostics
+            .rate_hz
+            .iter()
+            .enumerate()
+            .filter(|(idx, rate)| diagnostics.reliable[*idx] && rate.is_finite())
+            .map(|(_, rate)| *rate)
+            .collect(),
+    );
     for interval in intervals {
         let start = interval.start_channel;
         let end = interval.end_channel;
@@ -1120,16 +1126,45 @@ fn apply_interval_delay_rate_correction(
         if indexes.len() < 2 {
             continue;
         }
+        let interval_rate_hz = median(
+            indexes
+                .iter()
+                .map(|&idx| diagnostics.rate_hz[idx])
+                .collect(),
+        );
+        let target_rate_residual = interval_rate_hz - common_rate_hz;
+        let smoothed_interval_rate = median(
+            indexes
+                .iter()
+                .map(|&idx| diagnostics.rate_residual_hz[idx])
+                .filter(|rate| rate.is_finite())
+                .collect(),
+        );
         for row in 0..rows {
+            let time = row as f64 * effective_integ_time as f64;
             for ch in start..=end {
                 let phase_offset =
                     diagnostics.interval_phase_fit_rad[ch] - diagnostics.global_phase_fit_rad[ch];
                 if !phase_offset.is_finite() {
                     continue;
                 }
-                // No rate term is applied here.  The residual time slope is
-                // intentionally retained for observing the spike effect.
-                let phase = phase_offset;
+                // Use the frequency-smoothed per-channel residual rate rather
+                // than one independently searched rate for the whole interval.
+                // The latter leaves a staircase/jagged rate pattern between
+                // YAMAGU34 spikes because weak channels and RFI perturb each
+                // sub-band's median. Keep the interval search as a fallback
+                // for channels that did not yield a reliable time fit.
+                let rate_hz = if diagnostics.rate_residual_hz[ch].is_finite()
+                    && smoothed_interval_rate.is_finite()
+                    && common_rate_hz.is_finite()
+                {
+                    // Preserve the independently measured interval median and
+                    // replace only its channel-to-channel jagged component.
+                    diagnostics.rate_residual_hz[ch] + target_rate_residual - smoothed_interval_rate
+                } else {
+                    target_rate_residual
+                };
+                let phase = phase_offset + 2.0 * std::f64::consts::PI * rate_hz * time;
                 let factor = C32::new((-phase).cos() as f32, (-phase).sin() as f32);
                 corrected_flat[row * cols + ch] *= factor;
             }

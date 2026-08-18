@@ -720,14 +720,17 @@ pub fn process_cor_file(
                 None,
             )?;
             let fullband_delay = fullband.analysis_results.residual_delay;
+            let fullband_rate = if physical_length > 1 {
+                fullband.analysis_results.residual_rate
+            } else {
+                0.0
+            };
             spike34_applied_delay = fullband_delay;
-            // --spike34 deliberately leaves the time/rate fringe term intact
-            // so the YAMAGU34-induced rate splitting remains observable.
-            spike34_applied_rate = 0.0;
+            spike34_applied_rate = fullband_rate;
             apply_phase_correction_in_place_at_frequency(
                 &mut complex_vec,
                 fft_point_half_used,
-                0.0,
+                fullband_rate,
                 fullband_delay,
                 0.0,
                 0.0,

@@ -19,6 +19,21 @@
   --skip <SEC>                       冒頭スキップ
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
+  --rfi histogram                     積分窓ごとに遅延–レート histogram/Rayleigh fit を実行
+                                      histogram の解析結果だけを frinZ/rfi/ 配下へ出力
+                                      結果は *_hist.{png,tsv,npz} と、Zig 互換の
+                                      *_hist_linear/logy/logx/logxy.png、
+                                      *_hist_imshow/imshow_rfi.png を同じ frinZ/rfi/ に出力
+                                      数値範囲指定との併用可。最強ピークの連結天体成分は
+                                      Rayleigh fit/閾値統計から除外し、図では別クラス表示。
+                                      rate=0 の通常周波数スペクトル行は天体保護のためマスク適用外。
+                                      fringe peak の delay 列・rate 行は天体(cyan cross)として
+                                      fit/マスク対象外
+  --rayleigh-count N                   Rayleigh tail count（既定値 1）。大きい値ほど
+                                      RFI 判定閾値が下がる。histogram と併用。
+  --rfi MASK.npz                     noise-histogram NPZ の RFI セルを 0+0j に置換
+       NPZ の ifft_rfi_frequency_mask / ifft_rfi_frequency_coordinates は
+       周波数-rate 平面、rfi_mask は delay-rate 平面として読み込みます。
   --bandpass <BP.npz>                バンドパス適用 (--bptable で補正スペクトル保存)
 
   --contamination [key:value ...]
@@ -76,11 +91,16 @@
 
 [補正・フラグ]
   --delay / --rate / --acel          事前補正値
+  --mkcor                             --delay/--rate/--acel と --search で得た残差を全区間の可視度へ適用し、
+                                      入力と同じディレクトリに *_mkcor.cor を作成する。header の station2
+                                      clock delay/rate/acel（および jerk/snap）も基線補正量で更新する。
+                                      --mkcor は全区間（--len=0, --skip=0, --loop=1）専用。--search なしなら
+                                      指定した手動補正だけを適用する。
   --drange MIN MAX                   遅延探索範囲
   --rrange MIN MAX                   レート探索範囲
   --frange MIN MAX                   周波数探索/表示範囲（--frequency 用）
   --scan-correct <CSV>               start,integ,delay[samp],rate[Hz]
-  --spike34 <YAMAGU34_AUTO.cor>   YAMAGU34自己相関のspikeを検出し、spike間ごとのdelay/rate TSV、補正前後の周波数スペクトル TSV/PNG、入力phase0・spike間線形fit・raw residual・rate residualのfit/residual TSV/PNG、spike位置に白線を重ねたraw-visibility比較図を frinZ/spike34/ に出力。周波数スペクトルPNGは全帯域search前後の2系列と黒破線のspike位置を表示する。
+  --spike34 <YAMAGU34_AUTO.cor>   YAMAGU34自己相関のspikeを検出し、spike間ごとのdelay/rate TSV、補正前後の周波数スペクトル TSV/PNG、積分周波数スペクトル位相に対する全帯域search後の頑健三次基線fit・spike間fit・raw/final residual・rate residualのfit/residual TSV/PNGを frinZ/spike34/ に出力する。fit_residual.png の第3段は三次基線を除いたspike区間の定数位相オフセットを示し、search rateから換算した等価時間ずれを注記する。phase_offset.tsvにも区間ごとの位相オフセット、時間ずれ、遅延傾斜、最終残差RMSを保存する。--delay を指定した場合は、そのdelayだけを全帯域に補正し、rateを補正せずに区間の等価時間オフセット位相だけを適用した before/after ヒートマップと、spike境界位相ジャンプのTSVも出力する。さらに全帯域--search補正後にspike間delayだけを補正した時間FFTレートスペクトル（-0.05～+0.05 Hz重ね描き）と、ピーク前後2点を含む5点上に凸二次fitのTSV/PNGを出力する。周波数スペクトルPNGは全帯域search前後の2系列と黒破線のspike位置を表示する。
                                      spike34ファイルはYAMAGU34-YAMAGU34自己相関、inputとファイル名時刻yyyydddhhmmss一致、input基線にYAMAGU34を含むことを要求。
   --flagging time START END ...      時間スキップ
   --flagging pp START END ...        セクターをゼロ詰め

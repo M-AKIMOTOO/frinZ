@@ -199,6 +199,21 @@ impl NamedNpz {
         ));
     }
 
+    pub fn add_u8_2d(
+        &mut self,
+        name: &str,
+        shape: (usize, usize),
+        values: impl IntoIterator<Item = u8>,
+    ) -> io::Result<()> {
+        let values: Vec<u8> = values.into_iter().collect();
+        validate_len(values.len(), shape)?;
+        self.entries.push((
+            format!("{name}.npy"),
+            make_npy("|u1", &[shape.0, shape.1], &values),
+        ));
+        Ok(())
+    }
+
     pub fn add_complex64_1d(&mut self, name: &str, values: &[num_complex::Complex<f32>]) {
         let mut payload = Vec::with_capacity(values.len() * 8);
         for value in values {

@@ -31,7 +31,7 @@ use crate::plot::{
     delay_plane, frequency_plane, plot_dynamic_spectrum_freq, plot_dynamic_spectrum_lag,
 };
 use crate::read::read_visibility_data;
-use crate::rfi::parse_rfi_ranges;
+use crate::rfi::{detect_histogram_rfi, has_histogram_mode, parse_rfi_ranges, HistogramRfiResult};
 use crate::search;
 use crate::spike34m::{
     apply_spike_interval_residual_correction, detect_auto_spikes, read_all_spectra, SpikePeak,
@@ -283,7 +283,6 @@ pub fn process_cor_file(
     let contamination_mode = args.contamination_subtract.is_some();
     let frinz_dir = frinz_output_dir(input_path, args.in_beam);
     fs::create_dir_all(&frinz_dir)?;
-
     let original_basename = input_path.file_stem().unwrap().to_str().unwrap();
     let basename = if contamination_mode && !original_basename.ends_with("_contamisubt") {
         format!("{}_contamisubt", original_basename)
@@ -347,10 +346,6 @@ pub fn process_cor_file(
     if args.cumulate != 0 && !args.in_beam {
         let path = frinz_dir.join(format!("cumulate/len{}s", args.cumulate));
         fs::create_dir_all(&path)?;
-    }
-
-    if !args.rfi.is_empty() {
-        let _ = frinz_dir.join("rfi_history");
     }
 
     if args.add_plot && !args.in_beam {
@@ -422,9 +417,17 @@ pub fn process_cor_file(
 
     // --- RFI Handling ---
     let rfi_ranges = parse_rfi_ranges(&args.rfi, rbw)?;
-    let rfi_display = if args.rfi.is_empty() {
+    let has_rfi_npz = args
+        .rfi
+        .iter()
+        .any(|value| value.to_ascii_lowercase().ends_with(".npz"));
+    let has_rfi_histogram = has_histogram_mode(&args.rfi);
+    let rfi_active = !rfi_ranges.is_empty() || has_rfi_npz || has_rfi_histogram;
+    let rfi_display = if has_rfi_histogram {
+        "hist".to_string()
+    } else if args.rfi.is_empty() {
         "-".to_string()
-    } else if rfi_ranges.is_empty() {
+    } else if rfi_ranges.is_empty() && !has_rfi_npz {
         "(invalid)".to_string()
     } else {
         args.rfi.join(",")
@@ -776,107 +779,29 @@ pub fn process_cor_file(
 
         let primary_search_mode = args.primary_search_mode();
 
-        let (mut analysis_results, freq_rate_array, delay_rate_2d_data_comp, pre_bandpass_results) =
-            match primary_search_mode {
-                Some("peak") | Some("deep") | Some("coherent") => {
-                    // Unified fringe search path:
-                    //   peak = fast AxisThenLocal search + final local polish
-                    //   deep = full-grid hierarchical search
-                    //
-                    // Do not feed the previous solution into rate_correct/delay_correct.
-                    // It is only used as the next search seed inside run_*_search().
-                    // STFFT windows are independent; do not seed from an overlapping window.
-                    let search_seed = if stfft_plan.is_some() {
-                        None
-                    } else {
-                        prev_deep_solution
-                    };
-                    let mut search_result = if primary_search_mode == Some("deep") {
-                        search::run_deep_search(
-                            &complex_vec,
-                            &processing_header,
-                            current_length,
-                            physical_length,
-                            effective_integ_time,
-                            &current_obs_time,
-                            &file_start_time,
-                            &rfi_ranges,
-                            &bandpass_data,
-                            &loop_args,
-                            pp,
-                            loop_args.cpu,
-                            search_seed,
-                        )?
-                    } else if primary_search_mode == Some("coherent") {
-                        search::run_coherent_search(
-                            &complex_vec,
-                            &processing_header,
-                            current_length,
-                            physical_length,
-                            effective_integ_time,
-                            &current_obs_time,
-                            &file_start_time,
-                            &rfi_ranges,
-                            &bandpass_data,
-                            &loop_args,
-                            pp,
-                            loop_args.cpu,
-                            search_seed,
-                        )?
-                    } else {
-                        search::run_peak_search(
-                            &complex_vec,
-                            &processing_header,
-                            current_length,
-                            physical_length,
-                            effective_integ_time,
-                            &current_obs_time,
-                            &file_start_time,
-                            &rfi_ranges,
-                            &bandpass_data,
-                            &loop_args,
-                            pp,
-                            loop_args.cpu,
-                            search_seed,
-                        )?
-                    };
-                    search_result.analysis_results.residual_delay -= loop_args.delay_correct;
-                    search_result.analysis_results.residual_rate -= loop_args.rate_correct;
-                    // corrected_* should represent user-provided/static correction values
-                    // (e.g. --delay/--rate or scan-correct), not search-updated totals.
-                    search_result.analysis_results.corrected_delay = manual_delay_correct;
-                    search_result.analysis_results.corrected_rate = manual_rate_correct;
-                    let result_tuple = (
-                        search_result.analysis_results,
-                        search_result.freq_rate_array,
-                        search_result.delay_rate_2d_data,
-                        search_result.pre_bandpass_analysis_results,
-                    );
-
-                    if stfft_plan.is_none() {
-                        prev_deep_solution = Some((
-                            result_tuple.0.residual_delay + loop_args.delay_correct,
-                            result_tuple.0.residual_rate + loop_args.rate_correct,
-                        ));
-                    }
-
-                    result_tuple
-                }
-                _ => {
-                    // No search or other modes not handled here
-                    let (
-                        mut analysis_results,
-                        freq_rate_array,
-                        delay_rate_2d_data_comp,
-                        pre_bandpass_results,
-                    ) = run_analysis_pipeline(
+        let (
+            mut analysis_results,
+            mut freq_rate_array,
+            mut delay_rate_2d_data_comp,
+            pre_bandpass_results,
+        ) = match primary_search_mode {
+            Some("peak") | Some("deep") | Some("coherent") => {
+                // Unified fringe search path:
+                //   peak = fast AxisThenLocal search + final local polish
+                //   deep = full-grid hierarchical search
+                //
+                // Do not feed the previous solution into rate_correct/delay_correct.
+                // It is only used as the next search seed inside run_*_search().
+                // STFFT windows are independent; do not seed from an overlapping window.
+                let search_seed = if stfft_plan.is_some() {
+                    None
+                } else {
+                    prev_deep_solution
+                };
+                let mut search_result = if primary_search_mode == Some("deep") {
+                    search::run_deep_search(
                         &complex_vec,
                         &processing_header,
-                        &loop_args,
-                        None,
-                        loop_args.delay_correct,
-                        loop_args.rate_correct,
-                        loop_args.acel_correct,
                         current_length,
                         physical_length,
                         effective_integ_time,
@@ -884,19 +809,176 @@ pub fn process_cor_file(
                         &file_start_time,
                         &rfi_ranges,
                         &bandpass_data,
-                        args.plot,
-                        effective_fft_point,
-                    )?;
-                    analysis_results.length_f32 =
-                        (physical_length as f32 * effective_integ_time).ceil();
-                    (
-                        analysis_results,
-                        freq_rate_array,
-                        delay_rate_2d_data_comp,
-                        pre_bandpass_results,
-                    )
+                        &loop_args,
+                        pp,
+                        loop_args.cpu,
+                        search_seed,
+                    )?
+                } else if primary_search_mode == Some("coherent") {
+                    search::run_coherent_search(
+                        &complex_vec,
+                        &processing_header,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &rfi_ranges,
+                        &bandpass_data,
+                        &loop_args,
+                        pp,
+                        loop_args.cpu,
+                        search_seed,
+                    )?
+                } else {
+                    search::run_peak_search(
+                        &complex_vec,
+                        &processing_header,
+                        current_length,
+                        physical_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        &file_start_time,
+                        &rfi_ranges,
+                        &bandpass_data,
+                        &loop_args,
+                        pp,
+                        loop_args.cpu,
+                        search_seed,
+                    )?
+                };
+                search_result.analysis_results.residual_delay -= loop_args.delay_correct;
+                search_result.analysis_results.residual_rate -= loop_args.rate_correct;
+                // corrected_* should represent user-provided/static correction values
+                // (e.g. --delay/--rate or scan-correct), not search-updated totals.
+                search_result.analysis_results.corrected_delay = manual_delay_correct;
+                search_result.analysis_results.corrected_rate = manual_rate_correct;
+                let result_tuple = (
+                    search_result.analysis_results,
+                    search_result.freq_rate_array,
+                    search_result.delay_rate_2d_data,
+                    search_result.pre_bandpass_analysis_results,
+                );
+
+                if stfft_plan.is_none() {
+                    prev_deep_solution = Some((
+                        result_tuple.0.residual_delay + loop_args.delay_correct,
+                        result_tuple.0.residual_rate + loop_args.rate_correct,
+                    ));
                 }
+
+                result_tuple
+            }
+            _ => {
+                // No search or other modes not handled here
+                let (
+                    mut analysis_results,
+                    freq_rate_array,
+                    delay_rate_2d_data_comp,
+                    pre_bandpass_results,
+                ) = run_analysis_pipeline(
+                    &complex_vec,
+                    &processing_header,
+                    &loop_args,
+                    None,
+                    loop_args.delay_correct,
+                    loop_args.rate_correct,
+                    loop_args.acel_correct,
+                    current_length,
+                    physical_length,
+                    effective_integ_time,
+                    &current_obs_time,
+                    &file_start_time,
+                    &rfi_ranges,
+                    &bandpass_data,
+                    args.plot,
+                    effective_fft_point,
+                )?;
+                analysis_results.length_f32 =
+                    (physical_length as f32 * effective_integ_time).ceil();
+                (
+                    analysis_results,
+                    freq_rate_array,
+                    delay_rate_2d_data_comp,
+                    pre_bandpass_results,
+                )
+            }
+        };
+
+        let mut histogram_result: Option<HistogramRfiResult> = None;
+        if has_rfi_histogram {
+            let Some(freq_plane) = freq_rate_array.as_mut() else {
+                return Err("--rfi histogram requires a frequency-rate plane".into());
             };
+            let protected_rate_row = analysis_results
+                .rate_range
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    left.abs()
+                        .partial_cmp(&right.abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(index, _)| index);
+            let mut detected = detect_histogram_rfi(
+                freq_plane,
+                &delay_rate_2d_data_comp,
+                None,
+                protected_rate_row,
+                loop_args.rayleigh_count,
+            );
+            detected.delay_axis = analysis_results
+                .delay_range
+                .iter()
+                .map(|value| *value as f64)
+                .collect();
+            detected.rate_axis = analysis_results
+                .rate_range
+                .iter()
+                .map(|value| *value as f64)
+                .collect();
+            detected.frequency_axis = analysis_results
+                .freq_range
+                .iter()
+                .map(|value| *value as f64)
+                .collect();
+            // Rebuild delay-rate from the zeroed frequency-rate plane so the
+            // reported search result and all plots use the same data. Reapply
+            // the delay mask because the transform spreads a sparse mask.
+            delay_rate_2d_data_comp = process_ifft(
+                freq_plane,
+                effective_fft_point,
+                delay_rate_2d_data_comp.dim().0,
+            );
+            detected.zero_delay_rate(&mut delay_rate_2d_data_comp);
+            let old_residual_delay = analysis_results.residual_delay;
+            let old_residual_rate = analysis_results.residual_rate;
+            let old_corrected_delay = analysis_results.corrected_delay;
+            let old_corrected_rate = analysis_results.corrected_rate;
+            let old_corrected_acel = analysis_results.corrected_acel;
+            let old_corrected_jerk = analysis_results.corrected_jerk;
+            let old_corrected_snap = analysis_results.corrected_snap;
+            let mut refreshed = analyze_results(
+                freq_plane,
+                &delay_rate_2d_data_comp,
+                &processing_header,
+                current_length,
+                effective_integ_time,
+                &current_obs_time,
+                delay_rate_2d_data_comp.dim().0,
+                &loop_args,
+                primary_search_mode,
+            );
+            refreshed.residual_delay = old_residual_delay;
+            refreshed.residual_rate = old_residual_rate;
+            refreshed.corrected_delay = old_corrected_delay;
+            refreshed.corrected_rate = old_corrected_rate;
+            refreshed.corrected_acel = old_corrected_acel;
+            refreshed.corrected_jerk = old_corrected_jerk;
+            refreshed.corrected_snap = old_corrected_snap;
+            analysis_results = refreshed;
+            histogram_result = Some(detected);
+        }
 
         analysis_results.length_f32 = physical_length as f32 * effective_integ_time;
 
@@ -910,7 +992,7 @@ pub fn process_cor_file(
             &processing_header,
             &current_obs_time,
             &label_str,
-            !rfi_ranges.is_empty(),
+            rfi_active,
             args.frequency,
             args.bandpass.is_some(),
             filename_length,
@@ -923,6 +1005,17 @@ pub fn process_cor_file(
         }
         if first_output_basename.is_none() {
             first_output_basename = Some(base_filename.clone());
+        }
+
+        if let Some(histogram) = &histogram_result {
+            let rfi_dir = frinz_dir.join("rfi");
+            let (hist_png, hist_tsv, hist_npz) =
+                crate::rfi::write_histogram_products(&rfi_dir, &base_filename, histogram)?;
+            println!("# RFI histogram PNG written to {:?}", hist_png);
+            println!("# RFI histogram TSV written to {:?}", hist_tsv);
+            println!("# RFI histogram NPZ written to {:?}", hist_npz);
+            println!("# RFI histogram detail PNGs written under {:?}", rfi_dir);
+            println!("#RFI histogram: rayleigh-count={}, sigma={:.6e}, threshold={:.6e}, frequency-threshold={:.6e}, fit-cells={}, histogram-cells={}, delay-RFI cells={}, celestial cells={}, frequency-RFI cells={}", histogram.rayleigh_count, histogram.sigma, histogram.threshold, histogram.frequency_threshold, histogram.valid_count, histogram.hist_valid_count, histogram.candidate_count, histogram.celestial_count, histogram.frequency_mask.iter().filter(|value| **value).count());
         }
 
         if args.contamination.is_some() {
@@ -1031,7 +1124,7 @@ pub fn process_cor_file(
                 &processing_header,
                 &current_obs_time,
                 &label_str,
-                !rfi_ranges.is_empty(),
+                rfi_active,
                 args.frequency,
                 args.bandpass.is_some(),
                 filename_length,
@@ -1653,6 +1746,9 @@ pub fn process_cor_file(
                         heatmap_res_y,
                         args.in_beam,
                     )?;
+                    if args.rfi.is_empty() {
+                        println!("Fringe plot written to {:?}", output_filename);
+                    }
                 } else {
                     let freq_rate_array = freq_rate_array.as_ref().ok_or(
                         "--frequency が指定されているのに freq_rate_array が保持されていません",
@@ -1835,6 +1931,9 @@ pub fn process_cor_file(
                         freq_rate_array.shape()[0],
                         freq_rate_array.shape()[1],
                     )?;
+                    if args.rfi.is_empty() {
+                        println!("Fringe plot written to {:?}", output_filename);
+                    }
                 }
             }
         }
@@ -1997,14 +2096,44 @@ pub(crate) fn run_analysis_pipeline(
         )
     };
 
-    let skip_delay_rate_ifft = base_args.frequency && base_args.drange.is_empty();
+    // An imported NPZ mask is defined in physical frequency-rate coordinates.
+    // Apply it after the time FFT, before search/noise estimation, so marked
+    // cells are exactly 0+0j rather than merely excluded from a plot.
+    if let Some(mask) = base_args.rfi_npz_mask.as_deref() {
+        let (frequency_count, rate_count) = freq_rate_array.dim();
+        if let Some(values) = freq_rate_array.as_slice_mut() {
+            mask.apply_frequency_rate(
+                values,
+                frequency_count,
+                rate_count,
+                header.sampling_speed,
+                effective_fft_point,
+                effective_integ_time,
+            );
+        }
+    }
+
+    let skip_delay_rate_ifft =
+        base_args.frequency && base_args.drange.is_empty() && !has_histogram_mode(&base_args.rfi);
 
     let pre_bandpass_analysis_results = if keep_pre_bandpass_results && bandpass_data.is_some() {
-        let pre_bandpass_delay_rate_2d_data_comp = if skip_delay_rate_ifft {
+        let mut pre_bandpass_delay_rate_2d_data_comp = if skip_delay_rate_ifft {
             Array2::zeros((1, 1))
         } else {
             process_ifft(&freq_rate_array, effective_fft_point, padding_length)
         };
+        if let Some(mask) = base_args.rfi_npz_mask.as_deref() {
+            let (rate_count, delay_count) = pre_bandpass_delay_rate_2d_data_comp.dim();
+            if let Some(values) = pre_bandpass_delay_rate_2d_data_comp.as_slice_mut() {
+                mask.apply_delay_rate(
+                    values,
+                    rate_count,
+                    delay_count,
+                    effective_integ_time,
+                    effective_fft_point,
+                );
+            }
+        }
         Some(analyze_results(
             &freq_rate_array,
             &pre_bandpass_delay_rate_2d_data_comp,
@@ -2024,11 +2153,23 @@ pub(crate) fn run_analysis_pipeline(
         apply_bandpass_correction(&mut freq_rate_array, bp_data);
     }
 
-    let delay_rate_2d_data_comp = if skip_delay_rate_ifft {
+    let mut delay_rate_2d_data_comp = if skip_delay_rate_ifft {
         Array2::zeros((1, 1))
     } else {
         process_ifft(&freq_rate_array, effective_fft_point, padding_length)
     };
+    if let Some(mask) = base_args.rfi_npz_mask.as_deref() {
+        let (rate_count, delay_count) = delay_rate_2d_data_comp.dim();
+        if let Some(values) = delay_rate_2d_data_comp.as_slice_mut() {
+            mask.apply_delay_rate(
+                values,
+                rate_count,
+                delay_count,
+                effective_integ_time,
+                effective_fft_point,
+            );
+        }
+    }
 
     let analysis_results = analyze_results(
         &freq_rate_array,
@@ -2044,7 +2185,7 @@ pub(crate) fn run_analysis_pipeline(
 
     Ok((
         analysis_results,
-        base_args.frequency.then_some(freq_rate_array),
+        (base_args.frequency || has_histogram_mode(&base_args.rfi)).then_some(freq_rate_array),
         delay_rate_2d_data_comp,
         pre_bandpass_analysis_results,
     ))

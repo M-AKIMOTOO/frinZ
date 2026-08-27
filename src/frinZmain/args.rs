@@ -2,6 +2,9 @@ use clap::{ArgAction, Command, CommandFactory, Parser};
 use std::error::Error;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::rfi::RfiMask;
 
 use crate::header::parse_header;
 use crate::input_support::read_input_prefix;
@@ -183,9 +186,17 @@ pub struct Args {
     #[arg(long, default_value_t = 0, value_name = "HOPS")]
     pub stfft: i32,
 
-    /// RFI ranges.
-    #[arg(long, num_args = 1.., value_name = "MIN,MAX")]
+    /// RFI ranges (MIN,MAX), histogram, or an RFI mask NPZ file.
+    #[arg(long, num_args = 1.., value_name = "MIN,MAX|NPZ")]
     pub rfi: Vec<String>,
+
+    /// Rayleigh tail count used by `--rfi histogram` (larger values lower the threshold).
+    #[arg(long = "rayleigh-count", default_value_t = 1, value_name = "N")]
+    pub rayleigh_count: u64,
+
+    /// Loaded NPZ mask used internally; not a command-line option.
+    #[arg(skip)]
+    pub rfi_npz_mask: Option<Arc<RfiMask>>,
 
     /// Plot figures.
     #[arg(long)]
@@ -198,6 +209,10 @@ pub struct Args {
     /// Save raw visibility BIN.
     #[arg(long)]
     pub cor2bin: bool,
+
+    /// Write a phase-corrected .cor file.
+    #[arg(long)]
+    pub mkcor: bool,
 
     /// Save cross spectrum NPZ.
     #[arg(long)]
@@ -415,9 +430,12 @@ impl Default for Args {
             loop_: 1,
             stfft: 0,
             rfi: Vec::new(),
+            rayleigh_count: 1,
+            rfi_npz_mask: None,
             plot: false,
             frequency: false,
             cor2bin: false,
+            mkcor: false,
             spectrum: false,
             output: false,
             npz: false,

@@ -2239,6 +2239,7 @@ fn draw_heatmap_with_colorbar(
     data: &Vec<Vec<f32>>,
     x_desc: &str,
     y_desc: &str,
+    y_label_formatter: impl Fn(&usize) -> String,
     color_bar_title: &str,
     min_val: f32,
     max_val: f32,
@@ -2279,7 +2280,7 @@ fn draw_heatmap_with_colorbar(
         .x_label_style(("sans-serif", 18).into_font())
         .y_label_style(("sans-serif", 18).into_font())
         .x_label_formatter(&|v| format!("{v}"))
-        .y_label_formatter(&|v| format!("{v}"))
+        .y_label_formatter(&y_label_formatter)
         .draw()?;
 
     chart.draw_series(
@@ -2412,6 +2413,7 @@ pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
         &blurred_amplitudes,
         "Channels",
         "PP",
+        |v| format!("{v}"),
         "Amplitude (a.u.)",
         min_amp,
         max_amp,
@@ -2439,6 +2441,7 @@ pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
         &blurred_phases,
         "Channels",
         "PP",
+        |v| format!("{v}"),
         "Phase (deg)",
         -180.0,
         180.0,
@@ -2486,6 +2489,7 @@ pub fn plot_spectrum_amplitude_heatmap<P: AsRef<Path>>(
         &blurred_amplitudes,
         "Channels",
         "PP",
+        |v| format!("{v}"),
         "Amplitude (a.u.)",
         min_amp,
         max_amp,
@@ -2529,6 +2533,7 @@ pub fn plot_spectrum_phase_heatmap<P: AsRef<Path>>(
         &blurred_phases,
         "Channels",
         "PP",
+        |v| format!("{v}"),
         "Phase (deg)",
         -180.0,
         180.0,
@@ -3960,12 +3965,97 @@ pub fn plot_spike34_frequency_spectrum_with_phase<P: AsRef<Path>>(
     Ok(())
 }
 
+pub fn plot_spike34_delay_time_offset_phase_heatmap<P: AsRef<Path>>(
+    output_path: P,
+    before: &[Vec<Complex<f32>>],
+    after: &[Vec<Complex<f32>>],
+    effective_integ_time: f32,
+    delay_sample: f32,
+    reference_rate_hz: f32,
+    spike_channels: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if before.is_empty()
+        || after.is_empty()
+        || before[0].is_empty()
+        || before.len() != after.len()
+        || before[0].len() != after[0].len()
+        || before.iter().any(|row| row.len() != before[0].len())
+        || after.iter().any(|row| row.len() != after[0].len())
+    {
+        return Err("spike34 delay/time-offset heatmap has inconsistent dimensions".into());
+    }
+    let root = BitMapBackend::new(output_path.as_ref(), (1400, 1120)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let (before_area, after_area) = root.split_vertically(560);
+    let before_plot = before_area.margin(42, 0, 0, 0);
+    let after_plot = after_area.margin(42, 0, 0, 0);
+    before_area.draw(&Text::new(
+        format!(
+            "Before: --delay {delay_sample:.3} sample (rate preserved; R={reference_rate_hz:.6e} Hz)"
+        ),
+        (20, 25),
+        ("sans-serif", 26).into_font(),
+    ))?;
+    after_area.draw(&Text::new(
+        "After: interval phase shifted by equivalent time offsets (rate not corrected)",
+        (20, 25),
+        ("sans-serif", 26).into_font(),
+    ))?;
+    let time_formatter = |v: &usize| format!("{:.0}", *v as f32 * effective_integ_time);
+    let make_phase = |data: &[Vec<Complex<f32>>]| -> Vec<Vec<f32>> {
+        data.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| safe_arg(value).to_degrees())
+                    .collect()
+            })
+            .collect()
+    };
+    let before_phase = gaussian_blur_2d(&make_phase(before), 0.0);
+    let after_phase = gaussian_blur_2d(&make_phase(after), 0.0);
+    draw_heatmap_with_colorbar(
+        &before_plot,
+        &before_phase,
+        "Channels",
+        "Elapsed time [s]",
+        time_formatter,
+        "Phase (deg)",
+        -180.0,
+        180.0,
+        9,
+        |v| ((v + 180.0) / 360.0) as f64,
+        |v| format!("{v:.0}"),
+        spike_channels,
+    )?;
+    let after_time_formatter = |v: &usize| format!("{:.0}", *v as f32 * effective_integ_time);
+    draw_heatmap_with_colorbar(
+        &after_plot,
+        &after_phase,
+        "Channels",
+        "Elapsed time [s]",
+        after_time_formatter,
+        "Phase (deg)",
+        -180.0,
+        180.0,
+        9,
+        |v| ((v + 180.0) / 360.0) as f64,
+        |v| format!("{v:.0}"),
+        spike_channels,
+    )?;
+    root.present()?;
+    compress_png(output_path.as_ref());
+    Ok(())
+}
+
 pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
     output_path: P,
     frequency_mhz: &[f64],
     phase0_unwrapped_deg: &[f32],
     global_fit_deg: &[f32],
     interval_fit_deg: &[f32],
+    interval_delay_only_deg: &[f32],
+    interval_phase_offset_deg: &[f32],
+    interval_time_offset_s: &[f32],
     raw_phase_residual_deg: &[f32],
     final_phase_residual_deg: &[f32],
     raw_rate_residual_hz: &[f32],
@@ -3977,6 +4067,9 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
         || phase0_unwrapped_deg.len() != n
         || global_fit_deg.len() != n
         || interval_fit_deg.len() != n
+        || interval_delay_only_deg.len() != n
+        || interval_phase_offset_deg.len() != n
+        || interval_time_offset_s.len() != n
         || raw_phase_residual_deg.len() != n
         || final_phase_residual_deg.len() != n
         || raw_rate_residual_hz.len() != n
@@ -4001,6 +4094,9 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
     let phase0_series = to_series(phase0_unwrapped_deg);
     let fit_series = to_series(global_fit_deg);
     let interval_fit_series = to_series(interval_fit_deg);
+    let delay_only_series = to_series(interval_delay_only_deg);
+    let offset_series = to_series(interval_phase_offset_deg);
+    let time_offset_series = to_series(interval_time_offset_s);
     let residual_series = to_series(raw_phase_residual_deg);
     let final_residual_series = to_series(final_phase_residual_deg);
     let raw_rate_residual_series = to_series(raw_rate_residual_hz);
@@ -4017,13 +4113,20 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
         let margin = ((max_value - min_value) * 0.10).max(min_margin);
         (min_value - margin, max_value + margin)
     };
-    let (phase_min, phase_max) = bounds(&phase0_series, (-180.0, 180.0), 5.0);
+    let phase_bounds_series: Vec<(f64, f32)> = phase0_series
+        .iter()
+        .chain(fit_series.iter())
+        .chain(interval_fit_series.iter())
+        .copied()
+        .collect();
+    let (phase_min, phase_max) = bounds(&phase_bounds_series, (-180.0, 180.0), 5.0);
     let residual_bounds_series: Vec<(f64, f32)> = residual_series
         .iter()
         .chain(final_residual_series.iter())
         .copied()
         .collect();
     let (res_min, res_max) = bounds(&residual_bounds_series, (-10.0, 10.0), 1.0);
+    let offset_bounds = bounds(&offset_series, (-10.0, 10.0), 1.0);
     let rate_bounds_series: Vec<(f64, f32)> = raw_rate_residual_series
         .iter()
         .chain(smoothed_rate_residual_series.iter())
@@ -4031,76 +4134,138 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
         .collect();
     let (rate_min, rate_max) = bounds(&rate_bounds_series, (-1.0e-3, 1.0e-3), 1.0e-6);
 
-    let root = BitMapBackend::new(output_path.as_ref(), (1200, 1050)).into_drawing_area();
+    let root = BitMapBackend::new(output_path.as_ref(), (1400, 1400)).into_drawing_area();
     root.fill(&WHITE)?;
-    let (phase_area, remainder) = root.split_vertically(350);
-    let (residual_area, rate_area) = remainder.split_vertically(350);
-
-    let mut phase_chart = ChartBuilder::on(&phase_area)
+    let areas = root.split_evenly((4, 1));
+    let mut phase_chart = ChartBuilder::on(&areas[0])
         .caption(
-            "Spike34 interval phase fit and residual",
+            "Spike34 frequency-spectrum phase: cubic baseline and interval fit",
             ("sans-serif", 30).into_font(),
         )
         .margin(14)
         .x_label_area_size(4)
-        .y_label_area_size(115)
+        .y_label_area_size(125)
         .build_cartesian_2d(x_range.clone(), phase_min..phase_max)?;
     phase_chart
         .configure_mesh()
         .disable_mesh()
         .x_labels(0)
-        .y_desc("Input phase0 [deg]")
+        .y_desc("Fringe phase [deg]")
         .label_style(("sans-serif", 24).into_font())
         .y_label_formatter(&|value| format!("{value:.0}"))
         .axis_style(BLACK.stroke_width(2))
         .draw()?;
     phase_chart
         .draw_series(LineSeries::new(phase0_series, GREEN.stroke_width(2)))?
-        .label("Input phase0 (unwrapped)")
+        .label("Integrated spectrum phase")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], GREEN.stroke_width(2)));
     phase_chart
-        .draw_series(LineSeries::new(fit_series, BLUE.stroke_width(2)))?
-        .label("Global full-band linear fit")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(2)));
+        .draw_series(LineSeries::new(fit_series, BLUE.stroke_width(3)))?
+        .label("Global robust cubic fit")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(3)));
     phase_chart
         .draw_series(LineSeries::new(
             interval_fit_series,
             MAGENTA.stroke_width(2),
         ))?
-        .label("Per-interval fit")
+        .label("Per-interval fit (cubic + delay + intercept)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], MAGENTA.stroke_width(2)));
 
-    let mut residual_chart = ChartBuilder::on(&residual_area)
+    let mut residual_chart = ChartBuilder::on(&areas[1])
         .margin(14)
         .x_label_area_size(4)
-        .y_label_area_size(115)
+        .y_label_area_size(125)
         .build_cartesian_2d(x_range.clone(), res_min..res_max)?;
     residual_chart
         .configure_mesh()
         .disable_mesh()
         .x_labels(0)
-        .y_desc("Residual [deg]")
+        .y_desc("Phase residual [deg]")
         .label_style(("sans-serif", 24).into_font())
         .y_label_formatter(&|value| format!("{value:.0}"))
         .axis_style(BLACK.stroke_width(2))
         .draw()?;
-    residual_chart.draw_series(std::iter::once(PathElement::new(
-        vec![(x_min, 0.0f32), (x_max, 0.0f32)],
-        BLACK.mix(0.45).stroke_width(1),
-    )))?;
     residual_chart
         .draw_series(LineSeries::new(residual_series, RED.stroke_width(2)))?
-        .label("Raw residual (input - global fit)")
+        .label("Raw = spectrum phase − cubic baseline")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], RED.stroke_width(2)));
     residual_chart
         .draw_series(LineSeries::new(final_residual_series, BLUE.stroke_width(2)))?
-        .label("Final residual (input - interval fit)")
+        .label("After interval delay + intercept fit")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(2)));
 
-    let mut rate_chart = ChartBuilder::on(&rate_area)
+    let mut offset_chart = ChartBuilder::on(&areas[2])
+        .margin(14)
+        .x_label_area_size(4)
+        .y_label_area_size(125)
+        .build_cartesian_2d(x_range.clone(), offset_bounds.0..offset_bounds.1)?;
+    offset_chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_labels(0)
+        .y_desc("Interval constant phase offset [deg]")
+        .label_style(("sans-serif", 24).into_font())
+        .y_label_formatter(&|value| format!("{value:.0}"))
+        .axis_style(BLACK.stroke_width(2))
+        .draw()?;
+    offset_chart
+        .draw_series(LineSeries::new(offset_series, MAGENTA.stroke_width(3)))?
+        .label("Intercept after cubic baseline (delay-only stage leaves this)")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], MAGENTA.stroke_width(3)));
+    offset_chart
+        .draw_series(LineSeries::new(
+            delay_only_series,
+            BLUE.mix(0.65).stroke_width(1),
+        ))?
+        .label("Cubic + delay-only fit")
+        .legend(|(x, y)| {
+            PathElement::new(vec![(x, y), (x + 28, y)], BLUE.mix(0.65).stroke_width(1))
+        });
+    // Annotate each interval with the equivalent time offset.  The value is
+    // derived from phase_offset/(2*pi*common_rate) and is also written to TSV.
+    for &spike_frequency in spike_frequencies_mhz {
+        if spike_frequency < x_min || spike_frequency > x_max {
+            continue;
+        }
+        offset_chart.draw_series(std::iter::once(PathElement::new(
+            vec![
+                (spike_frequency, offset_bounds.0),
+                (spike_frequency, offset_bounds.1),
+            ],
+            BLACK.stroke_width(2),
+        )))?;
+    }
+    let mut interval_time_labels = Vec::new();
+    let mut previous = x_min;
+    for &spike_frequency in spike_frequencies_mhz.iter().chain(std::iter::once(&x_max)) {
+        let center = 0.5 * (previous + spike_frequency);
+        let values: Vec<f32> = frequency_mhz
+            .iter()
+            .zip(&time_offset_series)
+            .filter_map(|(&frequency, &(_, value))| {
+                (frequency >= previous && frequency <= spike_frequency && value.is_finite())
+                    .then_some(value)
+            })
+            .collect();
+        if !values.is_empty() {
+            let time = values.iter().copied().sum::<f32>() / values.len() as f32;
+            let phase = 0.5 * (offset_bounds.0 + offset_bounds.1);
+            interval_time_labels.push((center, phase, time));
+        }
+        previous = spike_frequency;
+    }
+    for (x, y, time) in interval_time_labels {
+        offset_chart.draw_series(std::iter::once(Text::new(
+            format!("{time:+.2} s"),
+            (x, y),
+            ("sans-serif", 18).into_font(),
+        )))?;
+    }
+
+    let mut rate_chart = ChartBuilder::on(&areas[3])
         .margin(14)
         .x_label_area_size(60)
-        .y_label_area_size(115)
+        .y_label_area_size(125)
         .build_cartesian_2d(x_range.clone(), rate_min..rate_max)?;
     rate_chart
         .configure_mesh()
@@ -4113,16 +4278,12 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
         .y_label_formatter(&|value| format!("{value:.3e}"))
         .axis_style(BLACK.stroke_width(2))
         .draw()?;
-    rate_chart.draw_series(std::iter::once(PathElement::new(
-        vec![(x_min, 0.0f32), (x_max, 0.0f32)],
-        BLACK.mix(0.45).stroke_width(1),
-    )))?;
     rate_chart
         .draw_series(LineSeries::new(
             raw_rate_residual_series,
             RED.mix(0.55).stroke_width(1),
         ))?
-        .label("Raw rate residual (per-channel)")
+        .label("Raw rate residual (per channel)")
         .legend(|(x, y)| {
             PathElement::new(vec![(x, y), (x + 28, y)], RED.mix(0.55).stroke_width(1))
         });
@@ -4131,21 +4292,22 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
             smoothed_rate_residual_series,
             BLUE.stroke_width(3),
         ))?
-        .label("Applied smoothed rate residual")
+        .label("Smoothed rate residual (not applied in delay-only validation)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], BLUE.stroke_width(3)));
 
-    for chart_kind in 0..3 {
+    for chart_kind in 0..4 {
         let (y_min, y_max) = match chart_kind {
             0 => (phase_min, phase_max),
             1 => (res_min, res_max),
+            2 => offset_bounds,
             _ => (rate_min, rate_max),
         };
-        let step = ((y_max - y_min) / 40.0).max(1.0e-12);
-        let mut lines = Vec::new();
         for &frequency in spike_frequencies_mhz {
             if frequency < x_min || frequency > x_max {
                 continue;
             }
+            let mut lines = Vec::new();
+            let step = ((y_max - y_min) / 40.0).max(1.0e-12);
             for segment in 0..20 {
                 let y0 = y_min + segment as f32 * step * 2.0;
                 let y1 = (y0 + step).min(y_max);
@@ -4154,19 +4316,25 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
                     BLACK.stroke_width(2),
                 ));
             }
+            match chart_kind {
+                0 => phase_chart.draw_series(lines)?,
+                1 => residual_chart.draw_series(lines)?,
+                2 => offset_chart.draw_series(lines)?,
+                _ => rate_chart.draw_series(lines)?,
+            };
         }
-        match chart_kind {
-            0 => phase_chart.draw_series(lines)?,
-            1 => residual_chart.draw_series(lines)?,
-            _ => rate_chart.draw_series(lines)?,
-        };
     }
-    for chart in [&mut phase_chart, &mut residual_chart, &mut rate_chart] {
+    for chart in [
+        &mut phase_chart,
+        &mut residual_chart,
+        &mut offset_chart,
+        &mut rate_chart,
+    ] {
         chart
             .configure_series_labels()
             .background_style(WHITE.mix(0.9))
             .border_style(BLACK.stroke_width(2))
-            .label_font(("sans-serif", 20).into_font())
+            .label_font(("sans-serif", 18).into_font())
             .draw()?;
     }
     root.present()?;
@@ -4208,6 +4376,7 @@ pub fn plot_spectrum_amplitude_heatmap_with_spikes<P: AsRef<Path>>(
         &blurred_amplitudes,
         "Channels",
         "PP",
+        |v| format!("{v}"),
         "Amplitude (a.u.)",
         min_amp,
         max_amp,
@@ -4252,6 +4421,7 @@ pub fn plot_spectrum_phase_heatmap_with_spikes<P: AsRef<Path>>(
         &blurred_phases,
         "Channels",
         "PP",
+        |v| format!("{v}"),
         "Phase (deg)",
         -180.0,
         180.0,

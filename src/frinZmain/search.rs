@@ -726,7 +726,7 @@ mod deep {
             rate_padding: u32,
         ) -> (Array2<C32>, usize) {
             let rate_padding = rate_padding.max(1);
-            if rate == 0.0
+            let (mut freq_rate_array, padding_length) = if rate == 0.0
                 && delay == 0.0
                 && self.args.acel_correct == 0.0
                 && self.args.jerk_correct == 0.0
@@ -757,7 +757,21 @@ mod deep {
                     self.start_time_offset_sec,
                     self.header.observing_frequency,
                 )
+            };
+            if let Some(mask) = self.args.rfi_npz_mask.as_deref() {
+                let (frequency_count, rate_count) = freq_rate_array.dim();
+                if let Some(values) = freq_rate_array.as_slice_mut() {
+                    mask.apply_frequency_rate(
+                        values,
+                        frequency_count,
+                        rate_count,
+                        self.header.sampling_speed,
+                        self.effective_fft_point,
+                        self.effective_integ_time,
+                    );
+                }
             }
+            (freq_rate_array, padding_length)
         }
 
         fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
@@ -773,6 +787,7 @@ mod deep {
                 || self.args.raw_visibility
                 || self.args.npz
                 || self.args.contamination.is_some()
+                || crate::rfi::has_histogram_mode(&self.args.rfi)
         }
 
         fn apply_bandpass(&self, freq_rate_array: &mut Array2<C32>) {
@@ -804,61 +819,67 @@ mod deep {
             let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point];
             let ifft = cached_fft_plan(fft_point, true);
 
-            let mut scan = |mean: Option<(f64, f64)>| {
-                let mut sum_re = 0.0f64;
-                let mut sum_im = 0.0f64;
-                let mut noise_sum = 0.0f64;
-                let mut count = 0usize;
-                let mut max_power = -1.0f32;
-                let mut max_delay = 0.0f32;
-                let mut max_rate = 0.0f32;
-                let mut max_value = C32::new(0.0, 0.0);
+            let mut scan =
+                |mean: Option<(f64, f64)>| {
+                    let mut sum_re = 0.0f64;
+                    let mut sum_im = 0.0f64;
+                    let mut noise_sum = 0.0f64;
+                    let mut count = 0usize;
+                    let mut max_power = -1.0f32;
+                    let mut max_delay = 0.0f32;
+                    let mut max_rate = 0.0f32;
+                    let mut max_value = C32::new(0.0, 0.0);
 
-                for (rate_index, &rate_value) in rate_range.iter().enumerate() {
-                    for (dst, src) in ifft_exe[..freq_bins]
-                        .iter_mut()
-                        .zip(freq_rate_array.column(rate_index).iter().take(freq_bins))
-                    {
-                        *dst = *src;
-                    }
-                    ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
-                    ifft.process(&mut ifft_exe);
-
-                    for delay_index in 0..fft_point {
-                        let source_index = if delay_index < half {
-                            half.saturating_sub(1 + delay_index)
-                        } else {
-                            fft_point - 1 - (delay_index - half)
-                        };
-                        let value = ifft_exe[source_index] / scale;
-                        let delay_value = delay_at(delay_index);
-                        sum_re += value.re as f64;
-                        sum_im += value.im as f64;
-                        count += 1;
-
-                        if let Some((mean_re, mean_im)) = mean {
-                            noise_sum += ((value.re as f64 - mean_re).powi(2)
-                                + (value.im as f64 - mean_im).powi(2))
-                            .sqrt();
-                        } else if in_window(delay_value, &search_args.drange)
-                            && in_window(rate_value, &search_args.rrange)
-                            && !in_delay_rate_mask(delay_value, rate_value, delay_mask)
+                    for (rate_index, &rate_value) in rate_range.iter().enumerate() {
+                        for (dst, src) in ifft_exe[..freq_bins]
+                            .iter_mut()
+                            .zip(freq_rate_array.column(rate_index).iter().take(freq_bins))
                         {
-                            let power = value.norm_sqr();
-                            if power > max_power {
-                                max_power = power;
-                                max_delay = delay_value;
-                                max_rate = rate_value;
-                                max_value = value;
+                            *dst = *src;
+                        }
+                        ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
+                        ifft.process(&mut ifft_exe);
+
+                        for delay_index in 0..fft_point {
+                            let source_index = if delay_index < half {
+                                half.saturating_sub(1 + delay_index)
+                            } else {
+                                fft_point - 1 - (delay_index - half)
+                            };
+                            let value = ifft_exe[source_index] / scale;
+                            let delay_value = delay_at(delay_index);
+                            if self.args.rfi_npz_mask.as_deref().is_some_and(|mask| {
+                                mask.contains_delay_rate(delay_value, rate_value)
+                            }) {
+                                continue;
+                            }
+                            sum_re += value.re as f64;
+                            sum_im += value.im as f64;
+                            count += 1;
+
+                            if let Some((mean_re, mean_im)) = mean {
+                                noise_sum += ((value.re as f64 - mean_re).powi(2)
+                                    + (value.im as f64 - mean_im).powi(2))
+                                .sqrt();
+                            } else if in_window(delay_value, &search_args.drange)
+                                && in_window(rate_value, &search_args.rrange)
+                                && !in_delay_rate_mask(delay_value, rate_value, delay_mask)
+                            {
+                                let power = value.norm_sqr();
+                                if power > max_power {
+                                    max_power = power;
+                                    max_delay = delay_value;
+                                    max_rate = rate_value;
+                                    max_value = value;
+                                }
                             }
                         }
                     }
-                }
 
-                (
-                    sum_re, sum_im, noise_sum, count, max_delay, max_rate, max_value,
-                )
-            };
+                    (
+                        sum_re, sum_im, noise_sum, count, max_delay, max_rate, max_value,
+                    )
+                };
 
             let (sum_re, sum_im, _, count, coarse_delay, coarse_rate, coarse_value) = scan(None);
             let mean = if count > 0 {
@@ -899,6 +920,22 @@ mod deep {
             (coarse_delay, coarse_rate, analysis)
         }
 
+        fn apply_delay_rate_mask(&self, values: &mut Array2<C32>) {
+            let Some(mask) = self.args.rfi_npz_mask.as_deref() else {
+                return;
+            };
+            let (rate_count, delay_count) = values.dim();
+            if let Some(slice) = values.as_slice_mut() {
+                mask.apply_delay_rate(
+                    slice,
+                    rate_count,
+                    delay_count,
+                    self.effective_integ_time,
+                    self.effective_fft_point,
+                );
+            }
+        }
+
         fn coarse_estimates(
             &self,
             algorithm: DeepSearchAlgorithm,
@@ -922,8 +959,9 @@ mod deep {
                         &search_args,
                     ));
                 }
-                let delay_rate_2d_data_comp =
+                let mut delay_rate_2d_data_comp =
                     process_ifft(&freq_rate_array, self.effective_fft_point, padding_length);
+                self.apply_delay_rate_mask(&mut delay_rate_2d_data_comp);
                 let analysis_results = analyze_results(
                     &freq_rate_array,
                     &delay_rate_2d_data_comp,
@@ -959,8 +997,9 @@ mod deep {
                         &search_args,
                     ));
                 }
-                let delay_rate_2d_data_comp =
+                let mut delay_rate_2d_data_comp =
                     process_ifft(&freq_rate_array, self.effective_fft_point, padding_length);
+                self.apply_delay_rate_mask(&mut delay_rate_2d_data_comp);
                 let analysis_results = analyze_results(
                     &freq_rate_array,
                     &delay_rate_2d_data_comp,
@@ -1069,6 +1108,15 @@ mod deep {
             {
                 return 0.0;
             }
+            if !self.args.frequency
+                && self
+                    .args
+                    .rfi_npz_mask
+                    .as_deref()
+                    .is_some_and(|mask| mask.contains_delay_rate(delay, rate))
+            {
+                return 0.0;
+            }
             // Evaluate it directly from the visibility rows so candidate scans
             // do not allocate a padded frequency-rate plane per worker.
             self.evaluate_coherent_amplitude(delay, rate)
@@ -1102,7 +1150,8 @@ mod deep {
                 && !self.args.dynamic_spectrum
                 && !self.args.raw_visibility
                 && !self.args.npz
-                && self.args.contamination.is_none();
+                && self.args.contamination.is_none()
+                && !crate::rfi::has_histogram_mode(&self.args.rfi);
 
             if can_skip_final_fft {
                 if let Some(coarse) = coarse_analysis {
@@ -1142,11 +1191,23 @@ mod deep {
             final_args.mask.clear();
 
             let pre_bandpass_analysis_results = if self.args.plot && self.bandpass_data.is_some() {
-                let pre_bandpass_delay_rate_2d_data_comp = process_ifft(
+                let mut pre_bandpass_delay_rate_2d_data_comp = process_ifft(
                     &final_freq_rate_array,
                     self.effective_fft_point,
                     padding_length,
                 );
+                if let Some(mask) = self.args.rfi_npz_mask.as_deref() {
+                    let (rate_count, delay_count) = pre_bandpass_delay_rate_2d_data_comp.dim();
+                    if let Some(values) = pre_bandpass_delay_rate_2d_data_comp.as_slice_mut() {
+                        mask.apply_delay_rate(
+                            values,
+                            rate_count,
+                            delay_count,
+                            self.effective_integ_time,
+                            self.effective_fft_point,
+                        );
+                    }
+                }
                 Some(analyze_results(
                     &final_freq_rate_array,
                     &pre_bandpass_delay_rate_2d_data_comp,
@@ -1163,11 +1224,23 @@ mod deep {
             };
 
             self.apply_bandpass(&mut final_freq_rate_array);
-            let final_delay_rate_2d_data_comp = process_ifft(
+            let mut final_delay_rate_2d_data_comp = process_ifft(
                 &final_freq_rate_array,
                 self.effective_fft_point,
                 padding_length,
             );
+            if let Some(mask) = self.args.rfi_npz_mask.as_deref() {
+                let (rate_count, delay_count) = final_delay_rate_2d_data_comp.dim();
+                if let Some(values) = final_delay_rate_2d_data_comp.as_slice_mut() {
+                    mask.apply_delay_rate(
+                        values,
+                        rate_count,
+                        delay_count,
+                        self.effective_integ_time,
+                        self.effective_fft_point,
+                    );
+                }
+            }
             let mut analysis_results = analyze_results(
                 &final_freq_rate_array,
                 &final_delay_rate_2d_data_comp,
@@ -1190,8 +1263,10 @@ mod deep {
 
             Ok((
                 analysis_results,
-                (self.args.frequency || self.args.contamination.is_some())
-                    .then_some(final_freq_rate_array),
+                (self.args.frequency
+                    || self.args.contamination.is_some()
+                    || crate::rfi::has_histogram_mode(&self.args.rfi))
+                .then_some(final_freq_rate_array),
                 final_delay_rate_2d_data_comp,
                 pre_bandpass_analysis_results,
             ))
@@ -1391,7 +1466,19 @@ mod deep {
             return Err("FFT チャンネル数が 0 です".into());
         }
         let effective_fft_point = (fft_point_half * 2) as i32;
-        let rfi_mask = build_rfi_mask(fft_point_half, rfi_ranges);
+        let mut rfi_mask = build_rfi_mask(fft_point_half, rfi_ranges);
+        if let Some(mask) = args.rfi_npz_mask.as_deref() {
+            let external = mask.frequency_channel_mask(
+                fft_point_half,
+                header.sampling_speed,
+                effective_fft_point,
+            );
+            for (channel, marked) in external.into_iter().enumerate() {
+                if marked {
+                    rfi_mask[channel] = true;
+                }
+            }
+        }
         let bandpass_gains = bandpass_data
             .as_deref()
             .and_then(|data| build_bandpass_gains(fft_point_half, data));

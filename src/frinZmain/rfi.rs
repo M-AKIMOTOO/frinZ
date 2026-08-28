@@ -1092,7 +1092,7 @@ pub fn detect_histogram_rfi(
             }
         }
     }
-    // The connected component around the strongest fringe peak is the
+    // The connected component around the selected fringe peak is the
     // celestial signal. The finite-band sinc response occupies the complete
     // delay column and rate row through the peak, so mark that cross as
     // celestial and keep it out of the Rayleigh/RFI statistics.

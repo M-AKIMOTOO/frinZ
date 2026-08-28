@@ -910,20 +910,64 @@ pub fn process_cor_file(
             let Some(freq_plane) = freq_rate_array.as_mut() else {
                 return Err("--rfi histogram requires a frequency-rate plane".into());
             };
-            let protected_rate_row = analysis_results
-                .rate_range
-                .iter()
-                .enumerate()
-                .min_by(|(_, left), (_, right)| {
-                    left.abs()
-                        .partial_cmp(&right.abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(index, _)| index);
+            // Use the same fringe-cell convention as `analyze_results`:
+            // without search/windows, the reference fringe is exactly
+            // (delay=0, rate=0); with delay/rate windows, use the selected
+            // in-window result.  A search result has already been corrected
+            // into the zero-delay/zero-rate frame, so its current plane is
+            // protected at the center as well.
+            let (rate_count, delay_count) = delay_rate_2d_data_comp.dim();
+            let nearest_rate_index = |target: f32| {
+                analysis_results
+                    .rate_range
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        (*left - target)
+                            .abs()
+                            .partial_cmp(&(*right - target).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0)
+            };
+            let nearest_delay_index = |target: f32| {
+                analysis_results
+                    .delay_range
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        (*left - target)
+                            .abs()
+                            .partial_cmp(&(*right - target).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0)
+            };
+            let use_selected_window = primary_search_mode.is_none()
+                && (!args.drange.is_empty() || !args.rrange.is_empty());
+            let target_rate = if use_selected_window {
+                analysis_results.residual_rate
+            } else {
+                0.0
+            };
+            let target_delay = if use_selected_window {
+                analysis_results.residual_delay
+            } else {
+                0.0
+            };
+            let protect_peak = (rate_count > 0 && delay_count > 0).then(|| {
+                (
+                    nearest_rate_index(target_rate).min(rate_count - 1),
+                    nearest_delay_index(target_delay).min(delay_count - 1),
+                )
+            });
+            let protected_rate_row = protect_peak.map(|(rate, _)| rate);
             let mut detected = detect_histogram_rfi(
                 freq_plane,
                 &delay_rate_2d_data_comp,
-                None,
+                protect_peak,
                 protected_rate_row,
                 loop_args.rayleigh_count,
             );
@@ -1746,9 +1790,6 @@ pub fn process_cor_file(
                         heatmap_res_y,
                         args.in_beam,
                     )?;
-                    if args.rfi.is_empty() {
-                        println!("Fringe plot written to {:?}", output_filename);
-                    }
                 } else {
                     let freq_rate_array = freq_rate_array.as_ref().ok_or(
                         "--frequency が指定されているのに freq_rate_array が保持されていません",
@@ -1931,9 +1972,6 @@ pub fn process_cor_file(
                         freq_rate_array.shape()[0],
                         freq_rate_array.shape()[1],
                     )?;
-                    if args.rfi.is_empty() {
-                        println!("Fringe plot written to {:?}", output_filename);
-                    }
                 }
             }
         }

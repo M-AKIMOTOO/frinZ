@@ -22,6 +22,75 @@ pub fn has_histogram_mode(rfi_args: &[String]) -> bool {
         .any(|value| value.eq_ignore_ascii_case("histogram") || value.eq_ignore_ascii_case("hist"))
 }
 
+/// Extract the Rayleigh tail count from `--rfi histogram count:N`.
+///
+/// The count token is consumed from the RFI argument list so the remaining
+/// values continue through the normal numeric-range/NPZ parser.  A bare
+/// `histogram`/`hist` keeps the Zig-compatible default of one tail sample.
+pub fn parse_histogram_count(rfi_args: &mut Vec<String>) -> io::Result<u64> {
+    let histogram = has_histogram_mode(rfi_args);
+    let mut count = 1u64;
+    let mut count_seen = false;
+    let mut filtered = Vec::with_capacity(rfi_args.len());
+    let mut index = 0usize;
+
+    while index < rfi_args.len() {
+        let current = rfi_args[index].trim().to_string();
+        let Some((key, inline_value)) = current.split_once(':') else {
+            filtered.push(rfi_args[index].clone());
+            index += 1;
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("count") {
+            filtered.push(rfi_args[index].clone());
+            index += 1;
+            continue;
+        }
+        if !histogram {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rfi count:N requires --rfi histogram",
+            ));
+        }
+        if count_seen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rfi histogram accepts only one count:N subargument",
+            ));
+        }
+
+        let mut raw_value = inline_value.trim().to_string();
+        if raw_value.is_empty() {
+            index += 1;
+            if index >= rfi_args.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--rfi histogram count: requires an integer value",
+                ));
+            }
+            raw_value = rfi_args[index].trim().to_string();
+        }
+        let parsed = raw_value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --rfi histogram count: '{}'", raw_value),
+            )
+        })?;
+        if parsed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rfi histogram count must be at least 1",
+            ));
+        }
+        count = parsed;
+        count_seen = true;
+        index += 1;
+    }
+
+    *rfi_args = filtered;
+    Ok(count)
+}
+
 /// RFI masks exported by the noise-histogram tools.
 ///
 /// `frequency_rate` uses row-major [rate, frequency] coordinates and is

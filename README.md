@@ -486,7 +486,7 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 - `--frequency`: Frequency domain analysis
 - `--rfi <"MIN,MAX">`: RFI frequency ranges to exclude (MHz)
 - `--rfi histogram`: derive a Rayleigh-fit RFI mask for each current integration window; histogram products are written under `frinZ/rfi/` and can be combined with numeric ranges. The strongest connected celestial component and the fringe-peak delay column/rate row are classified as celestial and excluded from the Rayleigh fit/threshold statistics; they remain visible as a cyan cross in the position map. The rate=0 frequency spectrum row is protected from the derived mask. The PNGs show all eligible cells, RFI candidates, known-celestial cells, the Rayleigh fit, and the threshold; linear/logy/logx/logxy and delay-rate imshow variants are emitted.
-- `--rayleigh-count N`: set the Rayleigh tail count used for the histogram threshold (default `1`; larger values lower the threshold), matching the Zig `noise_hist` convention. The selected value and fitted threshold are recorded in the histogram TSV/NPZ.
+- `--rfi histogram count:N`: set the Rayleigh tail count used for the histogram threshold (default `1`; larger values lower the threshold), matching the Zig `noise_hist` convention. The selected value and fitted threshold are recorded in the histogram TSV/NPZ.
 - `--rfi <MASK.npz>`: load `ifft_rfi_frequency_mask`/`ifft_rfi_frequency_coordinates` (frequency-rate) and `rfi_mask` (delay-rate) from a noise-histogram NPZ; matching plane cells are set to `0+0j`.
 - `--bandpass <FILE>`: Apply bandpass calibration
 - `--bandpass-table`: Generate bandpass table

@@ -19,7 +19,8 @@
   --skip <SEC>                       冒頭スキップ
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
-  --rfi histogram                     積分窓ごとに遅延–レート histogram/Rayleigh fit を実行
+  --rfi histogram [count:N]           積分窓ごとに遅延–レート histogram/Rayleigh fit を実行
+                                      count:N で Rayleigh tail count（既定1）を指定。
                                       histogram の解析結果だけを frinZ/rfi/ 配下へ出力
                                       結果は *_hist.{png,tsv,npz} と、Zig 互換の
                                       *_hist_linear/logy/logx/logxy.png、
@@ -29,8 +30,6 @@
                                       rate=0 の通常周波数スペクトル行は天体保護のためマスク適用外。
                                       fringe peak の delay 列・rate 行は天体(cyan cross)として
                                       fit/マスク対象外
-  --rayleigh-count N                   Rayleigh tail count（既定値 1）。大きい値ほど
-                                      RFI 判定閾値が下がる。histogram と併用。
   --rfi MASK.npz                     noise-histogram NPZ の RFI セルを 0+0j に置換
        NPZ の ifft_rfi_frequency_mask / ifft_rfi_frequency_coordinates は
        周波数-rate 平面、rfi_mask は delay-rate 平面として読み込みます。

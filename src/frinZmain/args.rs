@@ -190,8 +190,8 @@ pub struct Args {
     #[arg(long, num_args = 1.., value_name = "MIN,MAX|NPZ")]
     pub rfi: Vec<String>,
 
-    /// Rayleigh tail count used by `--rfi histogram` (larger values lower the threshold).
-    #[arg(long = "rayleigh-count", default_value_t = 1, value_name = "N")]
+    /// Internal Rayleigh tail count parsed from `--rfi histogram count:N`.
+    #[arg(skip)]
     pub rayleigh_count: u64,
 
     /// Loaded NPZ mask used internally; not a command-line option.

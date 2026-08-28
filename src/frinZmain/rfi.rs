@@ -2067,8 +2067,11 @@ fn draw_histogram_panel(
     }
     if !annotation.is_empty() {
         let box_left = x0 + (x1 - x0) * 0.02;
-        let box_right = x0 + (x1 - x0) * 0.43;
-        let line_step = (ymax / (annotation.len() as f64 + 3.0)).max(1.0);
+        let box_right = x0 + (x1 - x0) * 0.50;
+        // Keep the annotation inside the panel even for log-y plots, where
+        // ymax is only a few log-count units.  A fixed minimum step caused
+        // the lower lines to collapse at y=0 and become unreadable.
+        let line_step = ymax / (annotation.len() as f64 + 3.0);
         let box_top = ymax * 0.98;
         let box_bottom = (box_top - line_step * (annotation.len() as f64 + 1.0)).max(0.0);
         chart.draw_series(std::iter::once(Rectangle::new(
@@ -2080,7 +2083,7 @@ fn draw_histogram_panel(
             chart.draw_series(std::iter::once(Text::new(
                 line.clone(),
                 (box_left + (x1 - x0) * 0.008, y),
-                ("monospace", 12).into_font().color(&BLACK),
+                ("monospace", 16).into_font().color(&BLACK),
             )))?;
         }
     }

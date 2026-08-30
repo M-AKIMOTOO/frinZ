@@ -970,6 +970,7 @@ pub fn process_cor_file(
                 protect_peak,
                 protected_rate_row,
                 loop_args.rayleigh_count,
+                loop_args.histogram_bins,
             );
             detected.delay_axis = analysis_results
                 .delay_range
@@ -1059,7 +1060,7 @@ pub fn process_cor_file(
             println!("# RFI histogram TSV written to {:?}", hist_tsv);
             println!("# RFI histogram NPZ written to {:?}", hist_npz);
             println!("# RFI histogram detail PNGs written under {:?}", rfi_dir);
-            println!("#RFI histogram: rayleigh-count={}, sigma={:.6e}, threshold={:.6e}, frequency-threshold={:.6e}, fit-cells={}, histogram-cells={}, delay-RFI cells={}, celestial cells={}, frequency-RFI cells={}", histogram.rayleigh_count, histogram.sigma, histogram.threshold, histogram.frequency_threshold, histogram.valid_count, histogram.hist_valid_count, histogram.candidate_count, histogram.celestial_count, histogram.frequency_mask.iter().filter(|value| **value).count());
+            println!("#RFI histogram: rayleigh-count={}, bins={}, sigma={:.6e}, threshold={:.6e}, frequency-threshold={:.6e}, fit-cells={}, histogram-cells={}, delay-RFI cells={}, celestial cells={}, frequency-RFI cells={}", histogram.rayleigh_count, histogram.histogram_bins, histogram.sigma, histogram.threshold, histogram.frequency_threshold, histogram.valid_count, histogram.hist_valid_count, histogram.candidate_count, histogram.celestial_count, histogram.frequency_mask.iter().filter(|value| **value).count());
         }
 
         if args.contamination.is_some() {

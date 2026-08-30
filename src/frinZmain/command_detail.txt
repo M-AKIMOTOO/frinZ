@@ -19,8 +19,9 @@
   --skip <SEC>                       冒頭スキップ
   --loop <N>                         ループ回数
   --rfi MIN,MAX ...                  RFI 除外帯域 (MHz, 整数, 複数可)
-  --rfi histogram [count:N]           積分窓ごとに遅延–レート histogram/Rayleigh fit を実行
-                                      count:N で Rayleigh tail count（既定1）を指定。
+  --rfi histogram [count:N] [bins:N]  積分窓ごとに遅延–レート histogram/Rayleigh fit を実行
+                                      count:N で Rayleigh tail count（既定1）、
+                                      bins:N でヒストグラム分割数（既定256）を指定。
                                       histogram の解析結果だけを frinZ/rfi/ 配下へ出力
                                       結果は *_hist.{png,tsv,npz} と、Zig 互換の
                                       *_hist_linear/logy/logx/logxy.png、

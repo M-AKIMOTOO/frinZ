@@ -91,6 +91,74 @@ pub fn parse_histogram_count(rfi_args: &mut Vec<String>) -> io::Result<u64> {
     Ok(count)
 }
 
+/// Extract the histogram bin count from `--rfi histogram bins:N`.
+///
+/// The token is consumed from the RFI argument list. A bare `histogram`/`hist`
+/// keeps the default of 256 bins, matching the historical behaviour.
+pub fn parse_histogram_bins(rfi_args: &mut Vec<String>) -> io::Result<usize> {
+    let histogram = has_histogram_mode(rfi_args);
+    let mut bins = HISTOGRAM_BINS;
+    let mut bins_seen = false;
+    let mut filtered = Vec::with_capacity(rfi_args.len());
+    let mut index = 0usize;
+
+    while index < rfi_args.len() {
+        let current = rfi_args[index].trim().to_string();
+        let Some((key, inline_value)) = current.split_once(':') else {
+            filtered.push(rfi_args[index].clone());
+            index += 1;
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("bins") {
+            filtered.push(rfi_args[index].clone());
+            index += 1;
+            continue;
+        }
+        if !histogram {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rfi bins:N requires --rfi histogram",
+            ));
+        }
+        if bins_seen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rfi histogram accepts only one bins:N subargument",
+            ));
+        }
+
+        let mut raw_value = inline_value.trim().to_string();
+        if raw_value.is_empty() {
+            index += 1;
+            if index >= rfi_args.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--rfi histogram bins: requires an integer value",
+                ));
+            }
+            raw_value = rfi_args[index].trim().to_string();
+        }
+        let parsed = raw_value.parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --rfi histogram bins: '{}'", raw_value),
+            )
+        })?;
+        if parsed < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--rfi histogram bins must be at least 2",
+            ));
+        }
+        bins = parsed;
+        bins_seen = true;
+        index += 1;
+    }
+
+    *rfi_args = filtered;
+    Ok(bins)
+}
+
 /// RFI masks exported by the noise-histogram tools.
 ///
 /// `frequency_rate` uses row-major [rate, frequency] coordinates and is
@@ -691,6 +759,7 @@ pub struct HistogramRfiResult {
     pub rayleigh_samples: f64,
     pub reduced_chi_square: f64,
     pub rayleigh_count: u64,
+    pub histogram_bins: usize,
     pub threshold: f32,
     pub frequency_threshold: f32,
     /// Delay/rate coordinates of the selected fringe peak. Its entire delay
@@ -922,7 +991,12 @@ fn fit_rayleigh_histogram(edges: &[f64], counts: &[u64]) -> RayleighFit {
     }
 }
 
-fn fit_rayleigh_values(values: &[f32], min_positive: f64, max_value: f64) -> RayleighFit {
+fn fit_rayleigh_values(
+    values: &[f32],
+    min_positive: f64,
+    max_value: f64,
+    histogram_bins: usize,
+) -> RayleighFit {
     if values.is_empty() || !(min_positive > 0.0) || !(max_value >= min_positive) {
         return RayleighFit {
             sigma: f64::NAN,
@@ -934,20 +1008,20 @@ fn fit_rayleigh_values(values: &[f32], min_positive: f64, max_value: f64) -> Ray
     }
     let log_min = min_positive.log10();
     let log_max = max_value.log10().max(log_min + 1.0e-9);
-    let mut edges = Vec::with_capacity(HISTOGRAM_BINS + 1);
-    for bin in 0..=HISTOGRAM_BINS {
-        let fraction = bin as f64 / HISTOGRAM_BINS as f64;
+    let mut edges = Vec::with_capacity(histogram_bins + 1);
+    for bin in 0..=histogram_bins {
+        let fraction = bin as f64 / histogram_bins as f64;
         edges.push(10.0f64.powf(log_min + fraction * (log_max - log_min)));
     }
-    let mut counts = vec![0u64; HISTOGRAM_BINS];
+    let mut counts = vec![0u64; histogram_bins];
     for &value in values {
         let value = value as f64;
         if !value.is_finite() || value <= 0.0 {
             continue;
         }
         let bin =
-            (((value.log10() - log_min) / (log_max - log_min)) * HISTOGRAM_BINS as f64) as usize;
-        counts[bin.min(HISTOGRAM_BINS - 1)] += 1;
+            (((value.log10() - log_min) / (log_max - log_min)) * histogram_bins as f64) as usize;
+        counts[bin.min(histogram_bins - 1)] += 1;
     }
     fit_rayleigh_histogram(&edges, &counts)
 }
@@ -963,7 +1037,9 @@ pub fn detect_histogram_rfi(
     // never zeroed while inspecting the histogram result.
     protect_rate_row: Option<usize>,
     requested_rayleigh_count: u64,
+    requested_histogram_bins: usize,
 ) -> HistogramRfiResult {
+    let histogram_bins = requested_histogram_bins.max(2);
     let (rate_count, delay_count) = delay_rate.dim();
     let (frequency_count, frequency_rate_count) = freq_rate.dim();
     let total = rate_count.saturating_mul(delay_count);
@@ -1122,7 +1198,12 @@ pub fn detect_histogram_rfi(
         .max(1)
         .min(valid_count.saturating_sub(1).max(1) as u64);
     rayleigh_count_f64 = rayleigh_count as f64;
-    let fit = fit_rayleigh_values(&fit_valid, histogram_min_positive, histogram_max);
+    let fit = fit_rayleigh_values(
+        &fit_valid,
+        histogram_min_positive,
+        histogram_max,
+        histogram_bins,
+    );
     if fit.sigma.is_finite() && fit.sigma > 0.0 {
         sigma = fit.sigma as f32;
         sigma_mle = fit.sigma_mle;
@@ -1219,23 +1300,23 @@ pub fn detect_histogram_rfi(
     let max_hist = histogram_max;
     let log_min = min_positive.log10();
     let log_max = max_hist.log10().max(log_min + 1.0e-9);
-    let mut hist_edges = Vec::with_capacity(HISTOGRAM_BINS + 1);
-    let mut log_edges = Vec::with_capacity(HISTOGRAM_BINS + 1);
-    for bin in 0..=HISTOGRAM_BINS {
-        let fraction = bin as f64 / HISTOGRAM_BINS as f64;
+    let mut hist_edges = Vec::with_capacity(histogram_bins + 1);
+    let mut log_edges = Vec::with_capacity(histogram_bins + 1);
+    for bin in 0..=histogram_bins {
+        let fraction = bin as f64 / histogram_bins as f64;
         hist_edges.push(fraction * max_hist as f64);
         log_edges.push(10.0f64.powf(log_min + fraction * (log_max - log_min)));
     }
-    let mut hist_counts = vec![0u64; HISTOGRAM_BINS];
-    let mut log_counts = vec![0u64; HISTOGRAM_BINS];
+    let mut hist_counts = vec![0u64; histogram_bins];
+    let mut log_counts = vec![0u64; histogram_bins];
     for amplitude in valid.iter().copied() {
         let linear_bin = ((amplitude as f64 / (max_hist as f64).max(1.0e-30)
-            * HISTOGRAM_BINS as f64) as usize)
-            .min(HISTOGRAM_BINS - 1);
+            * histogram_bins as f64) as usize)
+            .min(histogram_bins - 1);
         hist_counts[linear_bin] += 1;
         let log_bin = (((amplitude as f64).log10() - log_min) / (log_max - log_min).max(1.0e-30)
-            * HISTOGRAM_BINS as f64) as usize;
-        log_counts[log_bin.min(HISTOGRAM_BINS - 1)] += 1;
+            * histogram_bins as f64) as usize;
+        log_counts[log_bin.min(histogram_bins - 1)] += 1;
     }
     let fringe_peak = amplitudes.get(seed).copied().unwrap_or(max_value);
     let samples_ge_peak = amplitudes
@@ -1244,8 +1325,8 @@ pub fn detect_histogram_rfi(
         .count() as u64;
     let fringe_peak_log_bin = if fringe_peak > 0.0 && fringe_peak.is_finite() {
         (((((fringe_peak as f64).log10() - log_min) / (log_max - log_min).max(1.0e-30))
-            * HISTOGRAM_BINS as f64) as usize)
-            .min(HISTOGRAM_BINS - 1)
+            * histogram_bins as f64) as usize)
+            .min(histogram_bins - 1)
     } else {
         0
     };
@@ -1262,20 +1343,20 @@ pub fn detect_histogram_rfi(
         .windows(2)
         .map(|window| rayleigh_samples * (rayleigh_cdf(window[1]) - rayleigh_cdf(window[0])))
         .collect::<Vec<_>>();
-    let mut rfi_hist_counts = vec![0u64; HISTOGRAM_BINS];
-    let mut rfi_log_counts = vec![0u64; HISTOGRAM_BINS];
-    let mut celestial_hist_counts = vec![0u64; HISTOGRAM_BINS];
-    let mut celestial_log_counts = vec![0u64; HISTOGRAM_BINS];
+    let mut rfi_hist_counts = vec![0u64; histogram_bins];
+    let mut rfi_log_counts = vec![0u64; histogram_bins];
+    let mut celestial_hist_counts = vec![0u64; histogram_bins];
+    let mut celestial_log_counts = vec![0u64; histogram_bins];
     for (index, amplitude) in amplitudes.iter().copied().enumerate() {
         if is_protected(index) || !amplitude.is_finite() {
             continue;
         }
         let linear_bin = ((amplitude as f64 / (max_hist as f64).max(1.0e-30)
-            * HISTOGRAM_BINS as f64) as usize)
-            .min(HISTOGRAM_BINS - 1);
+            * histogram_bins as f64) as usize)
+            .min(histogram_bins - 1);
         let log_bin = (((amplitude as f64).log10() - log_min) / (log_max - log_min).max(1.0e-30)
-            * HISTOGRAM_BINS as f64) as usize;
-        let log_bin = log_bin.min(HISTOGRAM_BINS - 1);
+            * histogram_bins as f64) as usize;
+        let log_bin = log_bin.min(histogram_bins - 1);
         if celestial[index] {
             celestial_hist_counts[linear_bin] += 1;
             celestial_log_counts[log_bin] += 1;
@@ -1293,6 +1374,7 @@ pub fn detect_histogram_rfi(
         rayleigh_samples,
         reduced_chi_square,
         rayleigh_count,
+        histogram_bins,
         threshold,
         frequency_threshold,
         fringe_peak_rate,
@@ -1337,7 +1419,10 @@ fn rayleigh_annotation(result: &HistogramRfiResult, bins_label: &str) -> Vec<Str
     vec![
         format!("Samples               : {}", result.hist_valid_count),
         format!("Valid samples         : {}", result.valid_count),
-        format!("Bins                  : {} ({bins_label})", HISTOGRAM_BINS),
+        format!(
+            "Bins                  : {} ({bins_label})",
+            result.histogram_bins
+        ),
         format!("Fringe-peak bin count : {}", result.fringe_peak_bin_count),
         format!(
             "Samples >= peak       : {} ({peak_percent:.4}%)",
@@ -1515,17 +1600,18 @@ pub fn write_histogram_products(
     writeln!(file, "# RFI histogram analysis")?;
     writeln!(
         file,
-        "# sigma\tsigma_mle\tsigma_initial\trayleigh_samples\treduced_chi_square\trayleigh_count\tthreshold\tfrequency_threshold\tfringe_peak_rate_index\tfringe_peak_delay_index\tfringe_peak\tfringe_peak_bin_count\tsamples_ge_peak\tfit_valid_count\thistogram_valid_count\tdelay_rfi_count\tcelestial_count"
+        "# sigma\tsigma_mle\tsigma_initial\trayleigh_samples\treduced_chi_square\trayleigh_count\thistogram_bins\tthreshold\tfrequency_threshold\tfringe_peak_rate_index\tfringe_peak_delay_index\tfringe_peak\tfringe_peak_bin_count\tsamples_ge_peak\tfit_valid_count\thistogram_valid_count\tdelay_rfi_count\tcelestial_count"
     )?;
     writeln!(
         file,
-        "# {:.8e}\t{:.8e}\t{:.8e}\t{:.8e}\t{:.8e}\t{}\t{:.8e}\t{:.8e}\t{}\t{}\t{:.8e}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "# {:.8e}\t{:.8e}\t{:.8e}\t{:.8e}\t{:.8e}\t{}\t{}\t{:.8e}\t{:.8e}\t{}\t{}\t{:.8e}\t{}\t{}\t{}\t{}\t{}\t{}",
         result.sigma,
         result.sigma_mle,
         result.sigma_initial,
         result.rayleigh_samples,
         result.reduced_chi_square,
         result.rayleigh_count,
+        result.histogram_bins,
         result.threshold,
         result.frequency_threshold,
         result.fringe_peak_rate,
@@ -1639,6 +1725,7 @@ pub fn write_histogram_products(
             .collect::<Vec<_>>(),
     );
     npz.add_f64_1d("rayleigh_count", &[result.rayleigh_count as f64]);
+    npz.add_f64_1d("histogram_bins", &[result.histogram_bins as f64]);
     npz.add_f64_1d("rayleigh_sigma_mle", &[result.sigma_mle]);
     npz.add_f64_1d("rayleigh_sigma_initial", &[result.sigma_initial]);
     npz.add_f64_1d("rayleigh_samples", &[result.rayleigh_samples]);

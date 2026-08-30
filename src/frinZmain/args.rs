@@ -194,6 +194,10 @@ pub struct Args {
     #[arg(skip)]
     pub rayleigh_count: u64,
 
+    /// Internal histogram bin count parsed from `--rfi histogram bins:N`.
+    #[arg(skip)]
+    pub histogram_bins: usize,
+
     /// Loaded NPZ mask used internally; not a command-line option.
     #[arg(skip)]
     pub rfi_npz_mask: Option<Arc<RfiMask>>,
@@ -431,6 +435,7 @@ impl Default for Args {
             stfft: 0,
             rfi: Vec::new(),
             rayleigh_count: 1,
+            histogram_bins: 256,
             rfi_npz_mask: None,
             plot: false,
             frequency: false,

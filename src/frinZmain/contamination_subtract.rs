@@ -136,7 +136,7 @@ pub fn apply_contamination_subtract(
 ) -> Result<(), Box<dyn Error>> {
     let model = read_model(model_path, input)?;
     if model.product != "flux_contamination_subtraction_model"
-        || !matches!(model.format_version, 1 | 2 | 3 | 4 | 5)
+        || !matches!(model.format_version, 1..=5)
     {
         return Err(format!(
             "unsupported contamination model {} version {}",
@@ -284,11 +284,11 @@ fn read_f32_npy_entry(
         .collect())
 }
 
-fn bracketing_gain_transfers<'a>(
-    transfers: &'a [GainTransfer],
+fn bracketing_gain_transfers(
+    transfers: &[GainTransfer],
     band: char,
     mjd: f64,
-) -> Result<(&'a GainTransfer, &'a GainTransfer, f64), Box<dyn Error>> {
+) -> Result<(&GainTransfer, &GainTransfer, f64), Box<dyn Error>> {
     let same_band: Vec<_> = transfers.iter().filter(|item| item.band == band).collect();
     if same_band.is_empty() {
         return Err(format!("no compact gain-transfer data for {band} band").into());
@@ -328,9 +328,14 @@ fn interpolate_gain_spectrum(
     {
         return Err("gain and target raw frequency axes differ".into());
     }
-    for channel in 0..frequency_hz.len() {
-        if (before.frequency_hz[channel] - frequency_hz[channel]).abs() > 1.0
-            || (after.frequency_hz[channel] - frequency_hz[channel]).abs() > 1.0
+    for ((&before_frequency, &after_frequency), &target_frequency) in before
+        .frequency_hz
+        .iter()
+        .zip(&after.frequency_hz)
+        .zip(frequency_hz)
+    {
+        if (before_frequency - target_frequency).abs() > 1.0
+            || (after_frequency - target_frequency).abs() > 1.0
         {
             return Err("gain and target frequency values differ".into());
         }
@@ -341,7 +346,7 @@ fn interpolate_gain_spectrum(
     let mut cross = C64::new(0.0, 0.0);
     for channel in 1..frequency_hz.len() {
         let left_conjugate = C64::new(before.spectrum[channel].re, -before.spectrum[channel].im);
-        cross = cross + left_conjugate * after.spectrum[channel];
+        cross += left_conjugate * after.spectrum[channel];
     }
     let global_delta = cross.im.atan2(cross.re);
     let align_after = C64::from_polar(1.0, -global_delta);
@@ -362,7 +367,7 @@ fn subtract_one_window(
     gain_transfers: &[GainTransfer],
     bandpass_override: Option<&[num_complex::Complex<f32>]>,
 ) -> Result<(), Box<dyn Error>> {
-    if scan.fft_point < 4 || scan.fft_point % 2 != 0 || scan.samples == 0 {
+    if scan.fft_point < 4 || !scan.fft_point.is_multiple_of(2) || scan.samples == 0 {
         return Err("invalid FFT point or integration length".into());
     }
     let channels = scan.fft_point / 2;
@@ -402,12 +407,16 @@ fn subtract_one_window(
                 scan.raw_mjd[row],
                 &scan.frequency_hz,
             )?;
-            for channel in 1..channels {
-                let frequency_hz = scan.frequency_hz[channel];
+            for (channel, (&gain, &frequency_hz)) in gain_spectrum
+                .iter()
+                .zip(&scan.frequency_hz)
+                .enumerate()
+                .skip(1)
+            {
                 let spectral_amplitude =
                     (frequency_hz / scan.reference_frequency_hz).powf(scan.spectral_index);
                 let geometric_phase = 2.0 * PI * frequency_hz * scan.geometric_delay_s[row];
-                let q = gain_spectrum[channel]
+                let q = gain
                     * (scan.gain_flux_ratio * spectral_amplitude)
                     * C64::from_polar(1.0, geometric_phase)
                     * model_scale;

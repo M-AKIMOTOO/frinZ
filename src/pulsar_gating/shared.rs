@@ -233,7 +233,7 @@ pub(crate) fn write_rfi_cut_report(
             masked[chan_idx] = true;
         }
     }
-    for chan_idx in 0..report.total_channels {
+    for (chan_idx, &is_masked) in masked.iter().enumerate() {
         let freq = freq_axis_mhz.get(chan_idx).copied().unwrap_or(f64::NAN);
         let mean_amp = report
             .channel_mean_amplitudes
@@ -248,7 +248,7 @@ pub(crate) fn write_rfi_cut_report(
         writeln!(
             file,
             "{},{:.9},{:.9},{:.9},{}",
-            chan_idx, freq, mean_amp, local_ref, masked[chan_idx]
+            chan_idx, freq, mean_amp, local_ref, is_masked
         )?;
     }
     Ok(())
@@ -259,7 +259,7 @@ fn median_of_sorted(sorted: &[f64]) -> f64 {
     if n == 0 {
         return 0.0;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]

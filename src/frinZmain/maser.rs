@@ -1,3 +1,5 @@
+// Maser analysis keeps plotting and spectral-axis parameters explicit.
+#![allow(clippy::too_many_arguments)]
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use ndarray::{Array1, Axis};
 use plotters::prelude::*;
@@ -68,8 +70,9 @@ fn format_with_precision(value: f64, digits: usize) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum MaserMode {
+    #[default]
     Seg,
     Stacked,
     Both,
@@ -94,12 +97,6 @@ impl MaserMode {
             MaserMode::Stacked => "stacked",
             MaserMode::Both => "both",
         }
-    }
-}
-
-impl Default for MaserMode {
-    fn default() -> Self {
-        MaserMode::Seg
     }
 }
 
@@ -455,7 +452,7 @@ fn median_f32(values: &[f32]) -> f32 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         0.5 * (sorted[mid - 1] + sorted[mid])
     } else {
         sorted[mid]
@@ -469,7 +466,7 @@ fn mad_f32(values: &[f32], median: f32) -> f32 {
     let mut dev: Vec<f32> = values.iter().map(|&v| (v - median).abs()).collect();
     dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = dev.len() / 2;
-    if dev.len() % 2 == 0 {
+    if dev.len().is_multiple_of(2) {
         0.5 * (dev[mid - 1] + dev[mid])
     } else {
         dev[mid]
@@ -1015,7 +1012,7 @@ fn plot_maser_spectrum(
         .label_style(("sans-serif", 20))
         .x_max_light_lines(0)
         .y_max_light_lines(0)
-        .light_line_style(&TRANSPARENT)
+        .light_line_style(TRANSPARENT)
         .draw()?;
 
     chart.draw_series(LineSeries::new(data.iter().cloned(), &BLUE))?;
@@ -1188,7 +1185,7 @@ fn plot_on_off_spectra(
         .label_style(("sans-serif", 20))
         .x_max_light_lines(0)
         .y_max_light_lines(0)
-        .light_line_style(&TRANSPARENT)
+        .light_line_style(TRANSPARENT)
         .draw()?;
 
     chart
@@ -1203,8 +1200,8 @@ fn plot_on_off_spectra(
 
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     // Draw legend as text
@@ -1367,7 +1364,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
                     if params.is_empty() {
                         return Err("Error: gauss requires amp,Vlst,fwhm values.".into());
                     }
-                    if params.len() % 3 != 0 {
+                    if !params.len().is_multiple_of(3) {
                         return Err(
                             format!(
                                 "Error: gauss expects triples of amp,Vlst,fwhm. Received {} entries: {}",
@@ -1402,7 +1399,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     }
 
     if off_spec.is_none() {
-        if let Some(first) = positional_args.get(0) {
+        if let Some(first) = positional_args.first() {
             let value = first.trim();
             if let Some(model) = BaselineFitKind::from_str(value) {
                 off_spec = Some(OffSpec::Baseline(model));
@@ -1657,7 +1654,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             .filter(|(_, &freq)| freq >= min_freq && freq <= max_freq)
             .map(|(i, _)| i)
             .collect()
-    } else if rest_freq_mhz >= 6600.0 && rest_freq_mhz <= 7112.0 {
+    } else if (6600.0..=7112.0).contains(&rest_freq_mhz) {
         maser_logln!(
             log_lines,
             "  C-band maser detected. Restricting analysis to 6664-6672 MHz range."
@@ -1665,7 +1662,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         freq_range_mhz
             .iter()
             .enumerate()
-            .filter(|(_, &freq)| freq >= 6664.0 && freq <= 6672.0)
+            .filter(|(_, &freq)| (6664.0..=6672.0).contains(&freq))
             .map(|(i, _)| i)
             .collect()
     } else {
@@ -2370,10 +2367,8 @@ fn analyze_segment(
             channel_width_kms,
             freq_precision,
             vel_precision,
-            gaussian_fit_data_vel.as_ref().map(|v| v.as_slice()),
-            gaussian_fit_components
-                .as_ref()
-                .map(|components| components.as_slice()),
+            gaussian_fit_data_vel.as_deref(),
+            gaussian_fit_components.as_deref(),
             gaussian_fit_baseline,
         )?;
 
@@ -2418,10 +2413,8 @@ fn analyze_segment(
                 channel_width_kms,
                 freq_precision,
                 vel_precision,
-                gaussian_fit_zoom.as_ref().map(|v| v.as_slice()),
-                gaussian_fit_components
-                    .as_ref()
-                    .map(|components| components.as_slice()),
+                gaussian_fit_zoom.as_deref(),
+                gaussian_fit_components.as_deref(),
                 gaussian_fit_baseline,
             )?;
         }
@@ -2499,11 +2492,11 @@ pub fn calculate_lsr_velocity_correction(
         -0.054_875_560_416_215_4,
         0.494_109_427_875_583_7,
         -0.867_666_149_019_004_7,
-        -0.873_437_090_234_885_0,
+        -0.873_437_090_234_885,
         -0.444_829_629_960_011_2,
         -0.198_076_373_431_201_5,
         -0.483_835_015_548_713_2,
-        0.746_982_244_497_218_9,
+        0.746_982_244_497_219,
         0.455_983_776_175_066_9,
     );
 
@@ -2694,7 +2687,7 @@ pub fn calculate_lsr_velocity_correction(
     );
 
     // 7. Final correction v_correction (dot product of observer's LSR velocity and target direction)
-    let v_correction = v_obs_lsr.dot(&k); // km/s
+    // km/s
 
-    v_correction
+    v_obs_lsr.dot(&k)
 }

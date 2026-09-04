@@ -1,3 +1,5 @@
+// Uptime chart parameters remain explicit to preserve the output contract.
+#![allow(clippy::too_many_arguments)]
 use crate::args::Args;
 use crate::header::parse_header;
 use crate::input_support::read_input_bytes;
@@ -320,8 +322,8 @@ fn draw_single_chart(
         .y_label_formatter(&|v| format!("{:.0}", v))
         .x_labels(25)
         .y_labels(y_labels)
-        .light_line_style(&WHITE.mix(0.0))
-        .bold_line_style(&BLACK.mix(0.2))
+        .light_line_style(WHITE.mix(0.0))
+        .bold_line_style(BLACK.mix(0.2))
         .draw()?;
 
     if !full_day_station1.is_empty() {
@@ -381,8 +383,8 @@ fn draw_single_chart(
     chart
         .configure_series_labels()
         .label_font(("sans-serif", 20))
-        .border_style(&BLACK)
-        .background_style(&WHITE.mix(0.7))
+        .border_style(BLACK)
+        .background_style(WHITE.mix(0.7))
         .draw()?;
 
     Ok(())

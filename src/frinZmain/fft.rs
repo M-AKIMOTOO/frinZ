@@ -1,3 +1,5 @@
+// FFT kernels intentionally expose axis/correction parameters separately.
+#![allow(clippy::too_many_arguments)]
 use ndarray::prelude::*;
 use num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -7,8 +9,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 type C32 = Complex<f32>;
 type C64 = Complex<f64>;
+type FftPlanCache = Mutex<HashMap<(usize, bool), Arc<dyn Fft<f32>>>>;
 
-static FFT_PLAN_CACHE: OnceLock<Mutex<HashMap<(usize, bool), Arc<dyn Fft<f32>>>>> = OnceLock::new();
+static FFT_PLAN_CACHE: OnceLock<FftPlanCache> = OnceLock::new();
 
 pub(crate) fn cached_fft_plan(len: usize, inverse: bool) -> Arc<dyn Fft<f32>> {
     let cache = FFT_PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -450,7 +453,7 @@ pub fn apply_phase_correction_in_place_at_frequency(
     start_time_offset_sec: f32,
     reference_frequency_hz: f64,
 ) {
-    if data.is_empty() || fft_point_half == 0 || data.len() % fft_point_half != 0 {
+    if data.is_empty() || fft_point_half == 0 || !data.len().is_multiple_of(fft_point_half) {
         return;
     }
 

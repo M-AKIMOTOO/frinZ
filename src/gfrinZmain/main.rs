@@ -52,16 +52,16 @@ fn smooth_ma(series: &[f64], w: usize) -> Vec<f64> {
     let n = series.len();
     let k = w / 2;
     let mut out = vec![0.0; n];
-    for i in 0..n {
+    for (i, output) in out.iter_mut().enumerate() {
         let s = i.saturating_sub(k);
         let e = min(n.saturating_sub(1), i + k);
         let mut sum = 0.0;
         let mut cnt = 0usize;
-        for j in s..=e {
-            sum += series[j];
+        for &value in &series[s..=e] {
+            sum += value;
             cnt += 1;
         }
-        out[i] = if cnt > 0 {
+        *output = if cnt > 0 {
             sum / (cnt as f64)
         } else {
             series[i]
@@ -73,20 +73,19 @@ fn smooth_sg(series: &[f64], w: usize, p: usize) -> Vec<f64> {
     let n = series.len();
     let mut out = vec![0.0; n];
     let m = (p + 1).max(1);
-    for i in 0..n {
+    for (i, output) in out.iter_mut().enumerate() {
         let k = w / 2;
         let l = i.saturating_sub(k);
         let r = min(n.saturating_sub(1), i + k);
         // Build normal equations for centered polynomial at x=0
         let mut ata = vec![vec![0.0f64; m]; m];
         let mut atb = vec![0.0f64; m];
-        for j in l..=r {
+        for (j, &y) in series.iter().enumerate().take(r + 1).skip(l) {
             let x = (j as isize - i as isize) as f64;
             let mut v = vec![1.0f64; m];
             for d in 1..m {
                 v[d] = v[d - 1] * x;
             }
-            let y = series[j];
             for a in 0..m {
                 atb[a] += v[a] * y;
                 for b in 0..m {
@@ -104,7 +103,7 @@ fn smooth_sg(series: &[f64], w: usize, p: usize) -> Vec<f64> {
         );
         let atb_v = DVector::<f64>::from_row_slice(&atb);
         let coeff = ata_m.lu().solve(&atb_v).unwrap_or(DVector::<f64>::zeros(m));
-        out[i] = coeff[0];
+        *output = coeff[0];
     }
     out
 }
@@ -193,10 +192,10 @@ fn compute_uv_for_pair(
     }
     let e = chosen?;
     let h = &e.header;
-    let lam = C_LIGHT / (h.observing_frequency as f64);
+    let lam = C_LIGHT / h.observing_frequency;
     // GMST approximation
     let jd = frinZ::utils::mjd_cal(t) + 2400000.5;
-    let gmst = astro::time::mn_sidr(jd) as f64;
+    let gmst = astro::time::mn_sidr(jd);
     let rot = |x: f64, y: f64, z: f64| -> (f64, f64, f64) {
         let cg = gmst.cos();
         let sg = gmst.sin();
@@ -564,7 +563,7 @@ fn main() -> anyhow::Result<()> {
             for s in &default_group {
                 mx = mx.max(s.a.max(s.b));
             }
-            for (_k, vecs) in &groups {
+            for vecs in groups.values() {
                 for s in vecs {
                     mx = mx.max(s.a.max(s.b));
                 }
@@ -591,7 +590,7 @@ fn main() -> anyhow::Result<()> {
                     out,
                     "---- ------------------- --------------- --------------- ---------------"
                 )?;
-                for ant in 0..num_ant_global {
+                for (ant, &phase) in phi.iter().enumerate().take(num_ant_global) {
                     let mark = if ant == cli.reference { " (ref)" } else { "" };
                     writeln!(
                         out,
@@ -600,7 +599,7 @@ fn main() -> anyhow::Result<()> {
                         format!("{}{}", "ANT", mark),
                         sol.tau_s[ant],
                         sol.rate_hz[ant],
-                        phi[ant].to_degrees()
+                        phase.to_degrees()
                     )?;
                 }
             } else if cli.plain {
@@ -914,8 +913,8 @@ fn main() -> anyhow::Result<()> {
         ants_set.insert(a);
         ants_set.insert(b);
         // antenna names mapping
-        if !ant_names.contains_key(&a) {
-            ant_names.insert(a, header.station1_name.clone());
+        if let std::collections::btree_map::Entry::Vacant(e) = ant_names.entry(a) {
+            e.insert(header.station1_name.clone());
         } else if ant_names.get(&a).unwrap() != &header.station1_name {
             eprintln!(
                 "#WARN: antenna {} name mismatch: '{}' vs '{}'",
@@ -924,8 +923,8 @@ fn main() -> anyhow::Result<()> {
                 header.station1_name
             );
         }
-        if !ant_names.contains_key(&b) {
-            ant_names.insert(b, header.station2_name.clone());
+        if let std::collections::btree_map::Entry::Vacant(e) = ant_names.entry(b) {
+            e.insert(header.station2_name.clone());
         } else if ant_names.get(&b).unwrap() != &header.station2_name {
             eprintln!(
                 "#WARN: antenna {} name mismatch: '{}' vs '{}'",
@@ -1303,7 +1302,7 @@ fn main() -> anyhow::Result<()> {
 
         // アンテナ解
         let sol = solve_antenna_tau_rate(num_ant, cli.reference, &solves);
-        let utc = win_time.unwrap_or_else(|| chrono::Utc::now()).to_rfc3339();
+        let utc = win_time.unwrap_or_else(chrono::Utc::now).to_rfc3339();
         writeln!(
             out,
             "t_idx={} utc={} len_s={:.3}",
@@ -1602,9 +1601,7 @@ fn main() -> anyhow::Result<()> {
 
             // FRNMOD相当: モデルで位相除去（baseline毎）
             if cli.model.is_some() {
-                let model = model_map
-                    .get(&(l1 as i64))
-                    .or_else(|| model_default.as_ref());
+                let model = model_map.get(&(l1 as i64)).or(model_default.as_ref());
                 if let Some((tau_ant, rate_ant)) = model {
                     if e.a < tau_ant.len() && e.b < tau_ant.len() {
                         let dt = tau_ant[e.a] - tau_ant[e.b]; // [s]
@@ -1788,11 +1785,7 @@ fn main() -> anyhow::Result<()> {
                 w_rate = w;
             }
 
-            let w_phase = if cli.crlb_weight {
-                (snr * snr).max(1e-20)
-            } else {
-                (snr * snr).max(1e-20)
-            };
+            let w_phase = (snr * snr).max(1e-20);
             solves.push(BaselineSolve {
                 a: e.a,
                 b: e.b,
@@ -1912,19 +1905,19 @@ fn main() -> anyhow::Result<()> {
                 .cloned()
                 .or_else(|| model_default.clone())
             {
-                for ant in 0..num_ant.min(tau0.len()) {
-                    sol.tau_s[ant] += tau0[ant];
+                for (ant, &tau) in tau0.iter().enumerate().take(num_ant) {
+                    sol.tau_s[ant] += tau;
                 }
-                for ant in 0..num_ant.min(rate0.len()) {
-                    sol.rate_hz[ant] += rate0[ant];
+                for (ant, &rate) in rate0.iter().enumerate().take(num_ant) {
+                    sol.rate_hz[ant] += rate;
                 }
             }
         }
 
-        let utc = win_time.unwrap_or_else(|| chrono::Utc::now()).to_rfc3339();
+        let utc = win_time.unwrap_or_else(chrono::Utc::now).to_rfc3339();
         // バイナリ: solutions.bin へ書き込み（RAW）
-        let unix_sec = win_time.unwrap_or_else(|| chrono::Utc::now()).timestamp();
-        write_i32_le(&mut sol_f, l1 as i32)?;
+        let unix_sec = win_time.unwrap_or_else(chrono::Utc::now).timestamp();
+        write_i32_le(&mut sol_f, l1)?;
         write_i64_le(&mut sol_f, unix_sec)?;
         write_f32_le(&mut sol_f, (length_sectors as f32) * ts)?;
         for v in &sol.tau_s {
@@ -1959,7 +1952,7 @@ fn main() -> anyhow::Result<()> {
         // テキスト/JSON 出力: スムージング指定時は即時出力せずに蓄積
         if smooth_kind != SmoothKind::None {
             win_solutions.push(WinSol {
-                t_idx: l1 as i32,
+                t_idx: l1,
                 unix_sec,
                 len_s: (length_sectors as f32) * ts,
                 tau: sol.tau_s.clone(),
@@ -2033,7 +2026,7 @@ fn main() -> anyhow::Result<()> {
             let svd = SVD::new(bw.clone(), true, false);
             let sv = svd.singular_values;
             let mut cond_txt = String::from("n/a");
-            if sv.len() >= 1 && n_unknowns >= 1 {
+            if !sv.is_empty() && n_unknowns >= 1 {
                 let mut smax = 0.0f64;
                 let mut smin = f64::INFINITY;
                 for v in sv.iter().cloned() {
@@ -2353,11 +2346,11 @@ fn main() -> anyhow::Result<()> {
                                         // find ids for names
                                         let ida = id2name
                                             .iter()
-                                            .find(|(_, &ref s)| s == nr.0.as_str())
+                                            .find(|(_, s)| s.as_str() == nr.0.as_str())
                                             .map(|(k, _v)| *k);
                                         let idb = id2name
                                             .iter()
-                                            .find(|(_, &ref s)| s == nr.1.as_str())
+                                            .find(|(_, s)| s.as_str() == nr.1.as_str())
                                             .map(|(k, _v)| *k);
                                         if let (Some(ia), Some(ib)) = (ida, idb) {
                                             let phi_nr = if let Some(&p) = phase_map.get(&(ia, ib))
@@ -2408,7 +2401,7 @@ fn main() -> anyhow::Result<()> {
                 out,
                 "---- ------------------- --------------- --------------- ---------------"
             )?;
-            for ant in 0..num_ant {
+            for (ant, &phase) in phi_ant.iter().enumerate().take(num_ant) {
                 let name = ant_names
                     .get(&ant)
                     .cloned()
@@ -2421,7 +2414,7 @@ fn main() -> anyhow::Result<()> {
                     format!("{}{}", name, mark),
                     sol.tau_s[ant],
                     rate_to_ss(sol.rate_hz[ant], obs_freq_hz),
-                    phi_ant[ant].to_degrees()
+                    phase.to_degrees()
                 )?;
             }
         } else if cli.plain {
@@ -2506,7 +2499,7 @@ fn main() -> anyhow::Result<()> {
             let svd = SVD::new(bw.clone(), true, false);
             let sv = svd.singular_values;
             let mut cond_val: Option<f64> = None;
-            if sv.len() >= 1 && n_unknowns >= 1 {
+            if !sv.is_empty() && n_unknowns >= 1 {
                 let mut smax = 0.0;
                 let mut smin = f64::INFINITY;
                 for v in sv.iter().cloned() {
@@ -2636,7 +2629,7 @@ fn main() -> anyhow::Result<()> {
                 .enumerate()
                 .map(|(idx, &tau)| {
                     let name = ant_names
-                        .get(&(idx as usize))
+                        .get(&{ idx })
                         .cloned()
                         .unwrap_or_else(|| "?".to_string());
                     serde_json::json!({
@@ -2791,11 +2784,11 @@ fn main() -> anyhow::Result<()> {
                                     // find ids for names
                                     let ida = id2name
                                         .iter()
-                                        .find(|(_, &ref s)| s == na)
+                                        .find(|(_, s)| s.as_str() == na)
                                         .map(|(k, _v)| *k);
                                     let idb = id2name
                                         .iter()
-                                        .find(|(_, &ref s)| s == nb)
+                                        .find(|(_, s)| s.as_str() == nb)
                                         .map(|(k, _v)| *k);
                                     if let (Some(ia), Some(ib)) = (ida, idb) {
                                         let phi_nr = if let Some(&p) = phase_map.get(&(ia, ib)) {
@@ -2880,20 +2873,20 @@ fn main() -> anyhow::Result<()> {
         let wlen = cli.smooth_len.max(1);
         let poly = cli.smooth_poly.max(0);
 
-        fn smooth_ma(series: &Vec<f64>, w: usize) -> Vec<f64> {
+        fn smooth_ma(series: &[f64], w: usize) -> Vec<f64> {
             let n = series.len();
             let k = w / 2;
             let mut out = vec![0.0; n];
-            for i in 0..n {
+            for (i, output) in out.iter_mut().enumerate() {
                 let s = i.saturating_sub(k);
                 let e = min(n - 1, i + k);
                 let mut sum = 0.0;
                 let mut cnt = 0usize;
-                for j in s..=e {
-                    sum += series[j];
+                for &value in &series[s..=e] {
+                    sum += value;
                     cnt += 1;
                 }
-                out[i] = if cnt > 0 {
+                *output = if cnt > 0 {
                     sum / (cnt as f64)
                 } else {
                     series[i]
@@ -2901,10 +2894,10 @@ fn main() -> anyhow::Result<()> {
             }
             out
         }
-        fn smooth_sg(series: &Vec<f64>, w: usize, p: usize) -> Vec<f64> {
+        fn smooth_sg(series: &[f64], w: usize, p: usize) -> Vec<f64> {
             let n = series.len();
             let mut out = vec![0.0; n];
-            for i in 0..n {
+            for (i, output) in out.iter_mut().enumerate() {
                 let k = w / 2;
                 let l = i.saturating_sub(k);
                 let r = min(n - 1, i + k);
@@ -2912,14 +2905,14 @@ fn main() -> anyhow::Result<()> {
                 let m = p + 1;
                 let mut ata = vec![vec![0.0f64; m]; m];
                 let mut atb = vec![0.0f64; m];
-                for j in l..=r {
+                for (j, y_ref) in series.iter().enumerate().take(r + 1).skip(l) {
                     let x = (j as isize - i as isize) as f64;
                     // ベクトル v = [1, x, x^2, ...]
                     let mut v = vec![1.0f64; m];
                     for d in 1..m {
                         v[d] = v[d - 1] * x;
                     }
-                    let y = series[j];
+                    let y = *y_ref;
                     for a in 0..m {
                         atb[a] += v[a] * y;
                         for b in 0..m {
@@ -2938,7 +2931,7 @@ fn main() -> anyhow::Result<()> {
                 );
                 let atb_v = DVector::<f64>::from_row_slice(&atb);
                 let coeff = ata_m.lu().solve(&atb_v).unwrap_or(DVector::<f64>::zeros(m));
-                out[i] = coeff[0]; // x=0 の推定値
+                *output = coeff[0]; // x=0 の推定値
             }
             out
         }
@@ -2995,7 +2988,7 @@ fn main() -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!("# Antennas: {}", mapping);
-                for (_i, w) in smoothed.iter().enumerate() {
+                for w in smoothed.iter() {
                     writeln!(
                         out,
                         "t_idx={} utc={} len_s={:.3} (smoothed)",
@@ -3008,7 +3001,7 @@ fn main() -> anyhow::Result<()> {
                     )?;
                     for ant in 0..ant_n {
                         let name = ant_names
-                            .get(&(ant as usize))
+                            .get(&{ ant })
                             .cloned()
                             .unwrap_or_else(|| "?".to_string());
                         let mark = if ant == cli.reference { " (ref)" } else { "" };
@@ -3052,7 +3045,7 @@ fn main() -> anyhow::Result<()> {
                         .enumerate()
                         .map(|(idx, &tau)| {
                             let name = ant_names
-                                .get(&(idx as usize))
+                                .get(&{ idx })
                                 .cloned()
                                 .unwrap_or_else(|| "?".to_string());
                             serde_json::json!({
@@ -3088,7 +3081,7 @@ fn main() -> anyhow::Result<()> {
     // Time-series structure fit (double) over all windows for 3 antennas
     if cli.fit_model.to_lowercase() == "double" && num_ant == 3 && !fit_obs_closure.is_empty() {
         let to_rad = std::f64::consts::PI / (180.0 * 3600.0 * 1000.0);
-        let range = (cli.fit_range_mas as f64) * to_rad;
+        let range = cli.fit_range_mas * to_rad;
         let grid = cli.fit_grid.max(3);
         let wrap = |x: f64| -> f64 {
             let mut y = (x + std::f64::consts::PI) % (2.0 * std::f64::consts::PI);

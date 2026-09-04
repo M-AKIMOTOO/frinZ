@@ -197,8 +197,8 @@ pub fn fit_polynomial_least_squares(
     for power in 0..=degree {
         let scaled = normalized_coeffs[power] / x_scale.powi(power as i32);
         let mut binomial = 1.0;
-        for x_power in 0..=power {
-            coefficients[x_power] += scaled * binomial * (-x_center).powi((power - x_power) as i32);
+        for (x_power, coefficient) in coefficients.iter_mut().enumerate().take(power + 1) {
+            *coefficient += scaled * binomial * (-x_center).powi((power - x_power) as i32);
             if x_power < power {
                 binomial *= (power - x_power) as f64 / (x_power + 1) as f64;
             }

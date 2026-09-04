@@ -74,9 +74,9 @@ pub fn output_header_info(
         header.station1_clock_acel,
         header.station1_clock_jerk,
         header.station1_clock_snap,
-        header.station1_position[0] as f64,
-        header.station1_position[1] as f64,
-        header.station1_position[2] as f64,
+        { header.station1_position[0] },
+        { header.station1_position[1] },
+        { header.station1_position[2] },
         header.station2_name,
         header.station2_code,
         header.station2_clock_delay,
@@ -84,12 +84,12 @@ pub fn output_header_info(
         header.station2_clock_acel,
         header.station2_clock_jerk,
         header.station2_clock_snap,
-        header.station2_position[0] as f64,
-        header.station2_position[1] as f64,
-        header.station2_position[2] as f64,
+        { header.station2_position[0] },
+        { header.station2_position[1] },
+        { header.station2_position[2] },
         header.source_name,
-        header.source_position_ra.to_degrees() as f64,
-        header.source_position_dec.to_degrees() as f64
+        { header.source_position_ra.to_degrees() },
+        { header.source_position_dec.to_degrees() }
     );
     if !header_file_path.exists() {
         std::fs::write(header_file_path, &header_info)?;
@@ -203,7 +203,7 @@ pub fn insert_product_before_processing_suffixes(base: &str, product: &str) -> S
     let mut output = core.to_string();
     let product = product.trim_matches('_');
     if !product.is_empty() && core != product && !core.ends_with(&format!("_{product}")) {
-        output.push_str("_");
+        output.push('_');
         output.push_str(product);
     }
     append_processing_suffixes(&mut output, bandpass, rfi, contamisubt, spike34, inbeam);

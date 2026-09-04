@@ -1,4 +1,5 @@
 // FRMAP module (frmap = fringe rate map).
+#![allow(clippy::too_many_arguments)]
 // Builds fringe-rate map constraints from baseline/fringe-rate measurements
 // and estimates sky-position intersections.
 use std::error::Error;
@@ -93,7 +94,7 @@ fn compute_median(data: &mut [f64]) -> f64 {
         }
     });
     let mid = data.len() / 2;
-    if data.len() % 2 == 0 {
+    if data.len().is_multiple_of(2) {
         (data[mid - 1] + data[mid]) * 0.5
     } else {
         data[mid]
@@ -669,8 +670,8 @@ pub fn run_fringe_rate_map_analysis(
             total_complex_beam.iter().map(|&value| value * inv_segments),
         )?;
         let uv_sample: Vec<f64> = (0..all_uv_data.len()).map(|index| index as f64).collect();
-        let uv_u: Vec<f32> = all_uv_data.iter().map(|&(u, _)| u as f32).collect();
-        let uv_v: Vec<f32> = all_uv_data.iter().map(|&(_, v)| v as f32).collect();
+        let uv_u: Vec<f32> = all_uv_data.iter().map(|&(u, _)| u).collect();
+        let uv_v: Vec<f32> = all_uv_data.iter().map(|&(_, v)| v).collect();
         npz.add_f64_1d("uv_sample", &uv_sample);
         npz.add_f32_1d("uv_u_wavelength", &uv_u);
         npz.add_f32_1d("uv_v_wavelength", &uv_v);
@@ -1267,7 +1268,7 @@ fn plot_fringe_rate_lines(
         .x_label_formatter(&|x| format!("{:.0}", x))
         .y_label_formatter(&|y| format!("{:.0}", y))
         .label_style(("sans-serif", 26))
-        .light_line_style(&TRANSPARENT)
+        .light_line_style(TRANSPARENT)
         .draw()?;
 
     let max_snr = lines.iter().fold(0.0_f64, |acc, line| acc.max(line.snr));
@@ -1284,7 +1285,7 @@ fn plot_fringe_rate_lines(
             } else {
                 1.0
             };
-            let color = BLUE.mix(frac as f64);
+            let color = BLUE.mix(frac);
             chart.draw_series(LineSeries::new(pts, color.stroke_width(2)))?;
         }
     }
@@ -1295,7 +1296,7 @@ fn plot_fringe_rate_lines(
             Circle::new(
                 (-point.l * rad_to_arcsec, point.m * rad_to_arcsec),
                 size,
-                &RED.mix(0.7),
+                RED.mix(0.7),
             )
         }))?;
     }
@@ -1751,10 +1752,12 @@ mod tests {
             fft_point as f32 / 2.0,
             fft_point as usize,
         );
-        let mut header = CorHeader::default();
-        header.observing_frequency = observing_frequency;
-        header.sampling_speed = sampling_speed;
-        header.fft_point = fft_point;
+        let header = CorHeader {
+            observing_frequency,
+            sampling_speed,
+            fft_point,
+            ..CorHeader::default()
+        };
         let map = create_complex_map(
             &delay_rate,
             u_mid,

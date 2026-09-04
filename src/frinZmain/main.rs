@@ -306,11 +306,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if args.scan_correct.is_some() {
-        if !args.search.is_empty() {
-            eprintln!("Error: --scan-correct cannot be used with --search.");
-            exit(1);
-        }
+    if args.scan_correct.is_some() && !args.search.is_empty() {
+        eprintln!("Error: --scan-correct cannot be used with --search.");
+        exit(1);
     }
 
     apply_runtime_defaults(&mut args, iter_explicit, rate_padding_explicit);
@@ -513,7 +511,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 time_flag_ranges = params
                     .chunks_exact(2)
-                    .filter_map(|chunk| {
+                    .flat_map(|chunk| {
                         let start = utils::parse_flag_time(&chunk[0]);
                         let end = utils::parse_flag_time(&chunk[1]);
                         match (start, end) {
@@ -547,7 +545,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 pp_flag_ranges = params
                     .chunks_exact(2)
-                    .filter_map(|chunk| {
+                    .flat_map(|chunk| {
                         let start_res = chunk[0].parse::<u32>();
                         let end_res = chunk[1].parse::<u32>();
                         match (start_res, end_res) {
@@ -631,7 +629,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if let Some(_) = args.fringe_rate_map {
+    if args.fringe_rate_map.is_some() {
         if let Some(input_path) = &args.input {
             if !check_memory_usage(&args, input_path)? {
                 exit(0);

@@ -1,3 +1,5 @@
+// RFI histogram and mask APIs retain explicit axes and fit controls.
+#![allow(clippy::too_many_arguments)]
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -197,11 +199,13 @@ impl PlaneMask {
 
 impl RfiMask {
     pub fn is_empty(&self) -> bool {
-        self.frequency_rate.as_ref().map_or(true, |plane| {
-            !plane.is_valid() || !plane.mask.iter().any(|value| *value)
-        }) && self.delay_rate.as_ref().map_or(true, |plane| {
-            !plane.is_valid() || !plane.mask.iter().any(|value| *value)
-        })
+        self.frequency_rate
+            .as_ref()
+            .is_none_or(|plane| !plane.is_valid() || !plane.mask.iter().any(|value| *value))
+            && self
+                .delay_rate
+                .as_ref()
+                .is_none_or(|plane| !plane.is_valid() || !plane.mask.iter().any(|value| *value))
     }
 
     /// Conservative channel mask used by direct coherent-search evaluation.
@@ -597,9 +601,7 @@ fn nearest_axis_index(axis: &[f64], value: f64) -> Option<usize> {
             continue;
         }
         let distance = (candidate - value).abs();
-        if best.map_or(true, |(_, best_distance): (usize, f64)| {
-            distance < best_distance
-        }) {
+        if best.is_none_or(|(_, best_distance): (usize, f64)| distance < best_distance) {
             best = Some((index, distance));
         }
     }
@@ -633,9 +635,7 @@ fn build_rate_map(source_axis: &[f64], target_count: usize, integ_time: f32) -> 
             let mut best = None;
             for (index, &candidate) in target_axis.iter().enumerate() {
                 let distance = (candidate - value as f32).abs();
-                if best.map_or(true, |(_, best_distance): (usize, f32)| {
-                    distance < best_distance
-                }) {
+                if best.is_none_or(|(_, best_distance): (usize, f32)| distance < best_distance) {
                     best = Some((index, distance));
                 }
             }
@@ -840,7 +840,7 @@ fn rayleigh_survival(value: f64, sigma: f64) -> f64 {
 }
 
 fn rayleigh_bin_probability(lower: f64, upper: f64, sigma: f64) -> f64 {
-    if !(sigma > 0.0) || !sigma.is_finite() || !(upper > lower) {
+    if sigma <= 0.0 || !sigma.is_finite() || upper <= lower {
         return 0.0;
     }
     rayleigh_survival(lower.max(0.0), sigma) - rayleigh_survival(upper.max(0.0), sigma)
@@ -849,7 +849,7 @@ fn rayleigh_bin_probability(lower: f64, upper: f64, sigma: f64) -> f64 {
 fn rayleigh_histogram_sse(edges: &[f64], counts: &[u64], log_sigma: f64, log_samples: f64) -> f64 {
     let sigma = log_sigma.exp();
     let samples = log_samples.exp();
-    if !(sigma > 0.0) || !sigma.is_finite() || !(samples > 0.0) || !samples.is_finite() {
+    if sigma <= 0.0 || !sigma.is_finite() || samples <= 0.0 || !samples.is_finite() {
         return f64::INFINITY;
     }
     edges
@@ -902,7 +902,7 @@ fn fit_rayleigh_histogram(edges: &[f64], counts: &[u64]) -> RayleighFit {
     } else {
         sigma_mle
     };
-    if !(sigma_initial > 0.0) || !sigma_initial.is_finite() {
+    if sigma_initial <= 0.0 || !sigma_initial.is_finite() {
         return RayleighFit {
             sigma: sigma_mle,
             sigma_mle,
@@ -920,7 +920,7 @@ fn fit_rayleigh_histogram(edges: &[f64], counts: &[u64]) -> RayleighFit {
     for _ in 0..500 {
         let sigma = log_sigma.exp();
         let samples = log_samples.exp();
-        if !(sigma > 0.0) || !sigma.is_finite() || !(samples > 0.0) || !samples.is_finite() {
+        if sigma <= 0.0 || !sigma.is_finite() || samples <= 0.0 || !samples.is_finite() {
             break;
         }
         let sigma_squared = sigma * sigma;
@@ -1002,7 +1002,7 @@ fn fit_rayleigh_values(
     max_value: f64,
     histogram_bins: usize,
 ) -> RayleighFit {
-    if values.is_empty() || !(min_positive > 0.0) || !(max_value >= min_positive) {
+    if values.is_empty() || min_positive <= 0.0 || max_value < min_positive {
         return RayleighFit {
             sigma: f64::NAN,
             sigma_mle: f64::NAN,
@@ -1177,9 +1177,9 @@ pub fn detect_histogram_rfi(
     // celestial signal. The finite-band sinc response occupies the complete
     // delay column and rate row through the peak, so mark that cross as
     // celestial and keep it out of the Rayleigh/RFI statistics.
-    for index in 0..total {
+    for (index, celestial_cell) in celestial.iter_mut().enumerate().take(total) {
         if is_protected(index) {
-            celestial[index] = true;
+            *celestial_cell = true;
         }
     }
     // It must not participate in the Rayleigh fit or in
@@ -2015,7 +2015,7 @@ fn write_histogram_heatmap(
         }
         chart
             .configure_series_labels()
-            .border_style(&BLACK)
+            .border_style(BLACK)
             .background_style(WHITE.mix(0.8))
             .draw()?;
     }
@@ -2182,7 +2182,7 @@ fn draw_histogram_panel(
     chart
         .configure_series_labels()
         .background_style(WHITE.mix(0.85))
-        .border_style(&BLACK)
+        .border_style(BLACK)
         .label_font(("sans-serif", 15))
         .draw()?;
     Ok(())

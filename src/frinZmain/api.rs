@@ -221,7 +221,7 @@ fn run_delay_rate(
     if fft_point_half == 0 {
         return Err("FFT point must be >= 2".into());
     }
-    if complex_vec.len() % fft_point_half != 0 {
+    if !complex_vec.len().is_multiple_of(fft_point_half) {
         return Err(format!(
             "visibility length ({}) is not divisible by FFT-half channels ({})",
             complex_vec.len(),
@@ -343,17 +343,19 @@ fn run_delay_rate(
 }
 
 fn args_from_options(options: &LibraryOptions, frequency_mode: bool) -> Args {
-    let mut args = Args::default();
-    args.frequency = frequency_mode;
-    args.spectrum = frequency_mode;
-    args.rate_padding = options.rate_padding.max(1);
-    args.iter = options.iter;
-    args.cpu = options.cpu;
-    args.delay_correct = options.correction.delay_samples;
-    args.rate_correct = options.correction.rate_hz;
-    args.acel_correct = options.correction.acceleration_hz_per_s;
-    args.jerk_correct = options.correction.jerk_hz_per_s2;
-    args.snap_correct = options.correction.snap_hz_per_s3;
+    let mut args = Args {
+        frequency: frequency_mode,
+        spectrum: frequency_mode,
+        rate_padding: options.rate_padding.max(1),
+        iter: options.iter,
+        cpu: options.cpu,
+        delay_correct: options.correction.delay_samples,
+        rate_correct: options.correction.rate_hz,
+        acel_correct: options.correction.acceleration_hz_per_s,
+        jerk_correct: options.correction.jerk_hz_per_s2,
+        snap_correct: options.correction.snap_hz_per_s3,
+        ..Args::default()
+    };
     if let Some(mode) = options.search_mode {
         args.search = vec![mode.as_str().to_string()];
         if args.rate_padding < 8 {
@@ -385,10 +387,10 @@ fn pad_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_width: u
         (current_rows as u32).next_power_of_two() as i32
     };
     if target_rows > current_rows {
-        data.extend(
-            std::iter::repeat(C32::new(0.0, 0.0))
-                .take((target_rows - current_rows) as usize * row_width),
-        );
+        data.extend(std::iter::repeat_n(
+            C32::new(0.0, 0.0),
+            (target_rows - current_rows) as usize * row_width,
+        ));
     }
     target_rows
 }

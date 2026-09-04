@@ -1,3 +1,5 @@
+// Folding kernels retain explicit timing and phase parameters.
+#![allow(clippy::too_many_arguments)]
 use astro::ecliptic;
 use astro::planet::{self, Planet};
 use astro::time;

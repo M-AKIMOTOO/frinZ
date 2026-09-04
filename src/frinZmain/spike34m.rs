@@ -1,3 +1,5 @@
+// Spike correction kernels retain explicit spectral and temporal axes.
+#![allow(clippy::too_many_arguments)]
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
@@ -22,6 +24,8 @@ use crate::utils::rate_cal;
 use plotters::prelude::*;
 
 type C32 = Complex<f32>;
+type SpectraRead = (CorHeader, Vec<Vec<C32>>, f32);
+type SpikeCorrectionResult = (Vec<Vec<C32>>, Vec<Vec<C32>>, f32, f32);
 
 #[derive(Clone, Debug)]
 pub struct SpikePeak {
@@ -40,7 +44,7 @@ fn output_dir(input_path: &Path) -> PathBuf {
         .join("spike34")
 }
 
-pub fn read_all_spectra(path: &Path) -> Result<(CorHeader, Vec<Vec<C32>>, f32), Box<dyn Error>> {
+pub fn read_all_spectra(path: &Path) -> Result<SpectraRead, Box<dyn Error>> {
     let buffer = read_input_bytes(path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
@@ -85,7 +89,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
     values.sort_by(|a, b| a.total_cmp(b));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         0.5 * (values[mid - 1] + values[mid])
     } else {
         values[mid]
@@ -699,9 +703,7 @@ fn robust_frequency_line_fit(
     let mut intercept = 0.0;
     for _ in 0..10 {
         let weights: Vec<f64> = base.iter().zip(&robust).map(|(a, r)| a * r).collect();
-        let Some((fit_slope, fit_intercept)) = weighted_line_fit(&centered, phase, &weights) else {
-            return None;
-        };
+        let (fit_slope, fit_intercept) = weighted_line_fit(&centered, phase, &weights)?;
         slope = fit_slope;
         intercept = fit_intercept;
         let residual: Vec<f64> = phase
@@ -833,7 +835,10 @@ fn pad_spectra_for_search(flat: &mut Vec<C32>, rows: usize, cols: usize) -> i32 
     }
     let target = rows.next_power_of_two();
     if target > rows {
-        flat.extend(std::iter::repeat(C32::new(0.0, 0.0)).take((target - rows) * cols));
+        flat.extend(std::iter::repeat_n(
+            C32::new(0.0, 0.0),
+            (target - rows) * cols,
+        ));
     }
     target as i32
 }
@@ -847,7 +852,7 @@ fn apply_global_and_safe_spike_correction(
     args: &Args,
     current_obs_time: &chrono::DateTime<chrono::Utc>,
     file_start_time: &chrono::DateTime<chrono::Utc>,
-) -> Result<(Vec<Vec<C32>>, Vec<Vec<C32>>, f32, f32), Box<dyn Error>> {
+) -> Result<SpikeCorrectionResult, Box<dyn Error>> {
     if spectra.is_empty() || spectra[0].is_empty() {
         return Ok((spectra.to_vec(), spectra.to_vec(), 0.0, 0.0));
     }
@@ -1726,17 +1731,19 @@ fn write_spike_rate_spectrum_search_corrected(
     let mut curves = vec![vec![0.0f64; nfft]; intervals.len()];
     let mut interval_counts = vec![0usize; intervals.len()];
     for (interval_idx, &(_, _, start, end)) in intervals.iter().enumerate() {
-        for channel in start..=end.min(cols.saturating_sub(1)) {
-            channel_interval[channel] = interval_idx;
+        let last_channel = end.min(cols.saturating_sub(1));
+        for slot in channel_interval
+            .iter_mut()
+            .take(last_channel + 1)
+            .skip(start)
+        {
+            *slot = interval_idx;
             interval_counts[interval_idx] += 1;
         }
     }
 
     let mut work = vec![C32::new(0.0, 0.0); nfft];
-    for channel in 0..cols {
-        let Some(&interval_idx) = channel_interval.get(channel) else {
-            continue;
-        };
+    for (channel, interval_idx) in channel_interval.iter().copied().enumerate() {
         if interval_idx == usize::MAX {
             continue;
         }

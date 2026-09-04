@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use super::shared::{
     compress_plot_png, detect_rfi_cut, output_stem, prepare_output_directory, scaled_font_size,
     scaled_legend_font_size, write_rfi_cut_report, RfiCutReport,
@@ -334,8 +336,8 @@ fn build_dedispersed_series(
     for (row_idx, duration) in pp_durations.iter().enumerate() {
         let center = centers[row_idx];
         let mut amp_sum = 0.0f64;
-        for chan_idx in 0..samples_per_sector {
-            let amp = dedispersed_heatmap[row_idx][chan_idx].norm() as f64;
+        for cell in dedispersed_heatmap[row_idx].iter().take(samples_per_sector) {
+            let amp = cell.norm() as f64;
             amp_sum += amp;
         }
         dedispersed_time_series.push((center, amp_sum * duration));
@@ -442,8 +444,8 @@ pub(crate) fn build_onpulse_dedispersed_sectors(
         .first()
         .map(|r| r.len())
         .unwrap_or(0);
-    let first_center = dedispersed.pp_elapsed.get(0).copied().unwrap_or(0.0)
-        + dedispersed.pp_durations.get(0).copied().unwrap_or(0.0) / 2.0;
+    let first_center = dedispersed.pp_elapsed.first().copied().unwrap_or(0.0)
+        + dedispersed.pp_durations.first().copied().unwrap_or(0.0) / 2.0;
 
     let on_count = on_mask.iter().filter(|&&v| v).count();
     let off_count = bins.saturating_sub(on_count);
@@ -764,8 +766,8 @@ fn compute_gated_aggregation(
     }
 
     let mut bin_assignments = Vec::with_capacity(sectors);
-    let first_center = dedispersed.pp_elapsed.get(0).copied().unwrap_or(0.0)
-        + dedispersed.pp_durations.get(0).copied().unwrap_or(0.0) / 2.0;
+    let first_center = dedispersed.pp_elapsed.first().copied().unwrap_or(0.0)
+        + dedispersed.pp_durations.first().copied().unwrap_or(0.0) / 2.0;
     for (idx, elapsed) in dedispersed.pp_elapsed.iter().enumerate() {
         let duration = dedispersed.pp_durations.get(idx).copied().unwrap_or(0.0);
         let center = elapsed + duration / 2.0;
@@ -1020,13 +1022,13 @@ fn write_outputs(
     let raw_rows = dedispersed.spectra_heatmap.len();
     let raw_cols = dedispersed
         .spectra_heatmap
-        .get(0)
+        .first()
         .map(|row| row.len())
         .unwrap_or(0);
     let dedisp_rows = dedispersed.dedispersed_heatmap.len();
     let dedisp_cols = dedispersed
         .dedispersed_heatmap
-        .get(0)
+        .first()
         .map(|row| row.len())
         .unwrap_or(0);
     if full_output
@@ -1660,7 +1662,7 @@ fn plot_folded_profile(
         .position(SeriesLabelPosition::UpperRight)
         .label_font(("sans-serif", scaled_legend_font_size(16)).into_font())
         .background_style(WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
@@ -1763,7 +1765,7 @@ fn plot_gated_profile(
         .position(SeriesLabelPosition::UpperRight)
         .label_font(("sans-serif", scaled_legend_font_size(16)).into_font())
         .background_style(WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
@@ -1894,7 +1896,7 @@ fn plot_gated_spectrum(
     let freq_max = on.iter().map(|(f, _)| *f).fold(f64::NEG_INFINITY, f64::max);
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
-    for series in [&on[..], &off[..], &diff[..]] {
+    for series in [on, off, diff] {
         for &(_, amp) in series {
             y_min = y_min.min(amp);
             y_max = y_max.max(amp);
@@ -1933,26 +1935,26 @@ fn plot_gated_spectrum(
     chart
         .draw_series(LineSeries::new(on.iter().copied(), &BLUE))?
         .label("On-pulse")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], &BLUE));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], BLUE));
 
     if off.iter().any(|&(_, amp)| amp.is_finite()) {
         chart
             .draw_series(LineSeries::new(off.iter().copied(), &GREEN))?
             .label("Off-pulse")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], &GREEN));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], GREEN));
     }
 
     chart
         .draw_series(LineSeries::new(diff.iter().copied(), &RED))?
         .label("On-Off")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], &RED));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], RED));
 
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
         .label_font(("sans-serif", scaled_legend_font_size(16)).into_font())
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
@@ -2069,8 +2071,8 @@ fn plot_gated_time_series(output_path: &Path, data: &[(f64, f64, bool)]) -> Resu
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
         .label_font(("sans-serif", scaled_legend_font_size(16)).into_font())
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
@@ -2266,21 +2268,20 @@ fn build_on_pulse_phase_difference_heatmap(
     let mut off_sums = vec![0.0f64; channels];
     let mut off_weights = vec![0.0f64; channels];
 
-    for sector_idx in 0..sectors {
-        let duration = pp_durations
-            .get(sector_idx)
-            .copied()
-            .unwrap_or(0.0)
-            .max(0.0);
+    for ((duration, center), row) in pp_durations
+        .iter()
+        .zip(centers.iter())
+        .zip(dedispersed_heatmap.iter())
+    {
+        let duration = (*duration).max(0.0);
         if duration <= 0.0 {
             continue;
         }
-        let center = centers.get(sector_idx).copied().unwrap_or(first_center);
-        let phase = ((center - first_center) / period).rem_euclid(1.0);
+        let phase = ((*center - first_center) / period).rem_euclid(1.0);
         let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
         let is_on = on_mask[bin];
-        for chan_idx in 0..channels {
-            let amp = dedispersed_heatmap[sector_idx][chan_idx].norm() as f64;
+        for (chan_idx, cell) in row.iter().enumerate().take(channels) {
+            let amp = cell.norm() as f64;
             if is_on {
                 on_sums[bin][chan_idx] += amp * duration;
                 on_weights[bin][chan_idx] += duration;

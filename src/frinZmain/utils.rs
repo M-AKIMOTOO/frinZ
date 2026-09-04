@@ -112,7 +112,7 @@ pub fn radec2azalt(
     let decimal_day_calc = obs_day as f64
         + obs_hour as f64 / 24.0
         + obs_minute as f64 / 60.0 / 24.0
-        + obs_second as f64 / 24.0 / 60.0 / 60.0;
+        + obs_second / 24.0 / 60.0 / 60.0;
 
     let date = time::Date {
         year: obs_year,
@@ -155,7 +155,7 @@ pub fn mjd_cal(time: DateTime<Utc>) -> f64 {
     let decimal_day_calc = obs_day as f64
         + obs_hour as f64 / 24.0
         + obs_minute as f64 / 60.0 / 24.0
-        + obs_second as f64 / 24.0 / 60.0 / 60.0;
+        + obs_second / 24.0 / 60.0 / 60.0;
 
     let date = time::Date {
         year: obs_year,
@@ -194,8 +194,8 @@ pub fn unwrap_phase(phases: &mut [f32], radians: bool) {
     let mut offset = 0.0;
     let mut original_prev = phases[0];
 
-    for i in 1..phases.len() {
-        let original_current = phases[i];
+    for phase in phases.iter_mut().skip(1) {
+        let original_current = *phase;
         let diff = original_current - original_prev;
         if radians {
             if diff > std::f32::consts::PI {
@@ -210,7 +210,7 @@ pub fn unwrap_phase(phases: &mut [f32], radians: bool) {
                 offset += 360.0;
             }
         }
-        phases[i] += offset;
+        *phase += offset;
         original_prev = original_current;
     }
 }

@@ -3,7 +3,7 @@ use ndarray::prelude::*;
 use num_complex::Complex;
 use plotters::prelude::*;
 use std::fs::{self, File};
-use std::io::{self, BufReader, ErrorKind, Read};
+use std::io::{self, BufReader, Read};
 
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::utils::safe_arg;
@@ -284,7 +284,7 @@ pub fn plot_bandpass_spectrum(
 
     // Helper to convert plotters error to io::Error, reducing boilerplate
     fn to_io_error<E: std::fmt::Display>(e: E) -> io::Error {
-        io::Error::new(ErrorKind::Other, e.to_string())
+        io::Error::other(e.to_string())
     }
 
     let output_file_path = path.with_extension("png"); // Change extension to png

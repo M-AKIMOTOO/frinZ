@@ -1,4 +1,6 @@
 // Bispectrum / closure-phase analysis module.
+// Its numerical kernels keep baseline and phase parameters explicit.
+#![allow(clippy::too_many_arguments)]
 // This code multiplies three baseline visibilities to form the bispectrum,
 // then derives closure phase and related statistics/plots.
 use crate::args::Args;
@@ -24,6 +26,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 type C32 = Complex<f32>;
+type ClosureProducts = (Vec<ClosureSample>, Vec<Vec<C32>>, Vec<Vec<u8>>);
 
 const FILE_HEADER_SIZE: usize = 256;
 const SECTOR_HEADER_SIZE: usize = 128;
@@ -405,7 +408,7 @@ fn apply_phase_solution(
 ) -> Vec<C32> {
     if fft_half == 0
         || complex_vec.is_empty()
-        || complex_vec.len() % fft_half != 0
+        || !complex_vec.len().is_multiple_of(fft_half)
         || (delay_samples == 0.0
             && rate_hz == 0.0
             && acel_hz == 0.0
@@ -784,7 +787,7 @@ fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         0.5 * (v[n / 2 - 1] + v[n / 2])
     } else {
         v[n / 2]
@@ -813,7 +816,7 @@ fn build_closure_products(
     common_indices: &[[usize; 3]],
     sign2: f32,
     sign3: f32,
-) -> Result<(Vec<ClosureSample>, Vec<Vec<C32>>, Vec<Vec<u8>>), Box<dyn Error>> {
+) -> Result<ClosureProducts, Box<dyn Error>> {
     if common_indices.is_empty() {
         return Err("No overlapping epochs found across the three baselines.".into());
     }
@@ -1218,7 +1221,7 @@ fn plot_closure_phase(
         .y_labels(15)
         .label_style(("sans-serif", 22))
         .axis_desc_style(("sans-serif", 24))
-        .light_line_style(&WHITE)
+        .light_line_style(WHITE)
         .draw()?;
 
     let colors = [
@@ -1351,7 +1354,7 @@ fn plot_bispectrum(path: &Path, rows: &[ClosureSample]) -> Result<(), Box<dyn Er
         .y_label_formatter(&|y| format!("{:>9.2e}", *y))
         .label_style(("sans-serif", 20))
         .axis_desc_style(("sans-serif", 22))
-        .light_line_style(&WHITE)
+        .light_line_style(WHITE)
         .draw()?;
 
     let c1 = RGBColor(0, 102, 204);
@@ -1393,8 +1396,8 @@ fn plot_bispectrum(path: &Path, rows: &[ClosureSample]) -> Result<(), Box<dyn Er
 
     chart_top
         .configure_series_labels()
-        .border_style(&BLACK)
-        .background_style(&WHITE.mix(0.8))
+        .border_style(BLACK)
+        .background_style(WHITE.mix(0.8))
         .label_font(("sans-serif", 18))
         .draw()?;
 
@@ -1423,7 +1426,7 @@ fn plot_bispectrum(path: &Path, rows: &[ClosureSample]) -> Result<(), Box<dyn Er
         .y_label_formatter(&|y| format!("{:>9.2e}", *y))
         .label_style(("sans-serif", 20))
         .axis_desc_style(("sans-serif", 22))
-        .light_line_style(&WHITE)
+        .light_line_style(WHITE)
         .draw()?;
 
     chart_bottom
@@ -1436,8 +1439,8 @@ fn plot_bispectrum(path: &Path, rows: &[ClosureSample]) -> Result<(), Box<dyn Er
 
     chart_bottom
         .configure_series_labels()
-        .border_style(&BLACK)
-        .background_style(&WHITE.mix(0.8))
+        .border_style(BLACK)
+        .background_style(WHITE.mix(0.8))
         .label_font(("sans-serif", 18))
         .draw()?;
 
@@ -1689,10 +1692,7 @@ pub fn run_closure_phase_analysis(
             );
         }
         let bispectrum_values: Vec<C32> = rows.iter().map(|row| row.bispectrum).collect();
-        let closure_phase_deg: Vec<f32> = rows
-            .iter()
-            .map(|row| row.closure_phase_deg as f32)
-            .collect();
+        let closure_phase_deg: Vec<f32> = rows.iter().map(|row| row.closure_phase_deg).collect();
         npz.add_complex64_1d("bispectrum", &bispectrum_values);
         npz.add_f32_1d("closure_phase_deg", &closure_phase_deg);
         let npz_path = npz_sidecar_path(&closure_png, "closure_phase");

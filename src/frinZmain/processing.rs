@@ -1,3 +1,5 @@
+// Pipeline entry points retain explicit stage inputs to keep correction order visible.
+#![allow(clippy::too_many_arguments)]
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor};
@@ -7,6 +9,12 @@ use crate::analysis::AnalysisResults;
 use chrono::{DateTime, Duration, Utc};
 use ndarray::{Array, Array2};
 use num_complex::Complex;
+type AnalysisPipelineResult = (
+    AnalysisResults,
+    Option<Array2<C32>>,
+    Array2<C32>,
+    Option<AnalysisResults>,
+);
 
 use crate::analysis::analyze_results;
 use crate::args::Args;
@@ -116,7 +124,7 @@ fn parse_scan_correct_file(path: &Path) -> Result<Vec<ScanCorrection>, Box<dyn E
         }
 
         let time_str = format!("{} {}", parts[0], parts[1]);
-        let time_str_cleaned = time_str.replace('/', "").replace(' ', "").replace(':', "");
+        let time_str_cleaned = time_str.replace(['/', ' ', ':'], "");
         let start_time = match parse_flag_time(&time_str_cleaned) {
             Some(t) => t,
             None => {
@@ -208,7 +216,7 @@ fn rebin_complex_rows(
         || target_cols == 0
         || original_cols == target_cols
         || target_cols > original_cols
-        || original_cols % target_cols != 0
+        || !original_cols.is_multiple_of(target_cols)
     {
         return data.to_vec();
     }
@@ -242,7 +250,7 @@ fn pad_time_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_wid
 
     if target_rows > current_rows {
         let additional_samples = (target_rows - current_rows) as usize * row_width;
-        data.extend(std::iter::repeat(C32::new(0.0, 0.0)).take(additional_samples));
+        data.extend(std::iter::repeat_n(C32::new(0.0, 0.0), additional_samples));
     }
 
     target_rows
@@ -399,7 +407,7 @@ pub fn process_cor_file(
 
         let original_half = (original_fft_point / 2) as usize;
         let requested_half = (requested_fft_point / 2) as usize;
-        if requested_half == 0 || original_half % requested_half != 0 {
+        if requested_half == 0 || !original_half.is_multiple_of(requested_half) {
             return Err(format!(
                 "--fft-rebin ({}) は元のチャンネル数 ({}) を整数分割できません",
                 requested_fft_point, original_fft_point
@@ -456,7 +464,7 @@ pub fn process_cor_file(
         }
     }
 
-    let bandpass_active = bandpass_data.as_ref().map_or(false, |bp| !bp.is_empty());
+    let bandpass_active = bandpass_data.as_ref().is_some_and(|bp| !bp.is_empty());
     if args.bandpass.is_some() {
         println!(
             "#Bandpass applied: {}",
@@ -1282,7 +1290,7 @@ pub fn process_cor_file(
                         station2_label
                     );
                 if !suppress_output {
-                    print!("{}\n", header_str);
+                    println!("{}", header_str);
                 }
                 if args.output {
                     delay_tsv.push_str(&format_delay_tsv_header(
@@ -1292,7 +1300,7 @@ pub fn process_cor_file(
                 }
             }
             if !suppress_output {
-                print!("{}\n", delay_output_line);
+                println!("{}", delay_output_line);
             }
             if args.output {
                 delay_tsv.push_str(&format_delay_tsv_row(
@@ -1377,7 +1385,7 @@ pub fn process_cor_file(
                     station2_label
                 );
                 if !suppress_output {
-                    print!("{}\n", header_str);
+                    println!("{}", header_str);
                 }
                 if args.output {
                     freq_tsv.push_str(&format_freq_tsv_header(
@@ -1387,7 +1395,7 @@ pub fn process_cor_file(
                 }
             }
             if !suppress_output {
-                print!("{}\n", freq_output_line);
+                println!("{}", freq_output_line);
             }
             if args.output {
                 freq_tsv.push_str(&format_freq_tsv_row(
@@ -1551,16 +1559,9 @@ pub fn process_cor_file(
                         });
                     let rows = delay_rate_2d_data_comp.shape()[0] as u32;
                     let cols = delay_rate_2d_data_comp.shape()[1] as u32;
-                    let delay_data: Vec<f32> = analysis_results
-                        .delay_range
-                        .iter()
-                        .map(|&x| x as f32)
-                        .collect();
-                    let rate_data: Vec<f32> = analysis_results
-                        .rate_range
-                        .iter()
-                        .map(|&x| x as f32)
-                        .collect();
+                    let delay_data: Vec<f32> =
+                        analysis_results.delay_range.iter().copied().collect();
+                    let rate_data: Vec<f32> = analysis_results.rate_range.to_vec();
                     let mut plot_drange: Vec<f32> = if args.drange.len() == 2
                         && matches!(
                             primary_search_mode,
@@ -1844,16 +1845,8 @@ pub fn process_cor_file(
                                 .map(|(&x, &y)| (x as f64, y as f64))
                                 .collect()
                         });
-                    let freq_data: Vec<f32> = analysis_results
-                        .freq_range
-                        .iter()
-                        .map(|&x| x as f32)
-                        .collect();
-                    let rate_data: Vec<f32> = analysis_results
-                        .rate_range
-                        .iter()
-                        .map(|&x| x as f32)
-                        .collect();
+                    let freq_data: Vec<f32> = analysis_results.freq_range.iter().copied().collect();
+                    let rate_data: Vec<f32> = analysis_results.rate_range.to_vec();
                     let heatmap_func = |freq: f64, rate: f64| -> f64 {
                         let f_min = freq_data[0] as f64;
                         let f_max = *freq_data.last().unwrap() as f64;
@@ -2014,15 +2007,7 @@ pub(crate) fn run_analysis_pipeline(
     bandpass_data: &Option<Vec<C32>>,
     keep_pre_bandpass_results: bool,
     effective_fft_point: i32,
-) -> Result<
-    (
-        AnalysisResults,
-        Option<Array2<C32>>,
-        Array2<C32>,
-        Option<AnalysisResults>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<AnalysisPipelineResult, Box<dyn Error>> {
     let mut temp_args = base_args.clone();
     temp_args.delay_correct = delay_correct;
     temp_args.rate_correct = rate_correct;
@@ -2052,7 +2037,7 @@ pub(crate) fn run_analysis_pipeline(
             return Err("セクター長が 0 以下です".into());
         }
         let rows = current_length as usize;
-        if rows == 0 || complex_vec.len() % rows != 0 {
+        if rows == 0 || !complex_vec.len().is_multiple_of(rows) {
             return Err(format!(
                 "複素データ長 ({}) がセクター数 ({}) の整数倍ではありません。",
                 complex_vec.len(),
@@ -2068,7 +2053,7 @@ pub(crate) fn run_analysis_pipeline(
     if fft_point_half == 0 {
         return Err("effective FFT point が不正（0）です".into());
     }
-    if complex_vec.len() % fft_point_half != 0 {
+    if !complex_vec.len().is_multiple_of(fft_point_half) {
         return Err(format!(
             "複素データ長 ({}) が FFT チャンネル数 ({}) の整数倍ではありません。",
             complex_vec.len(),
@@ -2174,10 +2159,10 @@ pub(crate) fn run_analysis_pipeline(
         Some(analyze_results(
             &freq_rate_array,
             &pre_bandpass_delay_rate_2d_data_comp,
-            &header,
+            header,
             current_length,
             effective_integ_time,
-            &current_obs_time,
+            current_obs_time,
             padding_length,
             &temp_args,
             search_mode,
@@ -2211,10 +2196,10 @@ pub(crate) fn run_analysis_pipeline(
     let analysis_results = analyze_results(
         &freq_rate_array,
         &delay_rate_2d_data_comp,
-        &header,
+        header,
         current_length,
         effective_integ_time,
-        &current_obs_time,
+        current_obs_time,
         padding_length,
         &temp_args,
         search_mode,

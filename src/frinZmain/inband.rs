@@ -161,7 +161,7 @@ fn validate_inband_width(
         )
         .into());
     }
-    if original_half % channels_per_band != 0 {
+    if !original_half.is_multiple_of(channels_per_band) {
         return Err(format!(
             "--inband {inband_mhz} MHz does not evenly divide the observing bandwidth {bw_mhz:.3} MHz."
         )
@@ -322,7 +322,8 @@ pub fn run_inband_analysis(
 
         let time_index = time_rows.len();
 
-        for band_idx in 0..band_count {
+        for (band_idx, previous_solution_slot) in prev_solutions.iter_mut().enumerate() {
+            let previous_solution = *previous_solution_slot;
             let start_chan = band_idx * channels_per_band;
             let band_start_mhz = start_chan as f32 * rbw_mhz;
             let mut subband_vec = extract_subband(
@@ -368,7 +369,7 @@ pub fn run_inband_analysis(
                         &local_args,
                         sub_header.number_of_sector,
                         local_args.cpu,
-                        prev_solutions[band_idx],
+                        previous_solution,
                     )?
                     .analysis_results
                 }
@@ -386,7 +387,7 @@ pub fn run_inband_analysis(
                         &local_args,
                         sub_header.number_of_sector,
                         local_args.cpu,
-                        prev_solutions[band_idx],
+                        previous_solution,
                     )?
                     .analysis_results
                 }
@@ -415,7 +416,7 @@ pub fn run_inband_analysis(
             };
 
             if requested_search.is_some() {
-                prev_solutions[band_idx] = Some((analysis.residual_delay, analysis.residual_rate));
+                *previous_solution_slot = Some((analysis.residual_delay, analysis.residual_rate));
             }
             if band_idx == 0 {
                 time_rows.push((time_index, analysis.yyyydddhhmmss1.clone(), analysis.mjd));

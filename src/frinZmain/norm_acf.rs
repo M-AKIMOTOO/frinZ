@@ -1,3 +1,5 @@
+// ACF helpers expose normalization inputs explicitly for reproducibility.
+#![allow(clippy::too_many_arguments)]
 use std::error::Error;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};

@@ -237,7 +237,7 @@ pub fn solve_antenna_tau_rate(
     {
         let svd = bw.svd(true, false);
         let sv = svd.singular_values;
-        if sv.len() >= 1 {
+        if !sv.is_empty() {
             let mut smax = 0.0f64;
             let mut smin = f64::INFINITY;
             for v in sv.iter().cloned() {

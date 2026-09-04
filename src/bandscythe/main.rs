@@ -1,4 +1,7 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::fs::File;
+
 use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -379,7 +382,7 @@ fn rebin_complex_spectrum(data: &[Complex32], output_bins: usize) -> Result<Vec<
     if output_bins == 0 {
         return Err(anyhow!("requested output bin count must be positive"));
     }
-    if data.len() % output_bins != 0 {
+    if !data.len().is_multiple_of(output_bins) {
         return Err(anyhow!(
             "cannot rebin {} samples into {} bins (non-integer ratio)",
             data.len(),

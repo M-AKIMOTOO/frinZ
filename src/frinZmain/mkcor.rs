@@ -1,3 +1,5 @@
+// Correction kernels retain explicit physical correction terms.
+#![allow(clippy::too_many_arguments)]
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;

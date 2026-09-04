@@ -1,4 +1,5 @@
 // M.AKIMOTO with Gemini
+
 // 2025/08/18
 // cargo run -- --source <source_name> <入力ファイル1> <入力ファイル2> ...
 
@@ -347,41 +348,6 @@ fn generate_output_filename(input_files: &[PathBuf]) -> Result<PathBuf, Box<dyn 
     Ok(PathBuf::from(output_filename_str))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generate_output_filename_preserves_common_trailing_label() {
-        let files = vec![
-            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600_x.cor"),
-            PathBuf::from("YAMAGU34_YAMAGU34_2025310003600_x.cor"),
-        ];
-
-        let output = generate_output_filename(&files).unwrap();
-
-        assert_eq!(
-            output,
-            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600T2025310003600_x_cormerge.cor")
-        );
-    }
-
-    #[test]
-    fn generate_output_filename_preserves_multi_part_trailing_label() {
-        let files = vec![
-            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600_x_usb.cor"),
-            PathBuf::from("YAMAGU34_YAMAGU34_2025310003600_x_usb.cor"),
-        ];
-
-        let output = generate_output_filename(&files).unwrap();
-
-        assert_eq!(
-            output,
-            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600T2025310003600_x_usb_cormerge.cor")
-        );
-    }
-}
-
 fn cleanup_temp_files(paths: &[&Path]) {
     for path in paths {
         if let Err(e) = fs::remove_file(path) {
@@ -609,4 +575,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_output_filename_preserves_common_trailing_label() {
+        let files = vec![
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600_x.cor"),
+            PathBuf::from("YAMAGU34_YAMAGU34_2025310003600_x.cor"),
+        ];
+
+        let output = generate_output_filename(&files).unwrap();
+
+        assert_eq!(
+            output,
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600T2025310003600_x_cormerge.cor")
+        );
+    }
+
+    #[test]
+    fn generate_output_filename_preserves_multi_part_trailing_label() {
+        let files = vec![
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600_x_usb.cor"),
+            PathBuf::from("YAMAGU34_YAMAGU34_2025310003600_x_usb.cor"),
+        ];
+
+        let output = generate_output_filename(&files).unwrap();
+
+        assert_eq!(
+            output,
+            PathBuf::from("YAMAGU34_YAMAGU34_2025309150600T2025310003600_x_usb_cormerge.cor")
+        );
+    }
 }

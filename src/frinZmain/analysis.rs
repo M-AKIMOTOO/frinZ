@@ -1,3 +1,5 @@
+// Public analysis entry points retain explicit physical quantities for call-site clarity.
+#![allow(clippy::too_many_arguments)]
 use chrono::{DateTime, Utc};
 use ndarray::prelude::*;
 use num_complex::Complex;
@@ -240,15 +242,11 @@ pub fn analyze_results(
         let mut temp_peak_rate_idx = padding_length_half;
         let mut temp_peak_delay_idx = fft_point_half;
 
-        for r_idx in 0..rate_range.len() {
-            if rate_range[r_idx] >= rate_win_low && rate_range[r_idx] <= rate_win_high {
+        for (r_idx, &rate) in rate_range.iter().enumerate() {
+            if rate >= rate_win_low && rate <= rate_win_high {
                 for d_idx in 0..delay_range.len() {
                     if delay_range[d_idx] >= delay_win_low && delay_range[d_idx] <= delay_win_high {
-                        if in_delay_rate_mask(
-                            delay_range[d_idx],
-                            rate_range[r_idx],
-                            delay_rate_mask,
-                        ) {
+                        if in_delay_rate_mask(delay_range[d_idx], rate, delay_rate_mask) {
                             continue;
                         }
                         let current_power = norm_sqr_at(delay_rate_array, r_idx, d_idx);
@@ -290,9 +288,9 @@ pub fn analyze_results(
     } else if delay_rate_mask.is_some() {
         let (mut max_power, mut max_r_idx, mut max_d_idx) =
             (0.0f32, padding_length_half, fft_point_half - 1);
-        for r_idx in 0..delay_rate_array.shape()[0] {
+        for (r_idx, &rate) in rate_range.iter().enumerate() {
             for d_idx in 0..delay_rate_array.shape()[1] {
-                if in_delay_rate_mask(delay_range[d_idx], rate_range[r_idx], delay_rate_mask) {
+                if in_delay_rate_mask(delay_range[d_idx], rate, delay_rate_mask) {
                     continue;
                 }
                 let current_power = norm_sqr_at(delay_rate_array, r_idx, d_idx);
@@ -431,8 +429,8 @@ pub fn analyze_results(
         let mut temp_peak_freq_row_idx = 0;
         let mut temp_peak_rate_col_idx = padding_length_half;
 
-        for r_idx in 0..rate_range.len() {
-            if rate_range[r_idx] >= rate_win_low && rate_range[r_idx] <= rate_win_high {
+        for (r_idx, &rate) in rate_range.iter().enumerate() {
+            if rate >= rate_win_low && rate <= rate_win_high {
                 for f_idx in 0..freq_range.len() {
                     let freq_mhz = freq_range[f_idx];
                     if freq_mhz < freq_win_low || freq_mhz > freq_win_high {
@@ -716,12 +714,12 @@ pub fn analyze_results(
         yyyydddhhmmss1: obs_time.format("%Y/%j %H:%M:%S").to_string(),
         source_name: header.source_name.clone(),
         length_f32,
-        ant1_az: ant1_az as f32,
-        ant1_el: ant1_el as f32,
-        ant1_hgt: ant1_hgt as f32,
-        ant2_az: ant2_az as f32,
-        ant2_el: ant2_el as f32,
-        ant2_hgt: ant2_hgt as f32,
+        ant1_az,
+        ant1_el,
+        ant1_hgt,
+        ant2_az,
+        ant2_el,
+        ant2_hgt,
         mjd: mjd_cal(*obs_time),
         delay_range,
         visibility,

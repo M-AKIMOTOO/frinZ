@@ -83,7 +83,7 @@ pub fn write_real_1d(
         meta,
         &[values.len()],
         values.iter().copied(),
-        std::iter::repeat(0.0).take(values.len()),
+        std::iter::repeat_n(0.0, values.len()),
         axis0,
         &[],
     )
@@ -125,7 +125,7 @@ pub fn write_real_2d(
         meta,
         &[shape.0, shape.1],
         values.iter().copied(),
-        std::iter::repeat(0.0).take(values.len()),
+        std::iter::repeat_n(0.0, values.len()),
         axis0,
         axis1,
     )
@@ -434,7 +434,7 @@ fn make_npy(descr: &str, shape: &[usize], payload: &[u8]) -> Vec<u8> {
         "{{\x27descr\x27: \x27{descr}\x27, \x27fortran_order\x27: False, \x27shape\x27: {shape_descr}, }}"
     ).into_bytes();
     let padding = (64 - ((12 + header.len() + 1) % 64)) % 64;
-    header.extend(std::iter::repeat(b' ').take(padding));
+    header.extend(std::iter::repeat_n(b' ', padding));
     header.push(b'\n');
     let mut output = Vec::with_capacity(12 + header.len() + payload.len());
     output.extend_from_slice(NPY_MAGIC);

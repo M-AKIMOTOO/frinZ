@@ -1,3 +1,5 @@
+// Search routines keep delay/rate and observation metadata explicit.
+#![allow(clippy::too_many_arguments)]
 pub use acel::run_acel_search_analysis;
 pub use deep::{
     run_coherent_search, run_deep2_search, run_deep_search, run_peak_search, DeepSearchParams,
@@ -24,6 +26,7 @@ mod acel {
     use crate::utils::unwrap_phase_with_rate;
 
     type C32 = Complex<f32>;
+    type PhaseExtraction = (Vec<f64>, Vec<f32>, Vec<f32>, Vec<f32>);
 
     struct VisibilityDataPoint {
         complex_vec: Vec<C32>,
@@ -108,7 +111,7 @@ mod acel {
         current_total_acel_correct: f32,
         rfi_ranges: &[(usize, usize)],
         bandpass_data: &Option<Vec<C32>>,
-    ) -> Result<(Vec<f64>, Vec<f32>, Vec<f32>, Vec<f32>), Box<dyn Error>> {
+    ) -> Result<PhaseExtraction, Box<dyn Error>> {
         let mut phases_collected: Vec<f32> = Vec::new();
         let mut times_collected: Vec<f64> = Vec::new();
         let mut residual_rates_hz: Vec<f32> = Vec::new();
@@ -462,7 +465,7 @@ mod acel {
                             .collect();
                         phase_fit_series = Some(fitted_phases);
                         phase_residual_series = Some(residual_phases);
-                        write_fit_data(&linear_path, Some(&vec![intercept, slope]))?;
+                        write_fit_data(&linear_path, Some(&[intercept, slope]))?;
                         println!("  Linear fit: m={:.6e}", slope);
                         total_rate_correct += (slope / (2.0 * std::f64::consts::PI)) as f32;
                     } else {
@@ -535,7 +538,7 @@ mod acel {
             }
 
             if let Some(fitted) = &phase_fit_series {
-                let residuals = phase_residual_series.as_ref().map(|v| v.as_slice());
+                let residuals = phase_residual_series.as_deref();
                 let phase_plot_path =
                     output_dir.join(format!("{}_step{}_phase.png", base_filename, step_idx + 1));
                 plot_acel_search_result(
@@ -550,7 +553,7 @@ mod acel {
             }
 
             if let Some(fitted) = &rate_fit_series {
-                let residuals = rate_residual_series.as_ref().map(|v| v.as_slice());
+                let residuals = rate_residual_series.as_deref();
                 let rate_plot_path = output_dir.join(format!(
                     "{}_step{}_res_rate.png",
                     base_filename,
@@ -568,7 +571,7 @@ mod acel {
             }
 
             if let Some(fitted) = &delay_fit_samples_series {
-                let residuals = delay_residual_samples_series.as_ref().map(|v| v.as_slice());
+                let residuals = delay_residual_samples_series.as_deref();
                 let delay_plot_path = output_dir.join(format!(
                     "{}_step{}_res_delay.png",
                     base_filename,
@@ -608,6 +611,12 @@ mod deep {
     use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, positive_or_epsilon, rate_cal};
 
     type C32 = Complex<f32>;
+    type DeepAnalysis = (
+        AnalysisResults,
+        Option<Array2<C32>>,
+        Array2<C32>,
+        Option<AnalysisResults>,
+    );
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DeepSearchAlgorithm {
@@ -951,7 +960,7 @@ mod deep {
                     return Ok(self.coarse_estimates_streaming(
                         &freq_rate_array,
                         padding_length,
-                        &search_args,
+                        search_args,
                     ));
                 }
                 let mut delay_rate_2d_data_comp =
@@ -1123,15 +1132,7 @@ mod deep {
             final_rate: f32,
             _algorithm: DeepSearchAlgorithm,
             _coarse_analysis: Option<&AnalysisResults>,
-        ) -> Result<
-            (
-                AnalysisResults,
-                Option<Array2<C32>>,
-                Array2<C32>,
-                Option<AnalysisResults>,
-            ),
-            Box<dyn Error>,
-        > {
+        ) -> Result<DeepAnalysis, Box<dyn Error>> {
             // Always evaluate the final candidate on the fully corrected FFT plane.
             // The reported noise/SNR must describe the same corrected data whether or
             // not diagnostic plots were requested. The former no-plot shortcut reused
@@ -1409,7 +1410,7 @@ mod deep {
         if rows == 0 || complex_vec.is_empty() {
             return Err("有効なデータが存在しません".into());
         }
-        if complex_vec.len() % rows != 0 {
+        if !complex_vec.len().is_multiple_of(rows) {
             return Err(format!(
                 "複素データ長 ({}) がセクター数 ({}) の整数倍ではありません",
                 complex_vec.len(),
@@ -1498,8 +1499,10 @@ mod deep {
         */
 
         // Step 2: 階層的探索
-        let mut search_params = DeepSearchParams::default();
-        search_params.max_iterations = (args.iter.max(1)) as usize;
+        let search_params = DeepSearchParams {
+            max_iterations: args.iter.max(1) as usize,
+            ..DeepSearchParams::default()
+        };
         let mut current_delay = coarse_delay;
         let mut current_rate = coarse_rate;
         let rate_denominator =
@@ -1983,15 +1986,17 @@ mod deep {
 
         #[test]
         fn output_options_do_not_select_a_different_coarse_search() {
-            let mut args = Args::default();
-            args.plot = true;
-            args.spectrum = true;
-            args.bandpass_table = true;
-            args.dynamic_spectrum = true;
-            args.raw_visibility = true;
-            args.npz = true;
-            args.contamination = Some(Vec::new());
-            args.rfi = vec!["histogram".to_string()];
+            let mut args = Args {
+                plot: true,
+                spectrum: true,
+                bandpass_table: true,
+                dynamic_spectrum: true,
+                raw_visibility: true,
+                npz: true,
+                contamination: Some(Vec::new()),
+                rfi: vec!["histogram".to_string()],
+                ..Args::default()
+            };
             assert!(!needs_frequency_domain_coarse_search(&args));
 
             args.frequency = true;

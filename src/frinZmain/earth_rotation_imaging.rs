@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
 
 // Earth-rotation synthesis imaging module
 
@@ -43,7 +44,7 @@ fn rebin_complex_rows(
         || target_cols == 0
         || target_cols > original_cols
         || original_cols == target_cols
-        || original_cols % target_cols != 0
+        || !original_cols.is_multiple_of(target_cols)
     {
         return data.to_vec();
     }
@@ -81,7 +82,7 @@ fn pad_time_rows_to_power_of_two(
 
     if target_rows > current_rows {
         let additional_samples = (target_rows - current_rows) * row_width;
-        data.extend(std::iter::repeat(C32::new(0.0, 0.0)).take(additional_samples));
+        data.extend(std::iter::repeat_n(C32::new(0.0, 0.0), additional_samples));
     }
 
     target_rows
@@ -222,7 +223,7 @@ pub fn parse_imaging_cli_options(tokens: &[String]) -> Result<ImagingCliOptions,
         if token.is_empty() {
             continue;
         }
-        let mut parts = token.splitn(2, |c| c == ':' || c == '=');
+        let mut parts = token.splitn(2, [':', '=']);
         let key = parts.next().unwrap().trim().to_ascii_lowercase();
         let value_opt = parts.next().map(|v| v.trim());
 
@@ -985,7 +986,7 @@ fn collect_visibilities_from_cor(
         }
         let original_half = (original_fft_point / 2) as usize;
         let requested_half = (requested_fft / 2) as usize;
-        if requested_half == 0 || original_half % requested_half != 0 {
+        if requested_half == 0 || !original_half.is_multiple_of(requested_half) {
             return Err(format!(
                 "Error: --fft-rebin ({}) は元のチャンネル数 ({}) を整数分割できません。",
                 requested_fft, original_fft_point
@@ -1624,7 +1625,7 @@ fn render_scalar_field_plot(
         .axis_desc_style(("sans-serif", 20))
         .x_label_formatter(&|v| format_angle_tick(*v, angle_unit))
         .y_label_formatter(&|v| format_angle_tick(*v, angle_unit))
-        .light_line_style(&WHITE.mix(0.0))
+        .light_line_style(WHITE.mix(0.0))
         .draw()?;
 
     let half = (size as f64) / 2.0;

@@ -419,7 +419,7 @@ pub fn run_phase_reference_analysis(
                     let new_basename = parts[..3].join("_");
                     let output_filename_str = format!("{}_phsref.cor", new_basename);
                     let phase_reference_dir = target_path.parent().unwrap_or_else(|| Path::new(""));
-                    fs::create_dir_all(&phase_reference_dir)?;
+                    fs::create_dir_all(phase_reference_dir)?;
                     let output_path = phase_reference_dir.join(output_filename_str);
 
                     write_phase_corrected_spectrum_binary(

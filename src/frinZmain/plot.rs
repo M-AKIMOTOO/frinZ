@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
 
 // Plot utilities for frinZ:
 // - delay/rate/frequency planes and diagnostics
@@ -267,7 +268,7 @@ pub fn delay_plane(
         let steps = 100;
         for i in 0..steps {
             let value = i as f64 / (steps - 1) as f64;
-            let color = HSLColor(((1.0 - value) * 0.7).into(), 1.0, 0.5);
+            let color = HSLColor((1.0 - value) * 0.7, 1.0, 0.5);
             colorbar.draw_series(std::iter::once(Rectangle::new(
                 [
                     (0.0, value * max_amplitude),
@@ -539,7 +540,7 @@ pub fn delay_plane(
     let steps = 100;
     for i in 0..steps {
         let value = i as f64 / (steps - 1) as f64;
-        let color = HSLColor(((1.0 - value) * 0.7).into(), 1.0, 0.5);
+        let color = HSLColor((1.0 - value) * 0.7, 1.0, 0.5);
         colorbar.draw_series(std::iter::once(Rectangle::new(
             [
                 (0.0, value * max_amplitude),
@@ -855,7 +856,7 @@ pub fn frequency_plane(
     let steps = 100;
     for i in 0..steps {
         let value = i as f64 / (steps - 1) as f64;
-        let color = HSLColor(((1.0 - value) * 0.7).into(), 1.0, 0.5);
+        let color = HSLColor((1.0 - value) * 0.7, 1.0, 0.5);
         colorbar.draw_series(std::iter::once(Rectangle::new(
             [
                 (0.0, value * max_amplitude),
@@ -1296,20 +1297,16 @@ pub fn add_plot(
 
         chart
             .configure_mesh()
-            .x_desc(&format!(
+            .x_desc(format!(
                 "The elapsed time since {} UT",
                 obs_start_time.format("%Y/%j %H:%M:%S")
             ))
             .y_desc(y_label)
             .x_label_formatter(&|v| format!("{:.0}", v))
             .y_label_formatter(&|v| {
-                if filename_suffix == "phase" {
+                if matches!(filename_suffix, "phase" | "snr") {
                     format!("{:.0}", v)
-                } else if filename_suffix == "snr" {
-                    format!("{:.0}", v)
-                } else if filename_suffix == "resdelay" {
-                    format!("{:.3}", v)
-                } else if filename_suffix == "freq" {
+                } else if matches!(filename_suffix, "resdelay" | "freq") {
                     format!("{:.3}", v)
                 } else if filename_suffix == "resrate" {
                     format!("{:.2e}", v)
@@ -1328,8 +1325,8 @@ pub fn add_plot(
             5,
             GREEN,
             &|c, s, st| {
-                return EmptyElement::at(c)    // We want to construct a composed element on-the-fly
-                    + Circle::new((0,0),s,st.filled()); // At point center, draw a circle
+                EmptyElement::at(c)    // We want to construct a composed element on-the-fly
+                    + Circle::new((0,0),s,st.filled()) // At point center, draw a circle
             },
         ))?;
 
@@ -1343,7 +1340,7 @@ pub fn add_plot(
 pub fn cumulate_plot(
     cumulate_len: &[f32],
     cumulate_snr: &[f32],
-    cumulate_path: &std::path::PathBuf,
+    cumulate_path: &std::path::Path,
     header: &crate::header::CorHeader,
     label: &[&str],
     obs_time: &chrono::DateTime<chrono::Utc>,
@@ -1415,7 +1412,7 @@ pub fn cumulate_plot(
         .y_labels(10)
         .label_style(("sans-serif ", 25).into_font())
         .max_light_lines(9)
-        .light_line_style(&BLACK.mix(0.15))
+        .light_line_style(BLACK.mix(0.15))
         .draw()?;
 
     chart
@@ -1497,8 +1494,8 @@ pub fn cumulate_plot(
 
                 chart
                     .configure_series_labels()
-                    .background_style(&WHITE.mix(0.8))
-                    .border_style(&BLACK)
+                    .background_style(WHITE.mix(0.8))
+                    .border_style(BLACK)
                     .label_font(("sans-serif", 18).into_font())
                     .draw()?;
             }
@@ -1532,8 +1529,8 @@ pub fn phase_reference_plot(
 
     if x_max == x_min {
         let duration = chrono::Duration::seconds(1);
-        x_min = x_min - duration;
-        x_max = x_max + duration;
+        x_min -= duration;
+        x_max += duration;
     }
 
     // Determine y-axis range from all relevant phase data
@@ -1565,7 +1562,7 @@ pub fn phase_reference_plot(
         .y_desc("Phase [deg]")
         .x_max_light_lines(0)
         .y_max_light_lines(0)
-        .light_line_style(&TRANSPARENT)
+        .light_line_style(TRANSPARENT)
         .x_label_formatter(&|ts| {
             chrono::Utc
                 .timestamp_opt(*ts as i64, 0)
@@ -1636,8 +1633,8 @@ pub fn phase_reference_plot(
 
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
@@ -1842,8 +1839,8 @@ pub fn plot_acel_search_result<P: AsRef<Path>>(
 
         chart
             .configure_series_labels()
-            .background_style(&WHITE.mix(0.8))
-            .border_style(&BLACK)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK)
             .label_font(("sans-serif", 18).into_font())
             .draw()?;
     } else {
@@ -1889,8 +1886,8 @@ pub fn plot_acel_search_result<P: AsRef<Path>>(
 
         chart
             .configure_series_labels()
-            .background_style(&WHITE.mix(0.8))
-            .border_style(&BLACK)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK)
             .label_font(("sans-serif", 18).into_font())
             .draw()?;
     }
@@ -2173,9 +2170,9 @@ pub fn plot_dynamic_spectrum_lag(
     Ok(())
 }
 
-fn gaussian_blur_2d(data: &Vec<Vec<f32>>, sigma: f32) -> Vec<Vec<f32>> {
+fn gaussian_blur_2d(data: &[Vec<f32>], sigma: f32) -> Vec<Vec<f32>> {
     if sigma <= 0.0 {
-        return data.clone();
+        return data.to_vec();
     }
 
     let rows = data.len();
@@ -2184,7 +2181,7 @@ fn gaussian_blur_2d(data: &Vec<Vec<f32>>, sigma: f32) -> Vec<Vec<f32>> {
     }
     let cols = data[0].len();
     if cols == 0 {
-        return data.clone();
+        return data.to_vec();
     }
 
     let kernel_radius = (sigma * 3.0).ceil() as usize;
@@ -2192,42 +2189,42 @@ fn gaussian_blur_2d(data: &Vec<Vec<f32>>, sigma: f32) -> Vec<Vec<f32>> {
     let mut kernel = vec![0.0; kernel_size];
     let mut kernel_sum = 0.0;
 
-    for i in 0..kernel_size {
+    for (i, value) in kernel.iter_mut().enumerate() {
         let x = i as f32 - kernel_radius as f32;
-        kernel[i] = (-0.5 * (x / sigma).powi(2)).exp();
-        kernel_sum += kernel[i];
+        *value = (-0.5 * (x / sigma).powi(2)).exp();
+        kernel_sum += *value;
     }
 
-    for i in 0..kernel_size {
-        kernel[i] /= kernel_sum;
+    for value in &mut kernel {
+        *value /= kernel_sum;
     }
 
     let mut blurred_data = vec![vec![0.0; cols]; rows];
     let mut temp_data = vec![vec![0.0; cols]; rows];
 
     // Apply horizontal blur
-    for r in 0..rows {
-        for c in 0..cols {
+    for (r, row) in data.iter().enumerate() {
+        for (c, cell) in temp_data[r].iter_mut().enumerate() {
             let mut sum = 0.0;
-            for k_idx in 0..kernel_size {
+            for (k_idx, &kernel_value) in kernel.iter().enumerate() {
                 let col_idx = (c as isize + k_idx as isize - kernel_radius as isize)
                     .clamp(0, cols as isize - 1) as usize;
-                sum += data[r][col_idx] * kernel[k_idx];
+                sum += row[col_idx] * kernel_value;
             }
-            temp_data[r][c] = sum;
+            *cell = sum;
         }
     }
 
     // Apply vertical blur
-    for r in 0..rows {
-        for c in 0..cols {
+    for (r, row) in blurred_data.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
             let mut sum = 0.0;
-            for k_idx in 0..kernel_size {
+            for (k_idx, &kernel_value) in kernel.iter().enumerate() {
                 let row_idx = (r as isize + k_idx as isize - kernel_radius as isize)
                     .clamp(0, rows as isize - 1) as usize;
-                sum += temp_data[row_idx][c] * kernel[k_idx];
+                sum += temp_data[row_idx][c] * kernel_value;
             }
-            blurred_data[r][c] = sum;
+            *cell = sum;
         }
     }
 
@@ -2236,7 +2233,7 @@ fn gaussian_blur_2d(data: &Vec<Vec<f32>>, sigma: f32) -> Vec<Vec<f32>> {
 
 fn draw_heatmap_with_colorbar(
     area: &DrawingArea<BitMapBackend, Shift>,
-    data: &Vec<Vec<f32>>,
+    data: &[Vec<f32>],
     x_desc: &str,
     y_desc: &str,
     y_label_formatter: impl Fn(&usize) -> String,
@@ -2376,7 +2373,7 @@ fn draw_heatmap_with_colorbar(
 
 pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
     output_path: P,
-    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    spectrum_data: &[Vec<Complex<f32>>],
     sigma: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
@@ -2458,7 +2455,7 @@ pub fn plot_spectrum_heatmaps<P: AsRef<Path>>(
 
 pub fn plot_spectrum_amplitude_heatmap<P: AsRef<Path>>(
     output_path: P,
-    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    spectrum_data: &[Vec<Complex<f32>>],
     sigma: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
@@ -2512,7 +2509,7 @@ pub fn plot_spectrum_amplitude_heatmap<P: AsRef<Path>>(
 
 pub fn plot_spectrum_phase_heatmap<P: AsRef<Path>>(
     output_path: P,
-    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    spectrum_data: &[Vec<Complex<f32>>],
     sigma: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if spectrum_data.is_empty() || spectrum_data[0].is_empty() {
@@ -2717,12 +2714,12 @@ pub fn plot_complex_histograms<P: AsRef<Path>, Q: AsRef<Path>>(
     let (left, right) = upper.split_horizontally(800);
     let (lower_left, lower_right) = lower.split_horizontally(800);
 
-    let mut reports = Vec::new();
-
-    reports.push(plot_histogram_panel(&left, "Real", real_values)?);
-    reports.push(plot_histogram_panel(&right, "Imag", imag_values)?);
-    reports.push(plot_histogram_panel(&lower_left, "Amplitude", amp_values)?);
-    reports.push(plot_phase_histogram_panel(&lower_right, phase_values)?);
+    let reports = vec![
+        plot_histogram_panel(&left, "Real", real_values)?,
+        plot_histogram_panel(&right, "Imag", imag_values)?,
+        plot_histogram_panel(&lower_left, "Amplitude", amp_values)?,
+        plot_phase_histogram_panel(&lower_right, phase_values)?,
+    ];
 
     write_histogram_report(&reports, log_path)?;
 
@@ -2845,7 +2842,7 @@ fn plot_phase_histogram_panel(
             GREEN.stroke_width(3),
         ))?
         .label(format!("Uniform N/bin={:.1e}", expected_uniform))
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 30, y)], &GREEN));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 30, y)], GREEN));
 
     let circular_mean = compute_circular_mean(&values_rad);
     let circular_sigma = compute_circular_sigma(&values_rad);
@@ -2928,14 +2925,14 @@ pub fn plot_cross_section(
 
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     let font = ("sans-serif", 35).into_font();
     let text_style = TextStyle::from(font.clone()).color(&BLACK);
-    let x_pos = root.get_pixel_range().0.end as i32 - 300;
-    let mut y_pos = root.get_pixel_range().1.start as i32 + 20;
+    let x_pos = root.get_pixel_range().0.end - 300;
+    let mut y_pos = root.get_pixel_range().1.start + 20;
 
     root.draw(&Text::new(
         format!("ΔRA: {:.3} mas", delta_ra_mas),
@@ -3049,12 +3046,12 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
 
     uv_chart
         .configure_mesh()
-        .x_desc(&format!("U ({})", uv_unit))
-        .y_desc(&format!("V ({})", uv_unit))
+        .x_desc(format!("U ({})", uv_unit))
+        .y_desc(format!("V ({})", uv_unit))
         .x_label_formatter(&|x| format!("{:.0}", x))
         .y_label_formatter(&|y| format!("{:.0}", y))
         .label_style(("sans-serif", 24))
-        .light_line_style(&WHITE)
+        .light_line_style(WHITE)
         .draw()?;
 
     let accessible_style = ShapeStyle::from(&BLACK).stroke_width(2);
@@ -3134,8 +3131,8 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
 
     uv_chart
         .configure_series_labels()
-        .border_style(&BLACK)
-        .background_style(&WHITE.mix(0.8))
+        .border_style(BLACK)
+        .background_style(WHITE.mix(0.8))
         .draw()?;
 
     let max_baseline = accessible_baseline
@@ -3207,7 +3204,7 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
         .x_label_formatter(&|x| format!("{:.0}", x))
         .x_labels(25)
         .y_label_formatter(&|y| format!("{:.0}", y))
-        .light_line_style(&WHITE)
+        .light_line_style(WHITE)
         .label_style(("sans-serif", 22))
         .draw()?;
 
@@ -3263,8 +3260,8 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
 
     baseline_chart
         .configure_series_labels()
-        .border_style(&BLACK)
-        .background_style(&WHITE.mix(0.8))
+        .border_style(BLACK)
+        .background_style(WHITE.mix(0.8))
         .draw()?;
 
     root.present()?;
@@ -3399,7 +3396,7 @@ fn compute_histogram(
 
     let hist_data = counts
         .into_iter()
-        .zip(centers.into_iter())
+        .zip(centers)
         .map(|(count, center)| (center, count as f64))
         .collect();
 
@@ -3708,7 +3705,7 @@ pub fn frequency_plane_msb(
     let steps = 100;
     for i in 0..steps {
         let value = i as f64 / (steps - 1) as f64;
-        let color = HSLColor(((1.0 - value) * 0.7).into(), 1.0, 0.5);
+        let color = HSLColor((1.0 - value) * 0.7, 1.0, 0.5);
         colorbar.draw_series(std::iter::once(Rectangle::new(
             [
                 (0.0, value * max_amplitude),
@@ -4344,7 +4341,7 @@ pub fn plot_spike34_fit_residual<P: AsRef<Path>>(
 
 pub fn plot_spectrum_amplitude_heatmap_with_spikes<P: AsRef<Path>>(
     output_path: P,
-    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    spectrum_data: &[Vec<Complex<f32>>],
     sigma: f32,
     spike_channels: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4399,7 +4396,7 @@ pub fn plot_spectrum_amplitude_heatmap_with_spikes<P: AsRef<Path>>(
 
 pub fn plot_spectrum_phase_heatmap_with_spikes<P: AsRef<Path>>(
     output_path: P,
-    spectrum_data: &Vec<Vec<Complex<f32>>>,
+    spectrum_data: &[Vec<Complex<f32>>],
     sigma: f32,
     spike_channels: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {

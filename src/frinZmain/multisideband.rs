@@ -30,10 +30,7 @@ impl<W1: Write, W2: Write> Write for TeeWriter<W1, W2> {
         let bytes_written1 = self.writer1.write(buf)?;
         let bytes_written2 = self.writer2.write(buf)?;
         if bytes_written1 != bytes_written2 {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                "Partial write to one of the writers",
-            ));
+            return Err(io::Error::other("Partial write to one of the writers"));
         }
         Ok(bytes_written1)
     }
@@ -345,7 +342,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     let mut c_band_phases_deg: Vec<f32> = c_band_analysis_results
         .freq_rate_spectrum
         .iter()
-        .map(|c| safe_arg(&c).to_degrees())
+        .map(|c| safe_arg(c).to_degrees())
         .collect();
     unwrap_phase(&mut c_band_phases_deg, false);
     let avg_c_phase = {
@@ -758,7 +755,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
             / (x_band_rate_values_f32[1] - x_band_rate_values_f32[0]) as f64)
             .round() as usize;
 
-        if freq_mhz >= 0.0 && freq_mhz < 512.0 + 0.01 {
+        if (0.0..512.0 + 0.01).contains(&freq_mhz) {
             // C-band range
             let freq_idx = (freq_mhz / c_band_freq_resolution_mhz).round() as usize;
             if freq_idx < c_band_freq_rate_array.shape()[0]
@@ -993,8 +990,8 @@ fn compare_headers_except_observing_frequency<W: Write>(
     }
 
     let field_name = "station1_name";
-    let c_val = format!("{}", header1.station1_name);
-    let x_val = format!("{}", header2.station1_name);
+    let c_val = header1.station1_name.to_string();
+    let x_val = header2.station1_name.to_string();
     let matches = header1.station1_name == header2.station1_name;
     writeln!(
         writer,
@@ -1006,8 +1003,8 @@ fn compare_headers_except_observing_frequency<W: Write>(
     }
 
     let field_name = "station1_code";
-    let c_val = format!("{}", header1.station1_code);
-    let x_val = format!("{}", header2.station1_code);
+    let c_val = header1.station1_code.to_string();
+    let x_val = header2.station1_code.to_string();
     let matches = header1.station1_code == header2.station1_code;
     writeln!(
         writer,
@@ -1019,8 +1016,8 @@ fn compare_headers_except_observing_frequency<W: Write>(
     }
 
     let field_name = "station2_name";
-    let c_val = format!("{}", header1.station2_name);
-    let x_val = format!("{}", header2.station2_name);
+    let c_val = header1.station2_name.to_string();
+    let x_val = header2.station2_name.to_string();
     let matches = header1.station2_name == header2.station2_name;
     writeln!(
         writer,
@@ -1032,8 +1029,8 @@ fn compare_headers_except_observing_frequency<W: Write>(
     }
 
     let field_name = "station2_code";
-    let c_val = format!("{}", header1.station2_code);
-    let x_val = format!("{}", header2.station2_code);
+    let c_val = header1.station2_code.to_string();
+    let x_val = header2.station2_code.to_string();
     let matches = header1.station2_code == header2.station2_code;
     writeln!(
         writer,
@@ -1045,8 +1042,8 @@ fn compare_headers_except_observing_frequency<W: Write>(
     }
 
     let field_name = "source_name";
-    let c_val = format!("{}", header1.source_name);
-    let x_val = format!("{}", header2.source_name);
+    let c_val = header1.source_name.to_string();
+    let x_val = header2.source_name.to_string();
     let matches = header1.source_name == header2.source_name;
     writeln!(
         writer,

@@ -1,3 +1,5 @@
+// Handoff records preserve explicit calibration quantities at the API boundary.
+#![allow(clippy::too_many_arguments)]
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};

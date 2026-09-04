@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use super::known_pulsar::{
     self, apply_rfi_cut_to_sectors, build_frequency_axis_mhz, fold_profile,
     load_sectors_with_limits, KnownArgs, SectorData,
@@ -693,14 +695,18 @@ fn build_time_series(
         cumulative_time += duration;
         durations.push(duration);
 
-        for chan_idx in 0..samples_per_sector {
+        for (chan_idx, series) in channel_series
+            .iter_mut()
+            .enumerate()
+            .take(samples_per_sector)
+        {
             let value = sector
                 .spectra
                 .get(chan_idx)
                 .copied()
                 .unwrap_or_else(|| Complex::new(0.0, 0.0));
             let amp = value.norm() as f64;
-            channel_series[chan_idx].push((center, amp));
+            series.push((center, amp));
         }
     }
 
@@ -1823,8 +1829,7 @@ fn build_dedispersed_scalar_series(
     let delays = compute_dispersion_delays_seconds(freq_axis_mhz, reference_freq_mhz, dm_pc_cm3);
 
     let mut out = Vec::with_capacity(rows);
-    for row_idx in 0..rows {
-        let center = centers[row_idx];
+    for &center in centers.iter().take(rows) {
         let mut sum = 0.0f64;
         let mut count = 0usize;
         for chan_idx in 0..channels {
@@ -2053,7 +2058,7 @@ fn median_of_sorted(sorted: &[f64]) -> f64 {
     if n == 0 {
         return 0.0;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]

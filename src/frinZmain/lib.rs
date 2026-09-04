@@ -13,8 +13,12 @@ pub mod folding;
 pub mod frmap;
 pub mod header;
 pub mod inband;
+#[path = "inbeamVLBI.rs"]
+pub mod inbeam_vlbi;
 pub mod input_support;
+pub mod logo;
 pub mod maser;
+pub mod mkcor;
 pub mod search;
 pub mod spike34m;
 pub mod stfft;

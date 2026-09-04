@@ -2,7 +2,6 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
-use std::process;
 
 use crate::analysis::AnalysisResults;
 use chrono::{DateTime, Duration, Utc};
@@ -279,6 +278,7 @@ pub fn process_cor_file(
     pp_flag_ranges: &[(u32, u32)],
     suppress_output: bool,
 ) -> Result<ProcessResult, Box<dyn Error>> {
+    args.validate_runtime()?;
     // --- File and Path Setup ---
     let contamination_mode = args.contamination_subtract.is_some();
     let frinz_dir = frinz_output_dir(input_path, args.in_beam);
@@ -384,29 +384,27 @@ pub fn process_cor_file(
     let mut effective_fft_point = original_fft_point;
     if let Some(requested_fft_point) = args.fft_rebin {
         if requested_fft_point <= 0 {
-            eprintln!("Error: --fft-rebin には正の値を指定してください。");
-            process::exit(1);
+            return Err("--fft-rebin には正の値を指定してください".into());
         }
         if requested_fft_point % 2 != 0 {
-            eprintln!("Error: --fft-rebin は偶数である必要があります。");
-            process::exit(1);
+            return Err("--fft-rebin は偶数である必要があります".into());
         }
         if requested_fft_point > original_fft_point {
-            eprintln!(
-                "Error: --fft-rebin ({}) はヘッダーの FFT 点数 ({}) を超えています。",
+            return Err(format!(
+                "--fft-rebin ({}) はヘッダーの FFT 点数 ({}) を超えています",
                 requested_fft_point, original_fft_point
-            );
-            process::exit(1);
+            )
+            .into());
         }
 
         let original_half = (original_fft_point / 2) as usize;
         let requested_half = (requested_fft_point / 2) as usize;
         if requested_half == 0 || original_half % requested_half != 0 {
-            eprintln!(
-                "Error: --fft-rebin ({}) は元のチャンネル数 ({}) を整数分割できません。",
+            return Err(format!(
+                "--fft-rebin ({}) は元のチャンネル数 ({}) を整数分割できません",
                 requested_fft_point, original_fft_point
-            );
-            process::exit(1);
+            )
+            .into());
         }
 
         effective_fft_point = requested_fft_point;
@@ -534,11 +532,11 @@ pub fn process_cor_file(
     if args.cumulate != 0 {
         let available = pp.saturating_sub(args.skip.max(0));
         if args.cumulate > available {
-            eprintln!(
-                "The specified cumulation length, {} s, is more than the observation time, {} s.",
+            return Err(format!(
+                "the specified cumulation length, {} s, exceeds the observation time, {} s",
                 args.cumulate, available
-            );
-            process::exit(1);
+            )
+            .into());
         }
         length = args.cumulate;
         loop_count = available.saturating_add(args.cumulate - 1) / args.cumulate;

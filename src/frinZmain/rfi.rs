@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process;
 
 use ndarray::Array2;
 use num_complex::Complex;
@@ -705,6 +704,12 @@ pub fn parse_rfi_ranges(rfi_args: &[String], rbw: f32) -> io::Result<Vec<(usize,
     if rfi_args.is_empty() {
         return Ok(vec![]);
     }
+    if !rbw.is_finite() || rbw <= 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid frequency resolution: {rbw} MHz"),
+        ));
+    }
     let mut ranges = Vec::new();
     for rfi_pair in rfi_args {
         // NPZ masks are loaded once by main and applied in the plane matching
@@ -716,11 +721,10 @@ pub fn parse_rfi_ranges(rfi_args: &[String], rbw: f32) -> io::Result<Vec<(usize,
         }
         let parts: Vec<&str> = rfi_pair.split(',').collect();
         if parts.len() != 2 {
-            eprintln!(
-                "Invalid RFI format: {}. Expected MIN,MAX, histogram, or an RFI .npz file.",
-                rfi_pair
-            );
-            process::exit(1);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid RFI format: {rfi_pair}; expected MIN,MAX, histogram, or an RFI .npz file"),
+            ));
         }
 
         let min_mhz_int: i32 = parts[0].parse().map_err(|_| {
@@ -736,12 +740,13 @@ pub fn parse_rfi_ranges(rfi_args: &[String], rbw: f32) -> io::Result<Vec<(usize,
             )
         })?;
 
-        if min_mhz_int >= max_mhz_int {
-            eprintln!(
-                "Invalid RFI range: min ({}) >= max ({}).",
-                min_mhz_int, max_mhz_int
-            );
-            process::exit(1);
+        if min_mhz_int < 0 || min_mhz_int >= max_mhz_int {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid RFI range: require 0 <= min < max, got {min_mhz_int},{max_mhz_int}"
+                ),
+            ));
         }
         let min_chan = (min_mhz_int as f32 / rbw).floor() as usize;
         let max_chan = (max_mhz_int as f32 / rbw).ceil() as usize;

@@ -421,6 +421,57 @@ impl Args {
             })
             .map(|s| s.as_str())
     }
+
+    pub fn validate_runtime(&self) -> Result<(), String> {
+        if self.length < 0 {
+            return Err("--length must be zero or greater".to_string());
+        }
+        if self.skip < 0 {
+            return Err("--skip must be zero or greater".to_string());
+        }
+        if self.loop_ < 1 {
+            return Err("--loop must be at least 1".to_string());
+        }
+        if self.stfft < 0 {
+            return Err("--stfft must be zero or greater".to_string());
+        }
+        if self.cumulate < 0 {
+            return Err("--cumulate must be zero or greater".to_string());
+        }
+        if self.fft_rebin.is_some_and(|value| value <= 0) {
+            return Err("--fft-rebin must be greater than zero".to_string());
+        }
+        if self.inband == Some(0) {
+            return Err("--inband must be greater than zero".to_string());
+        }
+        if !matches!(self.rate_padding, 1 | 2 | 4 | 8) {
+            return Err("--rate-padding must be one of 1, 2, 4, or 8".to_string());
+        }
+
+        let scalar_values = [
+            ("--delay", self.delay_correct),
+            ("--rate", self.rate_correct),
+            ("--acel", self.acel_correct),
+            ("--jerk", self.jerk_correct),
+            ("--snap", self.snap_correct),
+        ];
+        for (name, value) in scalar_values {
+            if !value.is_finite() {
+                return Err(format!("{name} must be finite"));
+            }
+        }
+        for (name, values) in [
+            ("--drange", self.drange.as_slice()),
+            ("--rrange", self.rrange.as_slice()),
+            ("--mask", self.mask.as_slice()),
+            ("--frange", self.frange.as_slice()),
+        ] {
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(format!("{name} values must be finite"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Args {
@@ -487,6 +538,23 @@ impl Default for Args {
     }
 }
 
+fn estimate_required_memory_bytes(
+    fft_point: u64,
+    sector_count: u64,
+    rate_padding: u64,
+) -> io::Result<u64> {
+    let padded_sectors = sector_count.checked_next_power_of_two().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sector count is too large for memory estimation",
+        )
+    })?;
+    4u64.checked_mul(fft_point)
+        .and_then(|bytes| bytes.checked_mul(padded_sectors))
+        .and_then(|bytes| bytes.checked_mul(rate_padding))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "memory estimate overflow"))
+}
+
 pub fn check_memory_usage(args: &Args, input_path: &Path) -> Result<bool, Box<dyn Error>> {
     let buffer = read_input_prefix(input_path, 256)?;
     let mut cursor = Cursor::new(buffer.as_slice());
@@ -496,7 +564,7 @@ pub fn check_memory_usage(args: &Args, input_path: &Path) -> Result<bool, Box<dy
     let pp = header.number_of_sector as u64;
     let rate_padding = args.rate_padding as u64;
 
-    let required_memory = 4 * fft_point * pp.next_power_of_two() * rate_padding; // byte
+    let required_memory = estimate_required_memory_bytes(fft_point, pp, rate_padding)?;
 
     let mem_info = sys_info::mem_info()?;
     let total_ram = mem_info.total * 1024; // Convert KB to Bytes
@@ -521,4 +589,39 @@ pub fn check_memory_usage(args: &Args, input_path: &Path) -> Result<bool, Box<dy
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{estimate_required_memory_bytes, Args};
+
+    #[test]
+    fn runtime_validation_rejects_invalid_dimensions_and_nonfinite_values() {
+        let mut args = Args::default();
+        assert!(args.validate_runtime().is_ok());
+
+        args.length = -1;
+        assert!(args.validate_runtime().unwrap_err().contains("--length"));
+        args.length = 0;
+
+        args.loop_ = 0;
+        assert!(args.validate_runtime().unwrap_err().contains("--loop"));
+        args.loop_ = 1;
+
+        args.rate_correct = f32::NAN;
+        assert!(args.validate_runtime().unwrap_err().contains("--rate"));
+        args.rate_correct = 0.0;
+
+        args.rrange = vec![0.0, f32::INFINITY];
+        assert!(args.validate_runtime().unwrap_err().contains("--rrange"));
+    }
+
+    #[test]
+    fn memory_estimate_uses_checked_arithmetic() {
+        assert_eq!(
+            estimate_required_memory_bytes(8192, 120, 4).unwrap(),
+            4 * 8192 * 128 * 4
+        );
+        assert!(estimate_required_memory_bytes(u64::MAX, 2, 8).is_err());
+    }
 }

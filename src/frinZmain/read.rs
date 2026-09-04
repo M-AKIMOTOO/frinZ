@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Cursor, Error, ErrorKind, Read};
 use std::path::Path;
 
-use crate::header::{parse_header, CorHeader};
+use crate::header::{parse_header, validate_cor_payload, CorHeader};
 
 pub type C32 = Complex<f32>;
 
@@ -133,6 +133,7 @@ pub fn read_visibility_data(
     is_cumulate: bool,
     pp_flag_ranges: &[(u32, u32)],
 ) -> io::Result<(Vec<C32>, DateTime<Utc>, f32)> {
+    validate_cor_payload(header, cursor.get_ref().len())?;
     let sector_size = (8 + header.fft_point / 4) * 16;
 
     let (actual_length_start, length_end) =
@@ -222,6 +223,7 @@ pub fn read_sector_header(
     loop_index: i32,
     is_cumulate: bool,
 ) -> io::Result<Vec<Vec<u8>>> {
+    validate_cor_payload(header, cursor.get_ref().len())?;
     // 各セクターのサイズを計算します。
     let sector_size = (8 + header.fft_point / 4) * 16;
 

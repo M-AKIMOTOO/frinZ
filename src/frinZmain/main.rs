@@ -1,79 +1,38 @@
-#![allow(unused_imports)]
 use byteorder::{LittleEndian, WriteBytesExt};
+use chrono::{DateTime, Utc};
+use clap::{parser::ValueSource, FromArgMatches};
+use num_complex::Complex;
 use std::error::Error;
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use chrono::{DateTime, Utc};
-use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
-use num_complex::Complex;
-use std::path::{Path, PathBuf};
-
-mod analysis;
-mod args;
-mod bandpass;
-mod bispectrum;
-mod contamination;
-mod contamination_subtract;
-mod search;
-mod stfft;
-//mod error;
-mod fft;
-mod fitting;
-mod folding;
-mod frmap;
-mod header;
-mod inband;
-#[path = "inbeamVLBI.rs"]
-mod inbeam_vlbi;
-mod input_support;
-
-mod earth_rotation_imaging;
-mod logo;
-mod maser;
-mod mkcor;
-mod multisideband;
-mod norm_acf;
-mod npy_output;
-mod output;
-mod phsref;
-mod plot;
-mod png_compress;
-mod processing;
-mod raw_visibility;
-mod read;
-mod rfi;
-mod spike34m;
-mod uptimeplot;
-mod utils;
-mod uv;
-mod wwz;
-
-use crate::args::{check_memory_usage, Args};
-use crate::bispectrum::run_closure_phase_analysis;
-use crate::earth_rotation_imaging::{
+use frinZ::args::{check_memory_usage, Args};
+use frinZ::bispectrum::run_closure_phase_analysis;
+use frinZ::earth_rotation_imaging::{
     parse_imaging_cli_options, run_earth_rotation_imaging, run_imaging_test,
 };
-use crate::folding::run_folding_analysis;
-use crate::frmap::run_fringe_rate_map_analysis;
-use crate::inband::run_inband_analysis;
-use crate::inbeam_vlbi::run_inbeam_vlbi_analysis;
-use crate::input_support::read_input_bytes;
-use crate::maser::run_maser_analysis;
-use crate::mkcor::run_mkcor;
-use crate::multisideband::run_multisideband_analysis;
-use crate::phsref::run_phase_reference_analysis;
-use crate::plot::{write_add_plot_outputs, write_cumulate_outputs};
-use crate::processing::{frinz_output_dir, process_cor_file};
-use crate::raw_visibility::run_raw_visibility_plot;
-use crate::rfi::{load_rfi_npz, parse_histogram_bins, parse_histogram_count};
-use crate::search::run_acel_search_analysis;
-use crate::spike34m::run_spike34m_analysis;
-use crate::stfft::write_output as write_stfft_output;
-use crate::uptimeplot::run_uptime_plot;
-use crate::uv::run_uv_plot;
-use crate::wwz::write_wwz_outputs;
+use frinZ::folding::run_folding_analysis;
+use frinZ::frmap::run_fringe_rate_map_analysis;
+use frinZ::inband::run_inband_analysis;
+use frinZ::inbeam_vlbi::run_inbeam_vlbi_analysis;
+use frinZ::input_support::read_input_bytes;
+use frinZ::maser::run_maser_analysis;
+use frinZ::mkcor::run_mkcor;
+use frinZ::multisideband::run_multisideband_analysis;
+use frinZ::phsref::run_phase_reference_analysis;
+use frinZ::plot::{write_add_plot_outputs, write_cumulate_outputs};
+use frinZ::processing::{frinz_output_dir, process_cor_file};
+use frinZ::raw_visibility::run_raw_visibility_plot;
+use frinZ::rfi::{load_rfi_npz, parse_histogram_bins, parse_histogram_count};
+use frinZ::search::run_acel_search_analysis;
+use frinZ::spike34m::run_spike34m_analysis;
+use frinZ::stfft::write_output as write_stfft_output;
+use frinZ::uptimeplot::run_uptime_plot;
+use frinZ::uv::run_uv_plot;
+use frinZ::wwz::write_wwz_outputs;
+use frinZ::{logo, utils};
 
 // --- Type Aliases for Clarity ---
 pub type C32 = Complex<f32>;
@@ -174,10 +133,10 @@ fn filename_timestamp_key(path: &Path) -> Option<String> {
         })
 }
 
-fn read_cor_header_from_path(path: &Path) -> Result<crate::header::CorHeader, Box<dyn Error>> {
+fn read_cor_header_from_path(path: &Path) -> Result<frinZ::header::CorHeader, Box<dyn Error>> {
     let buffer = read_input_bytes(path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
-    Ok(crate::header::parse_header(&mut cursor)?)
+    Ok(frinZ::header::parse_header(&mut cursor)?)
 }
 
 fn validate_spike34m_arg(args: &Args) -> Result<(), Box<dyn Error>> {
@@ -229,8 +188,26 @@ fn validate_spike34m_arg(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn apply_runtime_defaults(args: &mut Args, iter_explicit: bool, rate_padding_explicit: bool) {
+    let has_primary_search = matches!(
+        args.primary_search_mode(),
+        Some("peak") | Some("deep") | Some("coherent")
+    );
+
+    if has_primary_search {
+        if !rate_padding_explicit {
+            args.rate_padding = 4;
+        }
+        if !iter_explicit {
+            args.iter = 4;
+        }
+    } else if args.cumulate != 0 {
+        args.rate_padding = 1;
+    }
+}
+
 // --- Main Application Logic ---
-fn main() -> Result<(), Box<dyn Error>> {
+fn run() -> Result<(), Box<dyn Error>> {
     let env_args: Vec<String> = std::env::args().collect();
     let short_help_requested =
         env_args.len() == 1 || env_args.iter().any(|arg| arg == "-h" || arg == "--help");
@@ -255,6 +232,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let iter_explicit = matches.value_source("iter") == Some(ValueSource::CommandLine);
+    let rate_padding_explicit =
+        matches.value_source("rate_padding") == Some(ValueSource::CommandLine);
 
     let mut args = match Args::from_arg_matches_mut(&mut matches) {
         Ok(args) => args,
@@ -334,31 +313,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if matches!(
-        args.primary_search_mode(),
-        Some("peak") | Some("deep") | Some("coherent")
-    ) {
-        args.rate_padding = 4;
-    } else if args.cumulate != 0 {
-        // シンプルな仕様: --cumulate が指定されたら rate_padding は常に 1 にする
-        args.rate_padding = 1;
-    }
-    if matches!(
-        args.primary_search_mode(),
-        Some("peak") | Some("deep") | Some("coherent")
-    ) && !iter_explicit
-    {
-        args.iter = 4;
-    }
-
-    if !args.rate_padding.is_power_of_two() {
-        eprintln!("Error: --rate-padding must be a power of two.");
-        exit(1);
-    }
-    if !matches!(args.rate_padding, 1 | 2 | 4 | 8) {
-        eprintln!("Error: --rate-padding must be one of 1, 2, 4, or 8.");
-        exit(1);
-    }
+    apply_runtime_defaults(&mut args, iter_explicit, rate_padding_explicit);
+    args.validate_runtime()?;
 
     if args.mkcor {
         return run_mkcor(&args);
@@ -393,7 +349,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let mut cursor = Cursor::new(buffer.as_slice());
 
-        let header = match crate::header::parse_header(&mut cursor) {
+        let header = match frinZ::header::parse_header(&mut cursor) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Error parsing header: {}", e);
@@ -422,7 +378,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let mut sectors_written = 0;
         for l1 in 0..header.number_of_sector {
-            let (complex_vec, _, _) = match crate::read::read_visibility_data(
+            let (complex_vec, _, _) = match frinZ::read::read_visibility_data(
                 &mut cursor,
                 &header,
                 1,  // length in sectors
@@ -835,4 +791,47 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     print_short_help();
     exit(1);
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        exit(1);
+    }
+}
+
+#[cfg(test)]
+mod runtime_default_tests {
+    use super::{apply_runtime_defaults, Args};
+
+    fn search_args() -> Args {
+        Args {
+            search: vec!["peak".to_string()],
+            ..Args::default()
+        }
+    }
+
+    #[test]
+    fn search_defaults_apply_only_when_not_explicit() {
+        let mut defaults = search_args();
+        apply_runtime_defaults(&mut defaults, false, false);
+        assert_eq!(defaults.rate_padding, 4);
+        assert_eq!(defaults.iter, 4);
+
+        let mut explicit = search_args();
+        explicit.rate_padding = 8;
+        explicit.iter = 7;
+        apply_runtime_defaults(&mut explicit, true, true);
+        assert_eq!(explicit.rate_padding, 8);
+        assert_eq!(explicit.iter, 7);
+    }
+
+    #[test]
+    fn search_keeps_explicit_padding_when_cumulate_is_also_set() {
+        let mut args = search_args();
+        args.cumulate = 60;
+        args.rate_padding = 8;
+        apply_runtime_defaults(&mut args, false, true);
+        assert_eq!(args.rate_padding, 8);
+    }
 }

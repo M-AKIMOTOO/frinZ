@@ -671,6 +671,13 @@ mod deep {
         pub pre_bandpass_analysis_results: Option<AnalysisResults>,
     }
 
+    fn needs_frequency_domain_coarse_search(args: &Args) -> bool {
+        // Only --frequency changes the domain in which the coarse fringe
+        // candidate is selected. Diagnostic/output options must not change
+        // delay, rate, amplitude, noise, or SNR.
+        args.frequency
+    }
+
     struct DeepSearchContext<'a> {
         complex_vec: &'a [C32],
         header: &'a CorHeader,
@@ -776,17 +783,6 @@ mod deep {
 
         fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
             self.fft_for_correction_with_padding(delay, rate, self.args.rate_padding)
-        }
-
-        fn needs_coarse_surface(&self) -> bool {
-            self.args.frequency
-                || self.args.spectrum
-                || self.args.bandpass_table
-                || self.args.dynamic_spectrum
-                || self.args.raw_visibility
-                || self.args.npz
-                || self.args.contamination.is_some()
-                || crate::rfi::has_histogram_mode(&self.args.rfi)
         }
 
         fn apply_bandpass(&self, freq_rate_array: &mut Array2<C32>) {
@@ -951,7 +947,7 @@ mod deep {
                 let (mut freq_rate_array, padding_length) =
                     self.fft_for_correction_with_padding(0.0, 0.0, self.args.rate_padding.max(1));
                 self.apply_bandpass(&mut freq_rate_array);
-                if !self.needs_coarse_surface() && self.current_length > 2 {
+                if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
                     return Ok(self.coarse_estimates_streaming(
                         &freq_rate_array,
                         padding_length,
@@ -989,7 +985,7 @@ mod deep {
                 let (mut freq_rate_array, padding_length) =
                     self.fft_for_correction_with_padding(0.0, 0.0, self.args.rate_padding.max(1));
                 self.apply_bandpass(&mut freq_rate_array);
-                if !self.needs_coarse_surface() && self.current_length > 2 {
+                if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
                     return Ok(self.coarse_estimates_streaming(
                         &freq_rate_array,
                         padding_length,
@@ -1712,6 +1708,27 @@ mod deep {
         }
     }
 
+    fn rate_search_bounds(effective_integ_time: f32, requested: &[f32]) -> (f32, f32) {
+        if requested.len() == 2 {
+            return (
+                requested[0].min(requested[1]),
+                requested[0].max(requested[1]),
+            );
+        }
+
+        // Without an explicit --rrange, return the canonical (unaliased)
+        // fringe-rate solution allowed by the time sampling. Very short
+        // integrations otherwise let the fine search escape the FFT rate
+        // axis and select an equivalent +/- n/dt alias.
+        let dt = effective_integ_time.abs();
+        let nyquist = if dt.is_finite() && dt > f32::EPSILON {
+            0.5 / dt
+        } else {
+            f32::MAX
+        };
+        (-nyquist, nyquist)
+    }
+
     fn delay_search_range_for_rate(
         initial_rate: f32,
         duration_sec: f32,
@@ -1770,14 +1787,7 @@ mod deep {
         } else {
             None
         };
-        let rate_bounds = if context.args.rrange.len() == 2 {
-            Some((
-                context.args.rrange[0].min(context.args.rrange[1]),
-                context.args.rrange[0].max(context.args.rrange[1]),
-            ))
-        } else {
-            None
-        };
+        let rate_bounds = rate_search_bounds(context.effective_integ_time, &context.args.rrange);
 
         // 並列探索実行
         let final_result = pool.install(|| {
@@ -1792,10 +1802,8 @@ mod deep {
                     let best_for_delay = rate_points
                         .iter()
                         .filter_map(|&rate| {
-                            if let Some((low, high)) = rate_bounds {
-                                if rate < low || rate > high {
-                                    return None;
-                                }
+                            if rate < rate_bounds.0 || rate > rate_bounds.1 {
+                                return None;
                             }
                             Some((delay, rate, context.evaluate_candidate_snr(delay, rate)))
                         })
@@ -1833,23 +1841,14 @@ mod deep {
         );
         */
 
-        let rate_bounds = if context.args.rrange.len() == 2 {
-            Some((
-                context.args.rrange[0].min(context.args.rrange[1]),
-                context.args.rrange[0].max(context.args.rrange[1]),
-            ))
-        } else {
-            None
-        };
+        let rate_bounds = rate_search_bounds(context.effective_integ_time, &context.args.rrange);
 
         let best_rate_result = pool.install(|| {
             rate_points
                 .par_iter()
                 .filter_map(|&rate| {
-                    if let Some((low, high)) = rate_bounds {
-                        if rate < low || rate > high {
-                            return None;
-                        }
+                    if rate < rate_bounds.0 || rate > rate_bounds.1 {
+                        return None;
                     }
                     Some((
                         center_delay,
@@ -1915,25 +1914,27 @@ mod deep {
 
     /// 探索点を生成
     fn generate_search_points(center: f32, range: f32, step: f32) -> Vec<f32> {
-        let mut points = Vec::new();
-
         // Use f64 for precision-critical calculations to avoid floating point errors
         // with very small steps, which can cause inconsistent point counts or infinite loops.
         let center64 = center as f64;
         let range64 = range as f64;
         let step64 = step as f64;
 
-        // Guard against infinite loop if step is zero or too small to be represented.
-        if step64 == 0.0 {
-            if range64 >= 0.0 {
-                points.push(center);
-            }
-            return points;
+        // Invalid or non-positive steps used to make the loop below run
+        // forever. A zero-width fallback is deterministic and safe.
+        if !center64.is_finite()
+            || !range64.is_finite()
+            || range64 < 0.0
+            || !step64.is_finite()
+            || step64 <= 0.0
+        {
+            return center64.is_finite().then_some(center).into_iter().collect();
         }
 
         let start = center64 - range64;
         let end = center64 + range64;
 
+        let mut points = Vec::new();
         let mut current = start;
         // Add a small tolerance to the end condition to handle floating point inaccuracies
         while current <= end + step64 * 0.5 {
@@ -1971,5 +1972,48 @@ mod deep {
         }
         corrected_args.search.clear(); // Prevent infinite loops
         corrected_args
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            generate_search_points, needs_frequency_domain_coarse_search, rate_search_bounds,
+        };
+        use crate::args::Args;
+
+        #[test]
+        fn output_options_do_not_select_a_different_coarse_search() {
+            let mut args = Args::default();
+            args.plot = true;
+            args.spectrum = true;
+            args.bandpass_table = true;
+            args.dynamic_spectrum = true;
+            args.raw_visibility = true;
+            args.npz = true;
+            args.contamination = Some(Vec::new());
+            args.rfi = vec!["histogram".to_string()];
+            assert!(!needs_frequency_domain_coarse_search(&args));
+
+            args.frequency = true;
+            assert!(needs_frequency_domain_coarse_search(&args));
+        }
+
+        #[test]
+        fn default_rate_bounds_are_time_nyquist_limits() {
+            assert_eq!(rate_search_bounds(1.0, &[]), (-0.5, 0.5));
+            assert_eq!(rate_search_bounds(0.25, &[]), (-2.0, 2.0));
+        }
+
+        #[test]
+        fn explicit_rate_bounds_are_preserved_and_ordered() {
+            assert_eq!(rate_search_bounds(1.0, &[0.2, -0.1]), (-0.1, 0.2));
+        }
+
+        #[test]
+        fn invalid_search_steps_cannot_loop_forever() {
+            assert_eq!(generate_search_points(1.5, 0.5, 0.0), vec![1.5]);
+            assert_eq!(generate_search_points(1.5, 0.5, -0.1), vec![1.5]);
+            assert!(generate_search_points(f32::NAN, 0.5, 0.1).is_empty());
+        }
     }
 }

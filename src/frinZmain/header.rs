@@ -1,5 +1,9 @@
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, ErrorKind, Read};
+
+const COR_MAGIC: [u8; 4] = [0x83, 0xf9, 0xa2, 0x3e];
+const FILE_HEADER_SIZE: usize = 256;
+const SECTOR_HEADER_SIZE: usize = 128;
 
 #[derive(Debug, Default, Clone)]
 pub struct CorHeader {
@@ -29,6 +33,81 @@ pub struct CorHeader {
     pub station2_clock_acel: f64,
     pub station2_clock_jerk: f64,
     pub station2_clock_snap: f64,
+}
+
+fn validate_header_fields(header: &CorHeader) -> io::Result<()> {
+    if header.magic_word != COR_MAGIC {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "invalid .cor magic word: {:02x?} (expected {:02x?})",
+                header.magic_word, COR_MAGIC
+            ),
+        ));
+    }
+    if header.sampling_speed <= 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid sampling speed: {}", header.sampling_speed),
+        ));
+    }
+    if header.fft_point < 4 || header.fft_point % 4 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "invalid FFT point: {} (must be a positive multiple of 4)",
+                header.fft_point
+            ),
+        ));
+    }
+    if header.number_of_sector <= 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "invalid sector count: {} (must be positive)",
+                header.number_of_sector
+            ),
+        ));
+    }
+    if !header.observing_frequency.is_finite() || header.observing_frequency < 0.0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "invalid observing frequency: {}",
+                header.observing_frequency
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_cor_payload(header: &CorHeader, file_len: usize) -> io::Result<()> {
+    validate_header_fields(header)?;
+
+    let visibility_bytes = (header.fft_point as usize)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "sector size overflow"))?;
+    let sector_size = SECTOR_HEADER_SIZE
+        .checked_add(visibility_bytes)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "sector size overflow"))?;
+    let payload_size = sector_size
+        .checked_mul(header.number_of_sector as usize)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "file size overflow"))?;
+    let expected_size = FILE_HEADER_SIZE
+        .checked_add(payload_size)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "file size overflow"))?;
+
+    if file_len < expected_size {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!(
+                "truncated .cor file: {} bytes, expected at least {} bytes",
+                file_len, expected_size
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_header(cursor: &mut Cursor<&[u8]>) -> io::Result<CorHeader> {
@@ -112,6 +191,75 @@ pub fn parse_header(cursor: &mut Cursor<&[u8]>) -> io::Result<CorHeader> {
     header.station2_clock_jerk = cursor.read_f64::<LittleEndian>()?;
     header.station2_clock_snap = cursor.read_f64::<LittleEndian>()?;
 
-    cursor.set_position(256); // Go to the end of the header
+    cursor.set_position(FILE_HEADER_SIZE as u64); // Go to the end of the header
+    validate_header_fields(&header)?;
     Ok(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        validate_cor_payload, validate_header_fields, CorHeader, COR_MAGIC, FILE_HEADER_SIZE,
+        SECTOR_HEADER_SIZE,
+    };
+    use std::io::ErrorKind;
+
+    fn valid_header() -> CorHeader {
+        CorHeader {
+            magic_word: COR_MAGIC,
+            sampling_speed: 1_024_000_000,
+            observing_frequency: 6_600_000_000.0,
+            fft_point: 8192,
+            number_of_sector: 2,
+            ..CorHeader::default()
+        }
+    }
+
+    fn expected_size(header: &CorHeader) -> usize {
+        FILE_HEADER_SIZE
+            + header.number_of_sector as usize
+                * (SECTOR_HEADER_SIZE + header.fft_point as usize * size_of::<f32>())
+    }
+
+    #[test]
+    fn accepts_a_well_formed_header_and_payload_size() {
+        let header = valid_header();
+        assert!(validate_header_fields(&header).is_ok());
+        assert!(validate_cor_payload(&header, expected_size(&header)).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_dimensions_before_allocation() {
+        let mut header = valid_header();
+        header.fft_point = -8192;
+        assert_eq!(
+            validate_header_fields(&header).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+
+        let mut header = valid_header();
+        header.number_of_sector = -1;
+        assert_eq!(
+            validate_header_fields(&header).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_magic_and_truncated_payload() {
+        let mut header = valid_header();
+        header.magic_word = [0; 4];
+        assert_eq!(
+            validate_header_fields(&header).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+
+        let header = valid_header();
+        assert_eq!(
+            validate_cor_payload(&header, expected_size(&header) - 1)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
 }

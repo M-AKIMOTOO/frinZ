@@ -779,8 +779,7 @@ mod deep {
         }
 
         fn needs_coarse_surface(&self) -> bool {
-            self.args.plot
-                || self.args.frequency
+            self.args.frequency
                 || self.args.spectrum
                 || self.args.bandpass_table
                 || self.args.dynamic_spectrum
@@ -1127,7 +1126,7 @@ mod deep {
             final_delay: f32,
             final_rate: f32,
             _algorithm: DeepSearchAlgorithm,
-            coarse_analysis: Option<&AnalysisResults>,
+            _coarse_analysis: Option<&AnalysisResults>,
         ) -> Result<
             (
                 AnalysisResults,
@@ -1137,49 +1136,10 @@ mod deep {
             ),
             Box<dyn Error>,
         > {
-            let can_skip_final_fft = matches!(
-                _algorithm,
-                DeepSearchAlgorithm::FullGrid
-                    | DeepSearchAlgorithm::AxisThenLocal
-                    | DeepSearchAlgorithm::PeakPolish
-                    | DeepSearchAlgorithm::Coherent
-            ) && !self.args.plot
-                && !self.args.frequency
-                && !self.args.spectrum
-                && !self.args.bandpass_table
-                && !self.args.dynamic_spectrum
-                && !self.args.raw_visibility
-                && !self.args.npz
-                && self.args.contamination.is_none()
-                && !crate::rfi::has_histogram_mode(&self.args.rfi);
-
-            if can_skip_final_fft {
-                if let Some(coarse) = coarse_analysis {
-                    let mut analysis_results = coarse.clone();
-                    let (sum_re, sum_im) = self.evaluate_coherent_sum(final_delay, final_rate);
-                    let scale = self.coherent_sum_scale();
-                    let value = C32::new((sum_re * scale) as f32, (sum_im * scale) as f32);
-                    let amplitude = value.norm();
-                    analysis_results.delay_peak_complex = value;
-                    analysis_results.delay_max_amp = amplitude;
-                    analysis_results.delay_phase = value.arg().to_degrees();
-                    analysis_results.delay_snr = if analysis_results.delay_noise > 0.0 {
-                        amplitude / analysis_results.delay_noise
-                    } else {
-                        0.0
-                    };
-                    analysis_results.residual_delay = final_delay;
-                    analysis_results.residual_rate = if self.physical_length <= 1 {
-                        0.0
-                    } else {
-                        final_rate
-                    };
-                    analysis_results.length_f32 =
-                        self.physical_length as f32 * self.effective_integ_time;
-                    return Ok((analysis_results, None, Array2::<C32>::zeros((0, 0)), None));
-                }
-            }
-
+            // Always evaluate the final candidate on the fully corrected FFT plane.
+            // The reported noise/SNR must describe the same corrected data whether or
+            // not diagnostic plots were requested. The former no-plot shortcut reused
+            // the coarse streaming noise estimate and made `--plot` change SNR.
             let (mut final_freq_rate_array, padding_length) =
                 self.fft_for_correction(final_delay, final_rate);
             let mut final_args = create_corrected_args(self.args, final_delay, final_rate);

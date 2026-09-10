@@ -25,7 +25,7 @@ use crate::fft::{
     apply_phase_correction_in_place_at_frequency, perform_ifft_on_vec, process_fft,
     process_fft_with_phase_correction_at_frequency, process_ifft,
 };
-use crate::header::{parse_header, CorHeader};
+use crate::header::{available_cor_sectors, parse_header, CorHeader};
 use crate::input_support::{open_input_data, open_input_data_copy_on_write};
 use crate::norm_acf::NormAcfContext;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
@@ -387,6 +387,17 @@ pub fn process_cor_file(
 
     // --- Parse Header ---
     let header = parse_header(&mut cursor)?;
+    let declared_pp = header.number_of_sector;
+    let available_pp = available_cor_sectors(&header, input_data.as_slice().len())?;
+    if available_pp <= 0 {
+        return Err("truncated .cor file: no complete visibility sectors are available".into());
+    }
+    if available_pp < declared_pp {
+        eprintln!(
+            "#WARN: .cor file is still being written; using {} complete sectors out of {} declared.",
+            available_pp, declared_pp
+        );
+    }
     let original_fft_point = header.fft_point;
 
     let mut effective_fft_point = original_fft_point;
@@ -521,7 +532,7 @@ pub fn process_cor_file(
         read_visibility_data(&mut cursor, &header, 1, 0, 0, false, pp_flag_ranges)?;
     cursor.set_position(256);
 
-    let pp = header.number_of_sector;
+    let pp = available_pp;
     let mut length = if args.length == 0 { pp } else { args.length };
     if args.length != 0 && args.length > pp {
         length = pp;

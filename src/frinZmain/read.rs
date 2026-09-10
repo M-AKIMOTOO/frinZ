@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Cursor, Error, ErrorKind, Read};
 use std::path::Path;
 
-use crate::header::{parse_header, validate_cor_payload, CorHeader};
+use crate::header::{available_cor_sectors, parse_header, CorHeader};
 
 pub type C32 = Complex<f32>;
 
@@ -62,9 +62,18 @@ pub fn read_cor_file_with_options<P: AsRef<Path>>(
 pub fn read_cor_bytes(bytes: &[u8], options: &CorReadOptions) -> io::Result<CorData> {
     let mut cursor = Cursor::new(bytes);
     let header = parse_header(&mut cursor)?;
-    let (length, loop_index) = resolve_read_params(&header, options);
+    let available = available_cor_sectors(&header, bytes.len())?;
+    if available == 0 {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated .cor file: no complete visibility sectors are available",
+        ));
+    }
+    let bounded_header = bounded_header(&header, available);
+
+    let (length, loop_index) = resolve_read_params(&bounded_header, options);
     let (first_sector, end_sector) = calculate_sector_range(
-        &header,
+        &bounded_header,
         length,
         options.skip,
         loop_index,
@@ -91,6 +100,11 @@ pub fn read_cor_bytes(bytes: &[u8], options: &CorReadOptions) -> io::Result<CorD
     })
 }
 
+fn bounded_header(header: &CorHeader, available: i32) -> CorHeader {
+    let mut bounded = header.clone();
+    bounded.number_of_sector = available;
+    bounded
+}
 fn resolve_read_params(header: &CorHeader, options: &CorReadOptions) -> (i32, i32) {
     if let Some(length) = options.length.filter(|length| *length > 0) {
         return (length, options.loop_index);
@@ -133,11 +147,23 @@ pub fn read_visibility_data(
     is_cumulate: bool,
     pp_flag_ranges: &[(u32, u32)],
 ) -> io::Result<(Vec<C32>, DateTime<Utc>, f32)> {
-    validate_cor_payload(header, cursor.get_ref().len())?;
+    let available = available_cor_sectors(header, cursor.get_ref().len())?;
+    if available == 0 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated .cor file: no complete visibility sectors are available",
+        ));
+    }
+    let bounded_header = bounded_header(header, available);
+    let range_header = if available < header.number_of_sector {
+        &bounded_header
+    } else {
+        header
+    };
     let sector_size = (8 + header.fft_point / 4) * 16;
 
     let (actual_length_start, length_end) =
-        calculate_sector_range(header, length, skip, loop_index, is_cumulate);
+        calculate_sector_range(range_header, length, skip, loop_index, is_cumulate);
 
     if actual_length_start >= length_end {
         return Err(Error::new(
@@ -223,12 +249,24 @@ pub fn read_sector_header(
     loop_index: i32,
     is_cumulate: bool,
 ) -> io::Result<Vec<Vec<u8>>> {
-    validate_cor_payload(header, cursor.get_ref().len())?;
+    let available = available_cor_sectors(header, cursor.get_ref().len())?;
+    if available == 0 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated .cor file: no complete visibility sectors are available",
+        ));
+    }
+    let bounded_header = bounded_header(header, available);
+    let range_header = if available < header.number_of_sector {
+        &bounded_header
+    } else {
+        header
+    };
     // 各セクターのサイズを計算します。
     let sector_size = (8 + header.fft_point / 4) * 16;
 
     let (actual_length_start, length_end) =
-        calculate_sector_range(header, length, skip, loop_index, is_cumulate);
+        calculate_sector_range(range_header, length, skip, loop_index, is_cumulate);
 
     if actual_length_start >= length_end {
         return Err(Error::new(

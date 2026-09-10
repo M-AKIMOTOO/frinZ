@@ -82,6 +82,28 @@ fn validate_header_fields(header: &CorHeader) -> io::Result<()> {
     Ok(())
 }
 
+/// Return the number of complete sector records physically present in a `.cor` payload.
+///
+/// A writer may still be producing a file whose header already contains the final
+/// sector count.  Callers that can operate on a prefix should use this value rather
+/// than assuming that the declared count is available.
+pub(crate) fn available_cor_sectors(header: &CorHeader, file_len: usize) -> io::Result<i32> {
+    validate_header_fields(header)?;
+    if file_len <= FILE_HEADER_SIZE {
+        return Ok(0);
+    }
+
+    let visibility_bytes = (header.fft_point as usize)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "sector size overflow"))?;
+    let sector_size = SECTOR_HEADER_SIZE
+        .checked_add(visibility_bytes)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "sector size overflow"))?;
+    let complete = (file_len - FILE_HEADER_SIZE) / sector_size;
+    Ok(complete.min(header.number_of_sector as usize) as i32)
+}
+
+#[allow(dead_code)]
 pub(crate) fn validate_cor_payload(header: &CorHeader, file_len: usize) -> io::Result<()> {
     validate_header_fields(header)?;
 
@@ -199,8 +221,8 @@ pub fn parse_header(cursor: &mut Cursor<&[u8]>) -> io::Result<CorHeader> {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_cor_payload, validate_header_fields, CorHeader, COR_MAGIC, FILE_HEADER_SIZE,
-        SECTOR_HEADER_SIZE,
+        available_cor_sectors, validate_cor_payload, validate_header_fields, CorHeader, COR_MAGIC,
+        FILE_HEADER_SIZE, SECTOR_HEADER_SIZE,
     };
     use std::io::ErrorKind;
 
@@ -219,6 +241,20 @@ mod tests {
         FILE_HEADER_SIZE
             + header.number_of_sector as usize
                 * (SECTOR_HEADER_SIZE + header.fft_point as usize * size_of::<f32>())
+    }
+
+    #[test]
+    fn counts_only_complete_payload_sectors() {
+        let header = valid_header();
+        let full_size = expected_size(&header);
+        let sector_size = SECTOR_HEADER_SIZE + header.fft_point as usize * size_of::<f32>();
+
+        assert_eq!(available_cor_sectors(&header, full_size).unwrap(), 2);
+        assert_eq!(
+            available_cor_sectors(&header, full_size - sector_size / 2).unwrap(),
+            1
+        );
+        assert_eq!(available_cor_sectors(&header, FILE_HEADER_SIZE).unwrap(), 0);
     }
 
     #[test]

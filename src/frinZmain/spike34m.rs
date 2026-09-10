@@ -10,7 +10,7 @@ use num_complex::Complex;
 use crate::args::Args;
 use crate::fft::{apply_phase_correction_in_place_at_frequency, cached_fft_plan};
 use crate::fitting;
-use crate::header::{parse_header, CorHeader};
+use crate::header::{available_cor_sectors, parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
 use crate::output::insert_product_before_processing_suffixes;
 use crate::plot::{
@@ -48,9 +48,13 @@ pub fn read_all_spectra(path: &Path) -> Result<SpectraRead, Box<dyn Error>> {
     let buffer = read_input_bytes(path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
+    let available = available_cor_sectors(&header, buffer.len())?;
+    if available == 0 {
+        return Err("truncated .cor file: no complete visibility sectors are available".into());
+    }
     let mut spectra = Vec::new();
     let mut effective_integ_time = 1.0f32;
-    for sector in 0..header.number_of_sector {
+    for sector in 0..available {
         let (complex_vec, _, effective) =
             read_visibility_data(&mut cursor, &header, 1, 0, sector, false, &[])?;
         if complex_vec.is_empty() {

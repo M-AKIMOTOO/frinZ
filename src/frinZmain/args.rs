@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::rfi::RfiMask;
 
-use crate::header::parse_header;
+use crate::header::{available_cor_sectors, parse_header};
 use crate::input_support::read_input_prefix;
 
 #[derive(Clone, Copy)]
@@ -561,7 +561,20 @@ pub fn check_memory_usage(args: &Args, input_path: &Path) -> Result<bool, Box<dy
     let header = parse_header(&mut cursor)?;
 
     let fft_point = header.fft_point as u64;
-    let pp = header.number_of_sector as u64;
+    // A live `.cor` writer publishes the final sector count in the header
+    // before all payload sectors have arrived.  Estimate memory from the
+    // complete sectors physically present so a partial file is not rejected
+    // or needlessly treated as a full observation.
+    let pp = if input_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+    {
+        header.number_of_sector.max(0) as u64
+    } else {
+        let file_len = usize::try_from(std::fs::metadata(input_path)?.len()).unwrap_or(usize::MAX);
+        available_cor_sectors(&header, file_len)?.max(0) as u64
+    };
     let rate_padding = args.rate_padding as u64;
 
     let required_memory = estimate_required_memory_bytes(fft_point, pp, rate_padding)?;

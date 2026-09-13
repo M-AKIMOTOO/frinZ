@@ -278,6 +278,29 @@ pub struct ProcessResult {
     #[allow(dead_code)]
     pub add_plot_complex: Vec<Complex<f32>>,
 }
+fn plot_frequency_stat(args: &Args, header: &CorHeader) -> (String, String) {
+    if args.rfi.is_empty() {
+        (
+            "Frequency [MHz]".to_string(),
+            format!("{:.3}", header.observing_frequency as f32 / 1e6),
+        )
+    } else {
+        let rfi_str = args
+            .rfi
+            .iter()
+            .map(|s| s.replace(',', "-"))
+            .collect::<Vec<String>>()
+            .join(", ");
+        (
+            "Frequency (RFI) [MHz]".to_string(),
+            format!(
+                "{:.3} ({})",
+                header.observing_frequency as f32 / 1e6,
+                rfi_str
+            ),
+        )
+    }
+}
 
 pub fn process_cor_file(
     input_path: &Path,
@@ -399,6 +422,7 @@ pub fn process_cor_file(
         );
     }
     let original_fft_point = header.fft_point;
+    let obsfreq_mhz = (header.observing_frequency / 1_000_000.0).round() as i64;
 
     let mut effective_fft_point = original_fft_point;
     if let Some(requested_fft_point) = args.fft_rebin {
@@ -1279,13 +1303,17 @@ pub fn process_cor_file(
         }
 
         if !args.frequency {
-            let delay_output_line = format_delay_output(
-                &analysis_results,
-                &label_str,
-                args.length,
-                &rfi_display,
-                bandpass_active,
-                norm_acf_context.is_some(),
+            let delay_output_line = format!(
+                "{} {:>6}",
+                format_delay_output(
+                    &analysis_results,
+                    &label_str,
+                    args.length,
+                    &rfi_display,
+                    bandpass_active,
+                    norm_acf_context.is_some(),
+                ),
+                obsfreq_mhz,
             );
             if l1 == 0 {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
@@ -1293,8 +1321,8 @@ pub fn process_cor_file(
                 let header_str = format!(
                         concat!(
                             "#*************************************************************************************************************************************************************************************************************************\n",
-                            "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF \n",
-                            "#                                        [s]      [%]               [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F]\n",
+                            "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF  obsfreq\n",
+                            "#                                        [s]      [%]               [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F] [MHz]\n",
                             "#*************************************************************************************************************************************************************************************************************************"
                         ),
                         station1_label,
@@ -1374,13 +1402,17 @@ pub fn process_cor_file(
                 }
             }
         } else {
-            let freq_output_line = format_freq_output(
-                &analysis_results,
-                &label_str,
-                args.length,
-                &rfi_display,
-                bandpass_active,
-                norm_acf_context.is_some(),
+            let freq_output_line = format!(
+                "{} {:>6}",
+                format_freq_output(
+                    &analysis_results,
+                    &label_str,
+                    args.length,
+                    &rfi_display,
+                    bandpass_active,
+                    norm_acf_context.is_some(),
+                ),
+                obsfreq_mhz,
             );
             if l1 == 0 {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
@@ -1388,8 +1420,8 @@ pub fn process_cor_file(
                 let header_str = format!(
                     concat!(
                         "#*******************************************************************************************************************************************************************************************************************\n",
-                        "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF\n",
-                        "#                                        [s]      [%]              [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F]\n",
+                        "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF  obsfreq\n",
+                        "#                                        [s]      [%]              [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F] [MHz]\n",
                         "#*******************************************************************************************************************************************************************************************************************"
                     ),
                     station1_label,
@@ -1748,13 +1780,14 @@ pub fn process_cor_file(
                             format!("{:.3}", analysis_results.length_f32.ceil()),
                         )
                     };
+                    let (freq_key, freq_val) = plot_frequency_stat(args, &header);
 
                     let stat_keys = vec![
                         "Epoch (UTC)",
                         "Station 1 & 2",
                         "Source",
                         &length_key,
-                        "Frequency [MHz]",
+                        &freq_key,
                         "Peak Amp [%]",
                         "Peak Phs [deg]",
                         "SNR (1 σ [%])",
@@ -1768,7 +1801,7 @@ pub fn process_cor_file(
                         format!("{} & {}", header.station1_name, header.station2_name),
                         analysis_results.source_name.to_string(),
                         length_val,
-                        format!("{:.3}", header.observing_frequency as f32 / 1e6),
+                        freq_val,
                         format!("{:.6}", analysis_results.delay_max_amp * 100.0),
                         format!("{:+.5}", analysis_results.delay_phase),
                         format!(

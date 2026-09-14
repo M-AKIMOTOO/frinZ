@@ -1348,6 +1348,7 @@ pub fn process_cor_file(
                     &rfi_display,
                     bandpass_active,
                     norm_acf_context.is_some(),
+                    obsfreq_mhz,
                 ));
                 delay_tsv.push('\n');
             }
@@ -1447,6 +1448,7 @@ pub fn process_cor_file(
                     &rfi_display,
                     bandpass_active,
                     norm_acf_context.is_some(),
+                    obsfreq_mhz,
                 ));
                 freq_tsv.push('\n');
             }

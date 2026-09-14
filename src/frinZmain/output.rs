@@ -337,10 +337,11 @@ fn format_tsv_header(station1_name: &str, station2_name: &str, frequency_mode: b
         "RFI",
         "BP",
         "ACF",
+        "obsfreq",
     ]);
     units.extend([
         "az[deg]", "el[deg]", "hgt[m]", "az[deg]", "el[deg]", "hgt[m]", "-", "[MHz]", "[T/F]",
-        "[T/F]",
+        "[T/F]", "[MHz]",
     ]);
     format!("{}\n{}\n", columns.join("\t"), units.join("\t"))
 }
@@ -359,6 +360,7 @@ pub fn format_delay_tsv_row(
     rfi_display: &str,
     bandpass_applied: bool,
     norm_acf_applied: bool,
+    obsfreq_mhz: i64,
 ) -> String {
     let label_segment = label.get(3).copied().unwrap_or("");
     vec![
@@ -382,6 +384,7 @@ pub fn format_delay_tsv_row(
         sanitize_tsv_field(rfi_display),
         if bandpass_applied { "True" } else { "False" }.to_string(),
         if norm_acf_applied { "True" } else { "False" }.to_string(),
+        obsfreq_mhz.to_string(),
     ]
     .join("\t")
 }
@@ -392,6 +395,7 @@ pub fn format_freq_tsv_row(
     rfi_display: &str,
     bandpass_applied: bool,
     norm_acf_applied: bool,
+    obsfreq_mhz: i64,
 ) -> String {
     let label_segment = label.get(3).copied().unwrap_or("");
     vec![
@@ -415,6 +419,7 @@ pub fn format_freq_tsv_row(
         sanitize_tsv_field(rfi_display),
         if bandpass_applied { "True" } else { "False" }.to_string(),
         if norm_acf_applied { "True" } else { "False" }.to_string(),
+        obsfreq_mhz.to_string(),
     ]
     .join("\t")
 }
@@ -508,8 +513,8 @@ mod filename_tests {
             assert!(lines[0].starts_with('#'));
             assert!(lines[1].starts_with('#'));
             assert!(!header.contains('*'));
-            assert_eq!(lines[0].split('\t').count(), 20);
-            assert_eq!(lines[1].split('\t').count(), 20);
+            assert_eq!(lines[0].split('\t').count(), 21);
+            assert_eq!(lines[1].split('\t').count(), 21);
             assert_eq!(lines[1].split('\t').next(), Some("# -"));
             assert!(lines[0].contains("YAMAGU32-azel"));
             assert!(lines[0].contains("YAMAGU34-azel"));

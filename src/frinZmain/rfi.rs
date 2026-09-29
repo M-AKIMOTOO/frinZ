@@ -8,6 +8,8 @@ use ndarray::Array2;
 use num_complex::Complex;
 
 use crate::npy_output::{NamedNpz, NpyMeta};
+use crate::plot::rasterize_rgb_grid_on_axes_with_overlay;
+use plotters::backend::RGBPixel;
 use plotters::coord::Shift;
 use plotters::prelude::*;
 use rustfft::FftPlanner;
@@ -1079,26 +1081,34 @@ pub fn detect_histogram_rfi(
             (!is_protected(index) && amplitude.is_finite()).then_some(*amplitude)
         })
         .collect::<Vec<_>>();
-    valid.sort_by(|a, b| a.total_cmp(b));
     let mut valid_count = valid.len();
     let histogram_min_positive = valid
         .iter()
         .copied()
-        .find(|value| *value > 0.0)
-        .unwrap_or(1.0) as f64;
+        .filter(|value| *value > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    let histogram_min_positive = if histogram_min_positive.is_finite() {
+        histogram_min_positive as f64
+    } else {
+        1.0
+    };
     let histogram_max = valid
-        .last()
+        .iter()
         .copied()
-        .unwrap_or(histogram_min_positive as f32)
-        .max(histogram_min_positive as f32) as f64;
+        .fold(histogram_min_positive as f32, f32::max) as f64;
     // Match the noise_hist tail-count convention while keeping every
     // integration window numerically valid if it has very few finite cells.
     let mut rayleigh_count = requested_rayleigh_count
         .max(1)
         .min(valid_count.saturating_sub(1).max(1) as u64);
     let mut rayleigh_count_f64 = rayleigh_count as f64;
+    let median = if valid_count > 0 {
+        let (_, median, _) = valid.select_nth_unstable_by(valid_count / 2, f32::total_cmp);
+        *median as f64
+    } else {
+        0.0
+    };
     let mut sigma = if valid_count > 0 {
-        let median = valid[valid_count / 2] as f64;
         (median / (2.0f64 * 2.0f64.ln()).sqrt()) as f32
     } else {
         0.0
@@ -1197,7 +1207,6 @@ pub fn detect_histogram_rfi(
     if fit_valid.is_empty() {
         fit_valid = valid.clone();
     }
-    fit_valid.sort_by(|a, b| a.total_cmp(b));
     valid_count = fit_valid.len();
     rayleigh_count = requested_rayleigh_count
         .max(1)
@@ -1247,8 +1256,10 @@ pub fn detect_histogram_rfi(
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(delay_count);
         let half = delay_count / 2;
+        let mut work = vec![C32::new(0.0, 0.0); delay_count];
+        let mut scratch = vec![C32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
         for rate in 0..rate_count {
-            let mut work = vec![C32::new(0.0, 0.0); delay_count];
+            work.fill(C32::new(0.0, 0.0));
             for delay in 0..delay_count {
                 if delay_mask[rate * delay_count + delay] {
                     let source = if delay < half {
@@ -1259,38 +1270,40 @@ pub fn detect_histogram_rfi(
                     work[source] = delay_rate[[rate, delay]];
                 }
             }
-            fft.process(&mut work);
+            fft.process_with_scratch(&mut work, &mut scratch);
             for frequency in 0..frequency_count.min(delay_count) {
                 rfi_frequency[[frequency, rate]] = work[frequency];
             }
         }
     }
-    let mut transformed = rfi_frequency
+    let frequency_amplitudes = rfi_frequency
         .iter()
         .map(|value| value.norm())
+        .collect::<Vec<_>>();
+    let mut transformed = frequency_amplitudes
+        .iter()
+        .copied()
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect::<Vec<_>>();
-    transformed.sort_by(|a, b| a.total_cmp(b));
-    let transformed_median = transformed
-        .get(transformed.len() / 2)
-        .copied()
-        .unwrap_or(0.0);
-    let transformed_max = transformed.last().copied().unwrap_or(0.0);
+    let transformed_max = transformed.iter().copied().fold(0.0f32, f32::max);
+    let transformed_median = if transformed.is_empty() {
+        0.0
+    } else {
+        let middle = transformed.len() / 2;
+        let (_, median, _) = transformed.select_nth_unstable_by(middle, f32::total_cmp);
+        *median
+    };
     let frequency_threshold = if transformed_median > 0.0 {
         (transformed_median * 3.0).max(transformed_max * 0.02)
     } else {
         transformed_max * 0.02
     };
-    let frequency_amplitudes = rfi_frequency
-        .iter()
-        .map(|value| value.norm())
-        .collect::<Vec<_>>();
     let mut frequency_mask = vec![false; frequency_count.saturating_mul(frequency_rate_count)];
-    for (index, value) in rfi_frequency.iter().enumerate() {
+    for (index, &amplitude) in frequency_amplitudes.iter().enumerate() {
         let rate_row = index % frequency_rate_count.max(1);
         frequency_mask[index] = frequency_threshold > 0.0
-            && value.norm().is_finite()
-            && value.norm() >= frequency_threshold
+            && amplitude.is_finite()
+            && amplitude >= frequency_threshold
             && Some(rate_row) != protect_rate_row;
     }
     if let Some(slice) = freq_rate.as_slice_mut() {
@@ -1941,58 +1954,99 @@ fn write_histogram_heatmap(
         .axis_desc_style(("sans-serif", 24))
         .draw()?;
 
-    let amplitudes = &result.delay_amplitudes;
-    chart.draw_series((0..rows).flat_map(|row| {
-        (0..cols).map(move |col| {
-            let index = row * cols + col;
-            let value = amplitudes.get(index).copied().unwrap_or(0.0).max(0.0);
+    let mut x_edges = Vec::with_capacity(cols + 1);
+    for col in 0..cols {
+        x_edges.push(histogram_cell_bounds(x_axis, col).0);
+    }
+    x_edges.push(histogram_cell_bounds(x_axis, cols - 1).1);
+    let mut y_edges = Vec::with_capacity(rows + 1);
+    for row in 0..rows {
+        y_edges.push(histogram_cell_bounds(y_axis, row).0);
+    }
+    y_edges.push(histogram_cell_bounds(y_axis, rows - 1).1);
+    let heatmap_values: Vec<f64> = result.delay_amplitudes.iter().map(|&v| v as f64).collect();
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let candidate = &result.candidate_mask;
+    let celestial = &result.celestial_mask;
+    let plot_x_min = x_min - x_pad;
+    let plot_x_max = x_max + x_pad;
+    let plot_y_min = y_min - y_pad;
+    let plot_y_max = y_max + y_pad;
+    let heatmap_buffer = rasterize_rgb_grid_on_axes_with_overlay(
+        bitmap_width,
+        bitmap_height,
+        &x_edges,
+        &y_edges,
+        &heatmap_values,
+        (plot_x_min, plot_x_max),
+        (plot_y_min, plot_y_max),
+        false,
+        &|x_cell, y_cell, px, py, _, _| {
+            if !classified {
+                return None;
+            }
+            let index = y_cell * cols + x_cell;
+            let is_celestial = celestial.get(index).copied().unwrap_or(false);
+            let is_candidate = candidate.get(index).copied().unwrap_or(false) && !is_celestial;
+            if !is_celestial && !is_candidate {
+                return None;
+            }
+
+            let (left, right) = (x_edges[x_cell], x_edges[x_cell + 1]);
+            let (bottom, top) = (y_edges[y_cell], y_edges[y_cell + 1]);
+            let px_at = |x: f64| {
+                (x - plot_x_min) / (plot_x_max - plot_x_min) * bitmap_width.saturating_sub(1) as f64
+            };
+            let py_at = |y: f64| {
+                (plot_y_max - y) / (plot_y_max - plot_y_min)
+                    * bitmap_height.saturating_sub(1) as f64
+            };
+            let on_border = (px as f64 - px_at(left)).abs() <= 2.0
+                || (px as f64 - px_at(right)).abs() <= 2.0
+                || (py as f64 - py_at(bottom)).abs() <= 2.0
+                || (py as f64 - py_at(top)).abs() <= 2.0;
+            if on_border {
+                Some(if is_celestial { CYAN.rgb() } else { RED.rgb() })
+            } else {
+                None
+            }
+        },
+        &|value| {
+            let value = (value as f32).max(0.0);
             let value_log = if value > 0.0 { value.log10() } else { log_min };
             let normalized = ((value_log - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
-            let (left, right) = histogram_cell_bounds(x_axis, col);
-            let (bottom, top) = histogram_cell_bounds(y_axis, row);
-            Rectangle::new(
-                [(left, bottom), (right, top)],
-                HSLColor((240.0 - 240.0 * normalized as f64) / 360.0, 1.0, 0.5).filled(),
-            )
-        })
-    }))?;
+            HSLColor((240.0 - 240.0 * normalized as f64) / 360.0, 1.0, 0.5).rgb()
+        },
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (plot_x_min, plot_y_max),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create delay-rate histogram bitmap")?;
+    chart.draw_series(std::iter::once(bitmap))?;
+    chart
+        .configure_mesh()
+        .x_desc("Delay")
+        .y_desc("Rate [Hz]")
+        .label_style(("sans-serif", 20))
+        .axis_desc_style(("sans-serif", 24))
+        .draw()?;
     if classified {
-        let candidate = &result.candidate_mask;
-        let celestial = &result.celestial_mask;
         chart
-            .draw_series((0..rows).flat_map(|row| {
-                (0..cols).filter_map(move |col| {
-                    let index = row * cols + col;
-                    if !candidate.get(index).copied().unwrap_or(false)
-                        || celestial.get(index).copied().unwrap_or(false)
-                    {
-                        return None;
-                    }
-                    let (left, right) = histogram_cell_bounds(x_axis, col);
-                    let (bottom, top) = histogram_cell_bounds(y_axis, row);
-                    Some(Rectangle::new(
-                        [(left, bottom), (right, top)],
-                        RED.stroke_width(2),
-                    ))
-                })
-            }))?
+            .draw_series(std::iter::once(PathElement::new(
+                vec![(plot_x_min, plot_y_min), (plot_x_min, plot_y_min)],
+                RED.stroke_width(2),
+            )))?
             .label("RFI candidates")
             .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], RED.stroke_width(2)));
         chart
-            .draw_series((0..rows).flat_map(|row| {
-                (0..cols).filter_map(move |col| {
-                    let index = row * cols + col;
-                    if !celestial.get(index).copied().unwrap_or(false) {
-                        return None;
-                    }
-                    let (left, right) = histogram_cell_bounds(x_axis, col);
-                    let (bottom, top) = histogram_cell_bounds(y_axis, row);
-                    Some(Rectangle::new(
-                        [(left, bottom), (right, top)],
-                        CYAN.stroke_width(2),
-                    ))
-                })
-            }))?
+            .draw_series(std::iter::once(PathElement::new(
+                vec![(plot_x_min, plot_y_min), (plot_x_min, plot_y_min)],
+                CYAN.stroke_width(2),
+            )))?
             .label("Celestial fringe cross")
             .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], CYAN.stroke_width(2)));
         let annotation = rayleigh_annotation(result, "delay-rate");

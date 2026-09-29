@@ -1,11 +1,13 @@
 use crate::args::Args;
 use crate::npy_output::{NamedNpz, NpyMeta};
 use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
+use crate::plot::rasterize_rgb_grid_on_axes;
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
 use crate::utils;
 use nalgebra::{Matrix3, Vector3};
 use ndarray::Array2;
+use plotters::backend::RGBPixel;
 use plotters::prelude::*;
 use plotters::style::colors::colormaps::ViridisRGB;
 use std::error::Error;
@@ -545,24 +547,14 @@ fn plot_wwz_heatmap(
         .fold(f64::NEG_INFINITY, |acc, value| acc.max(value));
     let max_power = robust_color_max(transform.wwz.iter().copied()).max(1e-12);
 
-    let build_heatmap_cells = || {
-        (0..transform.tau.len())
-            .flat_map(|tau_index| {
-                let x0 = x_edges[tau_index].min(x_edges[tau_index + 1]);
-                let x1 = x_edges[tau_index].max(x_edges[tau_index + 1]);
-                (0..y_values.len())
-                    .map(|freq_index| {
-                        let y0 = y_edges[freq_index].min(y_edges[freq_index + 1]);
-                        let y1 = y_edges[freq_index].max(y_edges[freq_index + 1]);
-                        let normalized =
-                            (transform.wwz[[tau_index, freq_index]] / max_power).clamp(0.0, 1.0);
-                        let color = ViridisRGB.get_color(normalized);
-                        Rectangle::new([(x0, y0), (x1, y1)], color.filled())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
+    // Array2 is indexed as [time, frequency], while the rasterizer uses
+    // row-major [vertical, horizontal] samples.
+    let mut heatmap_values = Vec::with_capacity(transform.tau.len() * y_values.len());
+    for freq_index in 0..y_values.len() {
+        for tau_index in 0..transform.tau.len() {
+            heatmap_values.push(transform.wwz[[tau_index, freq_index]]);
+        }
+    }
     let ridge_points = transform
         .tau
         .iter()
@@ -599,7 +591,31 @@ fn plot_wwz_heatmap(
                 .label_style(("sans-serif", 20).into_font())
                 .draw()?;
 
-            chart.draw_series(build_heatmap_cells())?;
+            let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+            let bitmap_width = plot_x.len().max(1) as u32;
+            let bitmap_height = plot_y.len().max(1) as u32;
+            let heatmap_buffer = rasterize_rgb_grid_on_axes(
+                bitmap_width,
+                bitmap_height,
+                &x_edges,
+                &y_edges,
+                &heatmap_values,
+                (x_min, x_max),
+                (y_min, y_max),
+                true,
+                &|value| {
+                    ViridisRGB
+                        .get_color((value / max_power).clamp(0.0, 1.0))
+                        .rgb()
+                },
+            );
+            let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+                (x_min, y_max),
+                (bitmap_width, bitmap_height),
+                heatmap_buffer,
+            )
+            .ok_or("failed to create log-period WWZ bitmap")?;
+            chart.draw_series(std::iter::once(bitmap))?;
             chart.draw_series(LineSeries::new(ridge_points.iter().copied(), &WHITE))?;
         }
         _ => {
@@ -630,7 +646,31 @@ fn plot_wwz_heatmap(
                 .label_style(("sans-serif", 20).into_font())
                 .draw()?;
 
-            chart.draw_series(build_heatmap_cells())?;
+            let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+            let bitmap_width = plot_x.len().max(1) as u32;
+            let bitmap_height = plot_y.len().max(1) as u32;
+            let heatmap_buffer = rasterize_rgb_grid_on_axes(
+                bitmap_width,
+                bitmap_height,
+                &x_edges,
+                &y_edges,
+                &heatmap_values,
+                (x_min, x_max),
+                (y_min, y_max),
+                false,
+                &|value| {
+                    ViridisRGB
+                        .get_color((value / max_power).clamp(0.0, 1.0))
+                        .rgb()
+                },
+            );
+            let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+                (x_min, y_max),
+                (bitmap_width, bitmap_height),
+                heatmap_buffer,
+            )
+            .ok_or("failed to create WWZ bitmap")?;
+            chart.draw_series(std::iter::once(bitmap))?;
             chart.draw_series(LineSeries::new(ridge_points.iter().copied(), &WHITE))?;
         }
     }

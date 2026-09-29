@@ -205,6 +205,7 @@ fn process_fft_impl(
 
     let mut freq_rate_array = Array2::<C32>::zeros((fft_point_half, padding_length));
     let mut fft_exe = vec![C32::new(0.0, 0.0); padding_length];
+    let mut fft_scratch = vec![C32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
     let mut rfi_mask = vec![false; fft_point_half];
     for &(min, max) in rfi_ranges {
         if min >= fft_point_half {
@@ -250,7 +251,7 @@ fn process_fft_impl(
         }
         fft_exe[rows..].fill(C32::new(0.0, 0.0));
 
-        fft.process(&mut fft_exe);
+        fft.process_with_scratch(&mut fft_exe, &mut fft_scratch);
 
         let (first_half, second_half) = fft_exe.split_at(padding_length_half);
         let mut row = freq_rate_array.row_mut(i);
@@ -348,6 +349,7 @@ pub fn process_ifft_with_delay_padding(
     let mut delay_rate_array = Array2::<C32>::zeros((padding_length, padded_fft_point));
     let ifft = cached_fft_plan(padded_fft_point, true);
     let mut ifft_exe = vec![C32::new(0.0, 0.0); padded_fft_point];
+    let mut ifft_scratch = vec![C32::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
     let freq_bins = freq_rate_array.dim().0.min(padded_fft_point);
     let scale = fft_point_usize as f32;
 
@@ -360,7 +362,7 @@ pub fn process_ifft_with_delay_padding(
         }
         ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
 
-        ifft.process(&mut ifft_exe);
+        ifft.process_with_scratch(&mut ifft_exe, &mut ifft_scratch);
 
         let half = padded_fft_point / 2;
         let (first_half, second_half) = ifft_exe.split_at(half);

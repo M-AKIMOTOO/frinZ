@@ -1747,6 +1747,7 @@ fn write_spike_rate_spectrum_search_corrected(
     }
 
     let mut work = vec![C32::new(0.0, 0.0); nfft];
+    let mut scratch = vec![C32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
     for (channel, interval_idx) in channel_interval.iter().copied().enumerate() {
         if interval_idx == usize::MAX {
             continue;
@@ -1755,7 +1756,7 @@ fn write_spike_rate_spectrum_search_corrected(
         for (row, values) in spectra.iter().enumerate() {
             work[row] = values[channel];
         }
-        fft.process(&mut work);
+        fft.process_with_scratch(&mut work, &mut scratch);
         let mut power = vec![0.0f64; nfft];
         for (index, value) in work.iter().enumerate() {
             let centered = (index + nfft / 2) % nfft;

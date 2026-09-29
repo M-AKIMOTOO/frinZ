@@ -12,7 +12,7 @@ use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality}
 use crate::processing::ProcessResult;
 use crate::utils::safe_arg;
 use chrono::{DateTime, TimeZone, Utc};
-use ndarray::Array2; // Added for dynamic spectrum
+use ndarray::{Array2, ArrayBase, Data, Ix2};
 use num_complex::Complex;
 use plotters::backend::RGBPixel;
 use plotters::coord::Shift;
@@ -76,6 +76,344 @@ where
     });
 
     buffer
+}
+
+pub(crate) fn rasterize_rgb_grid<T, F>(
+    output_width: u32,
+    output_height: u32,
+    sample_width: usize,
+    sample_height: usize,
+    values: &[T],
+    flip_x: bool,
+    flip_y: bool,
+    colorize: &F,
+) -> Vec<u8>
+where
+    T: Copy + Into<f64> + Sync,
+    F: Fn(f64) -> (u8, u8, u8) + Sync,
+{
+    let output_width = output_width as usize;
+    let output_height = output_height as usize;
+    if output_width == 0
+        || output_height == 0
+        || sample_width == 0
+        || sample_height == 0
+        || values.len() < sample_width.saturating_mul(sample_height)
+    {
+        return Vec::new();
+    }
+    let output_x_den = (output_width.saturating_sub(1)).max(1) as f64;
+    let output_y_den = (output_height.saturating_sub(1)).max(1) as f64;
+    let sample_x_max = sample_width.saturating_sub(1);
+    let sample_y_max = sample_height.saturating_sub(1);
+    let mut buffer = vec![0u8; output_width * output_height * 3];
+
+    plot_pool().install(|| {
+        buffer
+            .par_chunks_mut(3)
+            .enumerate()
+            .for_each(|(idx, pixel)| {
+                let px = idx % output_width;
+                let py = idx / output_width;
+                let mut sample_x =
+                    (px as f64 * sample_x_max as f64 / output_x_den).floor() as usize;
+                let mut sample_y =
+                    (py as f64 * sample_y_max as f64 / output_y_den).floor() as usize;
+                if flip_x {
+                    sample_x = sample_x_max.saturating_sub(sample_x);
+                }
+                if flip_y {
+                    sample_y = sample_y_max.saturating_sub(sample_y);
+                }
+                let (r, g, b) = colorize(values[sample_y * sample_width + sample_x].into());
+                pixel[0] = r;
+                pixel[1] = g;
+                pixel[2] = b;
+            });
+    });
+
+    buffer
+}
+
+pub(crate) fn rasterize_rgb_grid_on_axes<F>(
+    output_width: u32,
+    output_height: u32,
+    x_edges: &[f64],
+    y_edges: &[f64],
+    values: &[f64],
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    log_y: bool,
+    colorize: &F,
+) -> Vec<u8>
+where
+    F: Fn(f64) -> (u8, u8, u8) + Sync,
+{
+    rasterize_rgb_grid_on_axes_with_overlay(
+        output_width,
+        output_height,
+        x_edges,
+        y_edges,
+        values,
+        x_range,
+        y_range,
+        log_y,
+        &|_, _, _, _, _, _| None,
+        colorize,
+    )
+}
+
+pub(crate) fn rasterize_rgb_grid_on_axes_with_overlay<F, O>(
+    output_width: u32,
+    output_height: u32,
+    x_edges: &[f64],
+    y_edges: &[f64],
+    values: &[f64],
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    log_y: bool,
+    overlay: &O,
+    colorize: &F,
+) -> Vec<u8>
+where
+    F: Fn(f64) -> (u8, u8, u8) + Sync,
+    O: Fn(usize, usize, usize, usize, f64, f64) -> Option<(u8, u8, u8)> + Sync,
+{
+    let width = output_width as usize;
+    let height = output_height as usize;
+    let x_cells = x_edges.len().saturating_sub(1);
+    let y_cells = y_edges.len().saturating_sub(1);
+    let mut buffer = vec![255u8; width.saturating_mul(height).saturating_mul(3)];
+    if width == 0
+        || height == 0
+        || x_cells == 0
+        || y_cells == 0
+        || values.len() < x_cells.saturating_mul(y_cells)
+    {
+        return buffer;
+    }
+
+    let edge_x_min = x_edges[0].min(*x_edges.last().unwrap());
+    let edge_x_max = x_edges[0].max(*x_edges.last().unwrap());
+    let edge_y_min = y_edges[0].min(*y_edges.last().unwrap());
+    let edge_y_max = y_edges[0].max(*y_edges.last().unwrap());
+    let (x_min, x_max) = x_range;
+    let (y_min, y_max) = y_range;
+    let x_den = (width.saturating_sub(1)).max(1) as f64;
+    let y_den = (height.saturating_sub(1)).max(1) as f64;
+    let x_ascending = x_edges[0] <= x_edges[x_cells];
+    let y_ascending = y_edges[0] <= y_edges[y_cells];
+    let x_span = x_max - x_min;
+    let y_span = if log_y {
+        y_max.ln() - y_min.ln()
+    } else {
+        y_max - y_min
+    };
+
+    plot_pool().install(|| {
+        buffer
+            .par_chunks_mut(3)
+            .enumerate()
+            .for_each(|(index, pixel)| {
+                let px = index % width;
+                let py = index / width;
+                let x = x_min + x_span * px as f64 / x_den;
+                let y = if log_y {
+                    (y_max.ln() - y_span * py as f64 / y_den).exp()
+                } else {
+                    y_max - y_span * py as f64 / y_den
+                };
+                if x < edge_x_min || x > edge_x_max || y < edge_y_min || y > edge_y_max {
+                    return;
+                }
+                let x_cell = axis_cell_index(x_edges, x, x_ascending);
+                let y_cell = axis_cell_index(y_edges, y, y_ascending);
+                let value = values[y_cell * x_cells + x_cell];
+                let (r, g, b) =
+                    overlay(x_cell, y_cell, px, py, x, y).unwrap_or_else(|| colorize(value));
+                pixel[0] = r;
+                pixel[1] = g;
+                pixel[2] = b;
+            });
+    });
+
+    buffer
+}
+
+fn axis_cell_index(edges: &[f64], value: f64, ascending: bool) -> usize {
+    let cell_count = edges.len().saturating_sub(1);
+    if cell_count == 0 {
+        return 0;
+    }
+    let mut low = 0usize;
+    let mut high = edges.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let precedes = if ascending {
+            edges[middle] <= value
+        } else {
+            edges[middle] >= value
+        };
+        if precedes {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low.saturating_sub(1).min(cell_count - 1)
+}
+
+fn rasterize_scatter_rgb_buffer<X, Y>(
+    width: u32,
+    height: u32,
+    x_values: &[X],
+    y_values: &[Y],
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+) -> Vec<u8>
+where
+    X: Copy + Into<f64>,
+    Y: Copy + Into<f64>,
+{
+    let buffer = vec![
+        255u8;
+        (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(3)
+    ];
+    rasterize_scatter_layer_rgb_buffer(
+        buffer,
+        width,
+        height,
+        x_values,
+        y_values,
+        x_range,
+        y_range,
+        (0, 0, 255),
+        0.4,
+        1,
+    )
+}
+
+fn rasterize_scatter_layer_rgb_buffer<X, Y>(
+    mut buffer: Vec<u8>,
+    width: u32,
+    height: u32,
+    x_values: &[X],
+    y_values: &[Y],
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    color: (u8, u8, u8),
+    opacity: f64,
+    radius: isize,
+) -> Vec<u8>
+where
+    X: Copy + Into<f64>,
+    Y: Copy + Into<f64>,
+{
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0
+        || height == 0
+        || buffer.len() < width.saturating_mul(height).saturating_mul(3)
+        || x_values.len() != y_values.len()
+    {
+        return buffer;
+    }
+
+    let (x_min, x_max) = x_range;
+    let (y_min, y_max) = y_range;
+    let x_span = x_max - x_min;
+    let y_span = y_max - y_min;
+    if !x_span.is_finite() || !y_span.is_finite() || x_span <= 0.0 || y_span <= 0.0 {
+        return buffer;
+    }
+
+    let max_points = 200_000usize;
+    let stride = x_values.len().div_ceil(max_points).max(1);
+    let color = [color.0, color.1, color.2];
+    let opacity = opacity.clamp(0.0, 1.0);
+    for idx in (0..x_values.len()).step_by(stride) {
+        let x = x_values[idx].into();
+        let y = y_values[idx].into();
+        if !x.is_finite() || !y.is_finite() || x < x_min || x > x_max || y < y_min || y > y_max {
+            continue;
+        }
+        let px = ((x - x_min) / x_span * width.saturating_sub(1) as f64).round() as isize;
+        let py = ((y_max - y) / y_span * height.saturating_sub(1) as f64).round() as isize;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy > radius * radius {
+                    continue;
+                }
+                let pixel_x = px + dx;
+                let pixel_y = py + dy;
+                if pixel_x < 0
+                    || pixel_y < 0
+                    || pixel_x >= width as isize
+                    || pixel_y >= height as isize
+                {
+                    continue;
+                }
+                let offset = (pixel_y as usize * width + pixel_x as usize) * 3;
+                for channel in 0..3 {
+                    // Composite in input order so repeated samples retain density.
+                    buffer[offset + channel] = (buffer[offset + channel] as f64 * (1.0 - opacity)
+                        + color[channel] as f64 * opacity)
+                        .round() as u8;
+                }
+            }
+        }
+    }
+
+    buffer
+}
+
+// Preserve the sampled grid's normalization, then rasterize it at the chart's
+// actual pixel size instead of drawing every sample as a Plotters rectangle.
+fn build_sampled_heatmap_rgb_buffer<F>(
+    output_width: u32,
+    output_height: u32,
+    sample_width: usize,
+    sample_height: usize,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    heatmap_func: &F,
+) -> Vec<u8>
+where
+    F: Fn(f64, f64) -> f64 + Sync,
+{
+    let sample_x_den = (sample_width.saturating_sub(1)).max(1) as f64;
+    let sample_y_den = (sample_height.saturating_sub(1)).max(1) as f64;
+    let mut values = vec![0.0; sample_width * sample_height];
+
+    plot_pool().install(|| {
+        values.par_iter_mut().enumerate().for_each(|(idx, value)| {
+            let px = idx % sample_width;
+            let py = idx / sample_width;
+            let x = x_min + (x_max - x_min) * px as f64 / sample_x_den;
+            let y = y_min + (y_max - y_min) * py as f64 / sample_y_den;
+            *value = heatmap_func(x, y);
+        });
+    });
+
+    let amplitude_norm = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let amp = amplitude_norm.max(1e-30);
+    rasterize_rgb_grid(
+        output_width,
+        output_height,
+        sample_width,
+        sample_height,
+        &values,
+        false,
+        true,
+        &|value| {
+            let normalized = (value / amp).clamp(0.0, 1.0);
+            HSLColor((1.0 - normalized) * 0.7, 1.0, 0.5).rgb()
+        },
+    )
 }
 
 pub fn delay_plane(
@@ -811,37 +1149,27 @@ pub fn frequency_plane(
 
     let resolution_x = heatmap_res_x.max(2);
     let resolution_y = heatmap_res_y.max(2);
-    let mut heatmap_values = Vec::new();
-    let mut heatmap_data_max_val = f64::NEG_INFINITY;
-    for i in 0..resolution_y {
-        for j in 0..resolution_x {
-            let y = rate_min_x + (rate_max_x - rate_min_x) * i as f64 / (resolution_y - 1) as f64;
-            let x = bw * j as f64 / (resolution_x - 1) as f64;
-            let val = heatmap_func(x, y);
-            heatmap_values.push(val);
-            if val > heatmap_data_max_val {
-                heatmap_data_max_val = val;
-            }
-        }
-    }
-
-    for (idx, val) in heatmap_values.iter().enumerate() {
-        let i = idx / resolution_x;
-        let j = idx % resolution_x;
-        let y = rate_min_x + (rate_max_x - rate_min_x) * i as f64 / (resolution_y - 1) as f64;
-        let x = bw * j as f64 / (resolution_x - 1) as f64;
-        let x_step = bw / (resolution_x - 1) as f64;
-        let y_step = (rate_max_x - rate_min_x) / (resolution_y - 1) as f64;
-        let normalized_val = if heatmap_data_max_val > 0.0 {
-            *val / heatmap_data_max_val
-        } else {
-            0.0
-        };
-        heatmap_chart.draw_series(std::iter::once(Rectangle::new(
-            [(x, y), (x + x_step, y + y_step)],
-            HSLColor((1.0 - normalized_val) * 0.7, 1.0, 0.5).filled(),
-        )))?;
-    }
+    let (plot_x, plot_y) = heatmap_chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = build_sampled_heatmap_rgb_buffer(
+        bitmap_width,
+        bitmap_height,
+        resolution_x,
+        resolution_y,
+        0.0,
+        bw,
+        rate_min_x,
+        rate_max_x,
+        &heatmap_func,
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (0.0, rate_max_x),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create frequency heatmap bitmap")?;
+    heatmap_chart.draw_series(std::iter::once(bitmap))?;
 
     // 4. Colorbar
     let mut colorbar = ChartBuilder::on(&colorbar_area)
@@ -1256,83 +1584,93 @@ pub fn add_plot(
         (res_rate, "Residual Rate [Hz]", "resrate"),
     ];
 
-    for (data, y_label, filename_suffix) in plots {
-        if data.is_empty() {
-            continue;
-        }
-        let output_stem = insert_product_before_processing_suffixes(output_path, filename_suffix);
-        let file_path = format!("{output_stem}.png");
-        let root = BitMapBackend::new(&file_path, (900, 600)).into_drawing_area();
-        root.fill(&WHITE)?;
+    plot_pool()
+        .install(|| {
+            plots.par_iter().try_for_each(
+                |&(data, y_label, filename_suffix)| -> Result<(), String> {
+                    if data.is_empty() {
+                        return Ok(());
+                    }
+                    let output_stem =
+                        insert_product_before_processing_suffixes(output_path, filename_suffix);
+                    let file_path = format!("{output_stem}.png");
+                    let root = BitMapBackend::new(&file_path, (900, 600)).into_drawing_area();
+                    root.fill(&WHITE).map_err(|error| error.to_string())?;
 
-        let mut y_min = data.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mut y_max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut y_min = data.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let mut y_max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        if filename_suffix == "phase" {
-            y_min = -180.0;
-            y_max = 180.0;
-        } else if (y_max - y_min).abs() <= f32::EPSILON {
-            let margin = (y_min.abs() * 1.0e-6).max(1.0e-6);
-            y_min -= margin;
-            y_max += margin;
-        }
+                    if filename_suffix == "phase" {
+                        y_min = -180.0;
+                        y_max = 180.0;
+                    } else if (y_max - y_min).abs() <= f32::EPSILON {
+                        let margin = (y_min.abs() * 1.0e-6).max(1.0e-6);
+                        y_min -= margin;
+                        y_max += margin;
+                    }
 
-        let x_range = if length.len() > 1 {
-            *length.first().unwrap()..*length.last().unwrap()
-        } else {
-            // Handle case with a single data point
-            let center = length.first().unwrap_or(&0.0);
-            (center - 1.0)..(center + 1.0)
-        };
+                    let x_range = if length.len() > 1 {
+                        *length.first().unwrap()..*length.last().unwrap()
+                    } else {
+                        let center = length.first().unwrap_or(&0.0);
+                        (center - 1.0)..(center + 1.0)
+                    };
 
-        let mut chart = ChartBuilder::on(&root)
-            .caption(
-                format!("{}, length: {:.3} s", source_name, len_val_sec),
-                ("sans-serif ", 25).into_font(),
+                    let mut chart = ChartBuilder::on(&root)
+                        .caption(
+                            format!("{}, length: {:.3} s", source_name, len_val_sec),
+                            ("sans-serif ", 25).into_font(),
+                        )
+                        .margin(10)
+                        .x_label_area_size(60)
+                        .y_label_area_size(100)
+                        .build_cartesian_2d(x_range, y_min..y_max)
+                        .map_err(|error| error.to_string())?;
+
+                    chart
+                        .configure_mesh()
+                        .x_desc(format!(
+                            "The elapsed time since {} UT",
+                            obs_start_time.format("%Y/%j %H:%M:%S")
+                        ))
+                        .y_desc(y_label)
+                        .x_label_formatter(&|v| format!("{:.0}", v))
+                        .y_label_formatter(&|v| {
+                            if matches!(filename_suffix, "phase" | "snr") {
+                                format!("{:.0}", v)
+                            } else if matches!(filename_suffix, "resdelay" | "freq") {
+                                format!("{:.3}", v)
+                            } else if filename_suffix == "resrate" {
+                                format!("{:.2e}", v)
+                            } else {
+                                format!("{:.1e}", v)
+                            }
+                        })
+                        .y_labels(if filename_suffix == "phase" { 7 } else { 5 })
+                        .x_max_light_lines(0)
+                        .y_max_light_lines(0)
+                        .label_style(("sans-serif ", 25).into_font())
+                        .draw()
+                        .map_err(|error| error.to_string())?;
+
+                    chart
+                        .draw_series(PointSeries::of_element(
+                            length.iter().zip(data.iter()).map(|(x, y)| (*x, *y)),
+                            5,
+                            GREEN,
+                            &|c, s, st| EmptyElement::at(c) + Circle::new((0, 0), s, st.filled()),
+                        ))
+                        .map_err(|error| error.to_string())?;
+
+                    root.present().map_err(|error| error.to_string())?;
+                    drop(chart);
+                    drop(root);
+                    compress_png_with_mode(&file_path, CompressQuality::Low);
+                    Ok(())
+                },
             )
-            .margin(10)
-            .x_label_area_size(60)
-            .y_label_area_size(100)
-            .build_cartesian_2d(x_range, y_min..y_max)?;
-
-        chart
-            .configure_mesh()
-            .x_desc(format!(
-                "The elapsed time since {} UT",
-                obs_start_time.format("%Y/%j %H:%M:%S")
-            ))
-            .y_desc(y_label)
-            .x_label_formatter(&|v| format!("{:.0}", v))
-            .y_label_formatter(&|v| {
-                if matches!(filename_suffix, "phase" | "snr") {
-                    format!("{:.0}", v)
-                } else if matches!(filename_suffix, "resdelay" | "freq") {
-                    format!("{:.3}", v)
-                } else if filename_suffix == "resrate" {
-                    format!("{:.2e}", v)
-                } else {
-                    format!("{:.1e}", v)
-                }
-            })
-            .y_labels(if filename_suffix == "phase" { 7 } else { 5 })
-            .x_max_light_lines(0)
-            .y_max_light_lines(0)
-            .label_style(("sans-serif ", 25).into_font())
-            .draw()?;
-
-        chart.draw_series(PointSeries::of_element(
-            length.iter().zip(data.iter()).map(|(x, y)| (*x, *y)),
-            5,
-            GREEN,
-            &|c, s, st| {
-                EmptyElement::at(c)    // We want to construct a composed element on-the-fly
-                    + Circle::new((0,0),s,st.filled()) // At point center, draw a circle
-            },
-        ))?;
-
-        root.present()?;
-        compress_png_with_mode(&file_path, CompressQuality::Low);
-    }
+        })
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     Ok(())
 }
@@ -1939,29 +2277,38 @@ pub fn plot_sky_map<P: AsRef<Path>>(
         .label_style(("sans-serif", 30))
         .draw()?;
 
-    // Draw the heatmap
-    chart.draw_series(map_data.indexed_iter().map(|((y, x), &val)| {
-        let l_mas = ((x as f64) - (width as f64 / 2.0)) * cell_size_rad * rad_to_mas;
-        let m_mas = ((height as f64 / 2.0) - y as f64) * cell_size_rad * rad_to_mas;
-        let cell_l_mas = cell_size_rad * rad_to_mas;
-        let cell_m_mas = cell_size_rad * rad_to_mas;
-
-        let mut norm_val = if max_val > min_val {
-            (val - min_val) / (max_val - min_val)
-        } else {
-            0.0
-        };
-        if norm_val.is_nan() {
-            norm_val = 0.0;
-        }
-        norm_val = norm_val.clamp(0.0, 1.0);
-        let color = ViridisRGB.get_color(norm_val as f64);
-
-        Rectangle::new(
-            [(l_mas, m_mas), (l_mas + cell_l_mas, m_mas + cell_m_mas)],
-            color.filled(),
-        )
-    }))?;
+    // Rasterize the map at the plot area's pixel size instead of drawing every cell.
+    let map_values: Vec<f32> = map_data.iter().copied().collect();
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = rasterize_rgb_grid(
+        bitmap_width,
+        bitmap_height,
+        width,
+        height,
+        &map_values,
+        true,
+        false,
+        &|value| {
+            let mut norm_val = if max_val > min_val {
+                (value as f32 - min_val) / (max_val - min_val)
+            } else {
+                0.0
+            };
+            if norm_val.is_nan() {
+                norm_val = 0.0;
+            }
+            ViridisRGB.get_color(norm_val.clamp(0.0, 1.0) as f64).rgb()
+        },
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (l_range.start, m_range.end),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create sky-map bitmap")?;
+    chart.draw_series(std::iter::once(bitmap))?;
 
     // Add a white 'X' mark at (0,0)
     chart.draw_series(PointSeries::of_element(
@@ -2021,9 +2368,9 @@ pub fn plot_sky_map<P: AsRef<Path>>(
     Ok(())
 }
 
-pub fn plot_dynamic_spectrum_freq(
+pub fn plot_dynamic_spectrum_freq<S: Data<Elem = Complex<f32>>>(
     output_path: &str,
-    spectrum_array: &Array2<Complex<f32>>,
+    spectrum_array: &ArrayBase<S, Ix2>,
     header: &crate::header::CorHeader,
     obs_time: &DateTime<Utc>,
     _length: i32,
@@ -2042,9 +2389,9 @@ pub fn plot_dynamic_spectrum_freq(
     let time_range = 0..time_samples;
 
     // --- Amplitude Heatmap ---
-    let amplitudes: Vec<f32> = spectrum_array.iter().map(|c| c.norm()).collect();
-    let max_amp = amplitudes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_amp = amplitudes.iter().cloned().fold(f32::INFINITY, f32::min);
+    let amplitudes: Vec<f32> = spectrum_array.iter().map(|value| value.norm()).collect();
+    let max_amp = amplitudes.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min_amp = amplitudes.iter().copied().fold(f32::INFINITY, f32::min);
 
     let mut amp_chart = ChartBuilder::on(&upper)
         .caption(
@@ -2067,15 +2414,33 @@ pub fn plot_dynamic_spectrum_freq(
         .label_style(("sans-serif", 25).into_font())
         .draw()?;
 
-    amp_chart.draw_series(spectrum_array.indexed_iter().map(|((t, f), c)| {
-        let norm_val = if max_amp > min_amp {
-            (c.norm() - min_amp) / (max_amp - min_amp)
-        } else {
-            0.0
-        };
-        let color = ViridisRGB.get_color(norm_val as f64);
-        Rectangle::new([(f, t), (f + 1, t + 1)], color.filled())
-    }))?;
+    let (plot_x, plot_y) = amp_chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let amplitude_buffer = rasterize_rgb_grid(
+        bitmap_width,
+        bitmap_height,
+        freq_channels,
+        time_samples,
+        &amplitudes,
+        false,
+        true,
+        &|value| {
+            let norm_val = if max_amp > min_amp {
+                (value as f32 - min_amp) / (max_amp - min_amp)
+            } else {
+                0.0
+            };
+            ViridisRGB.get_color(norm_val.clamp(0.0, 1.0)).rgb()
+        },
+    );
+    let amplitude_bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (0, time_samples),
+        (bitmap_width, bitmap_height),
+        amplitude_buffer,
+    )
+    .ok_or("failed to create dynamic-spectrum amplitude bitmap")?;
+    amp_chart.draw_series(std::iter::once(amplitude_bitmap))?;
 
     // --- Phase Heatmap ---
     let mut phase_chart = ChartBuilder::on(&lower)
@@ -2099,11 +2464,30 @@ pub fn plot_dynamic_spectrum_freq(
         .label_style(("sans-serif", 25).into_font())
         .draw()?;
 
-    phase_chart.draw_series(spectrum_array.indexed_iter().map(|((t, f), c)| {
-        let norm_val = (safe_arg(c).to_degrees() + 180.0) / 360.0;
-        let color = ViridisRGB.get_color(norm_val as f64);
-        Rectangle::new([(f, t), (f + 1, t + 1)], color.filled())
-    }))?;
+    let phases: Vec<f32> = spectrum_array
+        .iter()
+        .map(|value| (safe_arg(value).to_degrees() + 180.0) / 360.0)
+        .collect();
+    let (plot_x, plot_y) = phase_chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let phase_buffer = rasterize_rgb_grid(
+        bitmap_width,
+        bitmap_height,
+        freq_channels,
+        time_samples,
+        &phases,
+        false,
+        true,
+        &|value| ViridisRGB.get_color(value.clamp(0.0, 1.0)).rgb(),
+    );
+    let phase_bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (0, time_samples),
+        (bitmap_width, bitmap_height),
+        phase_buffer,
+    )
+    .ok_or("failed to create dynamic-spectrum phase bitmap")?;
+    phase_chart.draw_series(std::iter::once(phase_bitmap))?;
 
     root.present()?;
     compress_png(output_path);
@@ -2154,16 +2538,34 @@ pub fn plot_dynamic_spectrum_lag(
         .label_style(("sans-serif", 25).into_font())
         .draw()?;
 
-    chart.draw_series(lag_data.indexed_iter().map(|((t, l), &val)| {
-        let x = lag_range_min + l as i32;
-        let norm_val = if max_val > min_val {
-            (val - min_val) / (max_val - min_val)
-        } else {
-            0.0
-        };
-        let color = ViridisRGB.get_color(norm_val as f64);
-        Rectangle::new([(x, t), (x + 1, t + 1)], color.filled())
-    }))?;
+    let values: Vec<f32> = lag_data.iter().copied().collect();
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = rasterize_rgb_grid(
+        bitmap_width,
+        bitmap_height,
+        lag_samples,
+        time_samples,
+        &values,
+        false,
+        true,
+        &|value| {
+            let norm_val = if max_val > min_val {
+                (value as f32 - min_val) / (max_val - min_val)
+            } else {
+                0.0
+            };
+            ViridisRGB.get_color(norm_val.clamp(0.0, 1.0) as f64).rgb()
+        },
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (lag_range_min, time_samples),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create dynamic-spectrum lag bitmap")?;
+    chart.draw_series(std::iter::once(bitmap))?;
 
     root.present()?;
     compress_png(output_path);
@@ -2241,7 +2643,7 @@ fn draw_heatmap_with_colorbar(
     min_val: f32,
     max_val: f32,
     num_color_bar_labels: usize,
-    color_value_normalizer: impl Fn(f32) -> f64,
+    color_value_normalizer: impl Fn(f32) -> f64 + Sync,
     color_bar_label_formatter: impl Fn(f32) -> String,
     spike_channels: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2280,16 +2682,30 @@ fn draw_heatmap_with_colorbar(
         .y_label_formatter(&y_label_formatter)
         .draw()?;
 
-    chart.draw_series(
-        (0..cols)
-            .flat_map(|x| (0..rows).map(move |y| (x, y)))
-            .map(|(x, y)| {
-                let val = data[y][x];
-                let color_value = color_value_normalizer(val);
-                let color = ViridisRGB.get_color(color_value);
-                Rectangle::new([(x, y), (x + 1, y + 1)], color.filled())
-            }),
-    )?;
+    let values: Vec<f32> = data.iter().flat_map(|row| row.iter().copied()).collect();
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = rasterize_rgb_grid(
+        bitmap_width,
+        bitmap_height,
+        cols,
+        rows,
+        &values,
+        false,
+        true,
+        &|value| {
+            let color_value = color_value_normalizer(value as f32).clamp(0.0, 1.0);
+            ViridisRGB.get_color(color_value).rgb()
+        },
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (0, rows),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create spectrum heatmap bitmap")?;
+    chart.draw_series(std::iter::once(bitmap))?;
 
     let dash_len = (rows / 60).max(3);
     let gap_len = dash_len;
@@ -2570,6 +2986,10 @@ pub fn plot_complex_scatter<P: AsRef<Path>>(
 
     let real_margin = ((max_real - min_real) * 0.05).max(1e-6);
     let imag_margin = ((max_imag - min_imag) * 0.05).max(1e-6);
+    let x_min = (min_real - real_margin) as f64;
+    let x_max = (max_real + real_margin) as f64;
+    let y_min = (min_imag - imag_margin) as f64;
+    let y_max = (max_imag + imag_margin) as f64;
 
     let root = BitMapBackend::new(output_path.as_ref(), (1000, 1000)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -2578,11 +2998,28 @@ pub fn plot_complex_scatter<P: AsRef<Path>>(
         .margin(25)
         .x_label_area_size(60)
         .y_label_area_size(60)
-        .build_cartesian_2d(
-            (min_real - real_margin) as f64..(max_real + real_margin) as f64,
-            (min_imag - imag_margin) as f64..(max_imag + imag_margin) as f64,
-        )?;
+        .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
 
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let scatter_buffer = rasterize_scatter_rgb_buffer(
+        bitmap_width,
+        bitmap_height,
+        real_values,
+        imag_values,
+        (x_min, x_max),
+        (y_min, y_max),
+    );
+    let scatter_bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (x_min, y_max),
+        (bitmap_width, bitmap_height),
+        scatter_buffer,
+    )
+    .ok_or("failed to create complex scatter bitmap")?;
+    chart.draw_series(std::iter::once(scatter_bitmap))?;
+    // Repaint axes and grid over the rasterized points, matching the chart's
+    // original layering while keeping point rendering to a single bitmap.
     chart
         .configure_mesh()
         .x_desc("Real")
@@ -2591,28 +3028,6 @@ pub fn plot_complex_scatter<P: AsRef<Path>>(
         .x_label_formatter(&|v| format!("{:.2e}", v))
         .y_label_formatter(&|v| format!("{:.2e}", v))
         .draw()?;
-
-    let total_points = real_values.len();
-    let max_points = 200_000;
-    let stride = (total_points / max_points).max(1);
-
-    chart.draw_series(
-        real_values
-            .iter()
-            .zip(imag_values.iter())
-            .enumerate()
-            .filter_map(|(idx, (&re, &im))| {
-                if idx % stride == 0 {
-                    Some(Circle::new(
-                        (re as f64, im as f64),
-                        1,
-                        BLUE.mix(0.4).filled(),
-                    ))
-                } else {
-                    None
-                }
-            }),
-    )?;
 
     chart.draw_series(std::iter::once(Circle::new((0.0, 0.0), 6, RED.filled())))?;
 
@@ -2641,6 +3056,10 @@ pub fn plot_amp_phase_scatter<P: AsRef<Path>>(
         .fold(f32::NEG_INFINITY, |acc, &v| acc.max(v));
 
     let amp_margin = ((max_amp - min_amp) * 0.05).max(1e-6);
+    let x_min = (min_amp - amp_margin) as f64;
+    let x_max = (max_amp + amp_margin) as f64;
+    let y_min = -180.0f64;
+    let y_max = 180.0f64;
 
     let root = BitMapBackend::new(output_path.as_ref(), (1000, 600)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -2649,11 +3068,26 @@ pub fn plot_amp_phase_scatter<P: AsRef<Path>>(
         .margin(25)
         .x_label_area_size(60)
         .y_label_area_size(60)
-        .build_cartesian_2d(
-            (min_amp - amp_margin) as f64..(max_amp + amp_margin) as f64,
-            -180.0f64..180.0f64,
-        )?;
+        .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
 
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let scatter_buffer = rasterize_scatter_rgb_buffer(
+        bitmap_width,
+        bitmap_height,
+        amp_values,
+        &phase_deg,
+        (x_min, x_max),
+        (y_min, y_max),
+    );
+    let scatter_bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (x_min, y_max),
+        (bitmap_width, bitmap_height),
+        scatter_buffer,
+    )
+    .ok_or("failed to create amp-phase scatter bitmap")?;
+    chart.draw_series(std::iter::once(scatter_bitmap))?;
     chart
         .configure_mesh()
         .disable_mesh()
@@ -2663,24 +3097,6 @@ pub fn plot_amp_phase_scatter<P: AsRef<Path>>(
         .x_label_formatter(&|v| format!("{:.2e}", v))
         .y_label_formatter(&|v| format!("{:.0}", v))
         .draw()?;
-
-    let total_points = amp_values.len();
-    let max_points = 200_000;
-    let stride = (total_points / max_points).max(1);
-
-    chart.draw_series(
-        amp_values
-            .iter()
-            .zip(phase_deg.iter())
-            .enumerate()
-            .filter_map(|(idx, (&amp, &phase))| {
-                if idx % stride == 0 {
-                    Some(Circle::new((amp as f64, phase), 1, BLUE.mix(0.4).filled()))
-                } else {
-                    None
-                }
-            }),
-    )?;
 
     root.present()?;
     compress_png(output_path.as_ref());
@@ -2964,7 +3380,7 @@ pub fn plot_uv_coverage<P: AsRef<Path>>(
 
     let u_max = uv_data.iter().map(|(u, _)| u.abs()).fold(0.0, f32::max);
     let v_max = uv_data.iter().map(|(_, v)| v.abs()).fold(0.0, f32::max);
-    let max_abs = u_max.max(v_max) * 1.1;
+    let max_abs = (u_max.max(v_max) * 1.1).max(1.0e-6);
 
     let mut chart = ChartBuilder::on(&root)
         .caption("UV Coverage", ("sans-serif", 30))
@@ -2973,6 +3389,45 @@ pub fn plot_uv_coverage<P: AsRef<Path>>(
         .y_label_area_size(80)
         .build_cartesian_2d(-max_abs..max_abs, -max_abs..max_abs)?;
 
+    let u_values: Vec<f32> = uv_data.iter().map(|&(u, _)| u).collect();
+    let v_values: Vec<f64> = uv_data.iter().map(|&(_, v)| v as f64).collect();
+    let mirrored_u: Vec<f32> = u_values.iter().map(|&value| -value).collect();
+    let mirrored_v: Vec<f64> = v_values.iter().map(|&value| -value).collect();
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let scatter_buffer = vec![255u8; bitmap_width as usize * bitmap_height as usize * 3];
+    let scatter_buffer = rasterize_scatter_layer_rgb_buffer(
+        scatter_buffer,
+        bitmap_width,
+        bitmap_height,
+        &u_values,
+        &v_values,
+        (-(max_abs as f64), max_abs as f64),
+        (-(max_abs as f64), max_abs as f64),
+        (0, 0, 255),
+        1.0,
+        2,
+    );
+    let scatter_buffer = rasterize_scatter_layer_rgb_buffer(
+        scatter_buffer,
+        bitmap_width,
+        bitmap_height,
+        &mirrored_u,
+        &mirrored_v,
+        (-(max_abs as f64), max_abs as f64),
+        (-(max_abs as f64), max_abs as f64),
+        (255, 0, 0),
+        1.0,
+        2,
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (-max_abs, max_abs),
+        (bitmap_width, bitmap_height),
+        scatter_buffer,
+    )
+    .ok_or("failed to create UV-coverage bitmap")?;
+    chart.draw_series(std::iter::once(bitmap))?;
     chart
         .configure_mesh()
         .x_desc("U (meters)")
@@ -2981,17 +3436,6 @@ pub fn plot_uv_coverage<P: AsRef<Path>>(
         .y_label_formatter(&|y| format!("{:.0}", y))
         .label_style(("sans-serif", 25))
         .draw()?;
-
-    chart.draw_series(
-        uv_data
-            .iter()
-            .map(|(u, v)| Circle::new((*u, *v), 2, BLUE.filled())),
-    )?;
-    chart.draw_series(
-        uv_data
-            .iter()
-            .map(|(u, v)| Circle::new((-*u, -*v), 2, RED.filled())),
-    )?;
 
     root.present()?;
     Ok(())
@@ -3463,7 +3907,7 @@ pub fn frequency_plane_msb(
     _x_band_uncalibrated_phase_profile: &[(f64, f64)],
     c_band_rate_profile: &[(f64, f64)], // New parameter for C-band rate
     x_band_rate_profile: &[(f64, f64)], // New parameter for X-band rate
-    heatmap_func: impl Fn(f64, f64) -> f64,
+    heatmap_func: impl Fn(f64, f64) -> f64 + Sync,
     stat_keys: &[&str],
     stat_vals: &[&str],
     output_path: &str,
@@ -3660,37 +4104,27 @@ pub fn frequency_plane_msb(
         .draw()?;
 
     let resolution = 400;
-    let mut heatmap_values = Vec::new();
-    let mut heatmap_data_max_val = f64::NEG_INFINITY;
-    for i in 0..resolution {
-        for j in 0..resolution {
-            let y = rate_min_x + (rate_max_x - rate_min_x) * i as f64 / (resolution - 1) as f64;
-            let x = 0.0 + bw * j as f64 / (resolution - 1) as f64;
-            let val = heatmap_func(x, y);
-            heatmap_values.push(val);
-            if val > heatmap_data_max_val {
-                heatmap_data_max_val = val;
-            }
-        }
-    }
-
-    for (idx, val) in heatmap_values.iter().enumerate() {
-        let i = idx / resolution;
-        let j = idx % resolution;
-        let y = rate_min_x + (rate_max_x - rate_min_x) * i as f64 / (resolution - 1) as f64;
-        let x = 0.0 + bw * j as f64 / (resolution - 1) as f64;
-        let x_step = bw / (resolution - 1) as f64;
-        let y_step = (rate_max_x - rate_min_x) / (resolution - 1) as f64;
-        let normalized_val = if heatmap_data_max_val > 0.0 {
-            *val / heatmap_data_max_val
-        } else {
-            0.0
-        };
-        heatmap_chart.draw_series(std::iter::once(Rectangle::new(
-            [(x, y), (x + x_step, y + y_step)],
-            HSLColor((1.0 - normalized_val) * 0.7, 1.0, 0.5).filled(),
-        )))?;
-    }
+    let (plot_x, plot_y) = heatmap_chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = build_sampled_heatmap_rgb_buffer(
+        bitmap_width,
+        bitmap_height,
+        resolution,
+        resolution,
+        0.0,
+        bw,
+        rate_min_x,
+        rate_max_x,
+        &heatmap_func,
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (0.0, rate_max_x),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create multi-sideband frequency heatmap bitmap")?;
+    heatmap_chart.draw_series(std::iter::once(bitmap))?;
 
     // 4. Colorbar
     let mut colorbar = ChartBuilder::on(&colorbar_area)

@@ -822,6 +822,7 @@ mod deep {
             };
             let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point];
             let ifft = cached_fft_plan(fft_point, true);
+            let mut ifft_scratch = vec![C32::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
 
             let mut scan =
                 |mean: Option<(f64, f64)>| {
@@ -842,7 +843,7 @@ mod deep {
                             *dst = *src;
                         }
                         ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
-                        ifft.process(&mut ifft_exe);
+                        ifft.process_with_scratch(&mut ifft_exe, &mut ifft_scratch);
 
                         for delay_index in 0..fft_point {
                             let source_index = if delay_index < half {
@@ -857,24 +858,26 @@ mod deep {
                             }) {
                                 continue;
                             }
-                            sum_re += value.re as f64;
-                            sum_im += value.im as f64;
                             count += 1;
 
                             if let Some((mean_re, mean_im)) = mean {
                                 noise_sum += ((value.re as f64 - mean_re).powi(2)
                                     + (value.im as f64 - mean_im).powi(2))
                                 .sqrt();
-                            } else if in_window(delay_value, &search_args.drange)
-                                && in_window(rate_value, &search_args.rrange)
-                                && !in_delay_rate_mask(delay_value, rate_value, delay_mask)
-                            {
-                                let power = value.norm_sqr();
-                                if power > max_power {
-                                    max_power = power;
-                                    max_delay = delay_value;
-                                    max_rate = rate_value;
-                                    max_value = value;
+                            } else {
+                                sum_re += value.re as f64;
+                                sum_im += value.im as f64;
+                                if in_window(delay_value, &search_args.drange)
+                                    && in_window(rate_value, &search_args.rrange)
+                                    && !in_delay_rate_mask(delay_value, rate_value, delay_mask)
+                                {
+                                    let power = value.norm_sqr();
+                                    if power > max_power {
+                                        max_power = power;
+                                        max_delay = delay_value;
+                                        max_rate = rate_value;
+                                        max_value = value;
+                                    }
                                 }
                             }
                         }

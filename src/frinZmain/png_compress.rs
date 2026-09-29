@@ -59,6 +59,18 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
         return;
     }
 
+    let original_size = match fs::metadata(&path_buf) {
+        Ok(metadata) => metadata.len() as usize,
+        Err(_) => {
+            warn_once("Failed to inspect PNG for compression.");
+            return;
+        }
+    };
+
+    if try_pngquant(&path_buf, original_size, mode) {
+        return;
+    }
+
     let original = match fs::read(&path_buf) {
         Ok(data) => data,
         Err(_) => {
@@ -67,10 +79,6 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
         }
     };
 
-    if try_pngquant(&path_buf, original.len(), mode) {
-        return;
-    }
-
     let decoded = match image::load_from_memory(&original) {
         Ok(img) => img.to_rgba8(),
         Err(_) => {
@@ -78,6 +86,7 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
             return;
         }
     };
+    drop(original);
 
     let (width, height) = decoded.dimensions();
     let rgba_bytes = decoded.as_raw();
@@ -121,7 +130,7 @@ pub fn compress_png_with_mode<P: AsRef<Path>>(path: P, mode: CompressQuality) {
     }
 
     if let Some(best) = best_png {
-        if best.len() < original.len() && fs::write(&path_buf, best).is_err() {
+        if best.len() < original_size && fs::write(&path_buf, best).is_err() {
             warn_once("Failed to write recompressed PNG.");
         }
     }

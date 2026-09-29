@@ -9,12 +9,14 @@ use crate::fft::apply_phase_correction_in_place_at_frequency;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
+use crate::plot::rasterize_rgb_grid;
 use crate::processing::run_analysis_pipeline;
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
 use crate::utils;
 use chrono::{DateTime, Utc};
+use plotters::backend::RGBPixel;
 use plotters::prelude::*;
 use rustfft::{
     num_complex::{Complex, Complex32},
@@ -569,11 +571,12 @@ fn fft_2d_inverse(grid: &[Complex<f64>], size: usize) -> Result<Vec<Complex<f64>
 
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_inverse(size);
+    let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
 
     let mut buffer = grid.to_vec();
 
     for row in buffer.chunks_mut(size) {
-        fft.process(row);
+        fft.process_with_scratch(row, &mut scratch);
     }
 
     let mut transposed = vec![Complex::new(0.0, 0.0); size * size];
@@ -584,7 +587,7 @@ fn fft_2d_inverse(grid: &[Complex<f64>], size: usize) -> Result<Vec<Complex<f64>
     }
 
     for row in transposed.chunks_mut(size) {
-        fft.process(row);
+        fft.process_with_scratch(row, &mut scratch);
     }
 
     let mut final_grid = vec![Complex::new(0.0, 0.0); size * size];
@@ -1630,18 +1633,22 @@ fn render_scalar_field_plot(
 
     let half = (size as f64) / 2.0;
     let cell = cell_size_unit;
-    chart.draw_series((0..size).flat_map(|row| {
-        let y0 = ((size - row) as f64 - half) * cell;
-        let y1 = ((size - row - 1) as f64 - half) * cell;
-        (0..size).map(move |col| {
-            let idx = row * size + col;
-            let value = if data[idx].is_finite() {
-                data[idx]
-            } else {
-                0.0
-            };
-            let x0 = (col as f64 - half) * cell;
-            let x1 = ((col + 1) as f64 - half) * cell;
+    let values: Vec<f64> = data
+        .iter()
+        .map(|&value| if value.is_finite() { value } else { 0.0 })
+        .collect();
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let heatmap_buffer = rasterize_rgb_grid(
+        bitmap_width,
+        bitmap_height,
+        size,
+        size,
+        &values,
+        false,
+        false,
+        &|value| {
             let t = if symmetric {
                 if range_max.abs() < 1.0e-12 {
                     0.5
@@ -1653,10 +1660,16 @@ fn render_scalar_field_plot(
             } else {
                 (value - range_min) / (range_max - range_min)
             };
-            let color = jet_colormap(t.clamp(0.0, 1.0));
-            Rectangle::new([(x0, y0), (x1, y1)], color.filled())
-        })
-    }))?;
+            jet_colormap(t.clamp(0.0, 1.0)).rgb()
+        },
+    );
+    let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (-half * cell, half * cell),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create scalar-field bitmap")?;
+    chart.draw_series(std::iter::once(bitmap))?;
 
     let cb_area = colorbar_area.margin(10, 10, 10, 60);
     let mut cb_chart = ChartBuilder::on(&cb_area)

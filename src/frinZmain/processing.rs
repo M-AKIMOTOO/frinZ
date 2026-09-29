@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::analysis::AnalysisResults;
 use chrono::{DateTime, Duration, Utc};
-use ndarray::{Array, Array2};
+use ndarray::{Array, Array2, ArrayView2};
 use num_complex::Complex;
 type AnalysisPipelineResult = (
     AnalysisResults,
@@ -19,10 +19,11 @@ type AnalysisPipelineResult = (
 use crate::analysis::analyze_results;
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, plot_bandpass_spectrum, read_bandpass_file};
-use crate::contamination::{write_contamination_handoff, ContaminationPhaseCorrectionInput};
-use crate::contamination_subtract::apply_contamination_subtract;
+use crate::contamination::{
+    apply_contamination_subtract, write_contamination_handoff, ContaminationPhaseCorrectionInput,
+};
 use crate::fft::{
-    apply_phase_correction_in_place_at_frequency, perform_ifft_on_vec, process_fft,
+    apply_phase_correction_in_place_at_frequency, cached_fft_plan, process_fft,
     process_fft_with_phase_correction_at_frequency, process_ifft,
 };
 use crate::header::{available_cor_sectors, parse_header, CorHeader};
@@ -1226,9 +1227,8 @@ pub fn process_cor_file(
             let requested_rows = physical_length.max(0) as usize;
             let usable_rows = requested_rows.min(available_rows);
             let usable_len = usable_rows * fft_point_half;
-            let truncated_vec = complex_vec[..usable_len].to_vec();
             let spectrum_array =
-                Array::from_shape_vec((usable_rows, fft_point_half), truncated_vec).unwrap();
+                ArrayView2::from_shape((usable_rows, fft_point_half), &complex_vec[..usable_len])?;
             let frequency_stem = insert_product_before_processing_suffixes(
                 &base_filename,
                 "dynamic_spectrum_frequency",
@@ -1272,10 +1272,23 @@ pub fn process_cor_file(
             };
             let mut lag_data = Array::zeros((usable_rows, effective_fft_point as usize));
             let fft_point_usize = effective_fft_point as usize;
+            let ifft = cached_fft_plan(fft_point_usize, true);
+            let mut ifft_work = vec![C32::new(0.0, 0.0); fft_point_usize];
+            let mut ifft_scratch = vec![C32::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
             for (i, row) in spectrum_array.rows().into_iter().enumerate() {
-                let shifted_out = perform_ifft_on_vec(row.as_slice().unwrap(), fft_point_usize);
-                for (j, val) in shifted_out.iter().enumerate() {
-                    lag_data[[i, j]] = val.norm();
+                ifft_work.fill(C32::new(0.0, 0.0));
+                ifft_work[..row.len()].copy_from_slice(row.as_slice().unwrap());
+                ifft.process_with_scratch(&mut ifft_work, &mut ifft_scratch);
+
+                let half = fft_point_usize / 2;
+                let mut lag_row = lag_data.row_mut(i);
+                for (j, value) in lag_row.iter_mut().enumerate() {
+                    let source_index = if j < half {
+                        half - 1 - j
+                    } else {
+                        fft_point_usize - 1 - (j - half)
+                    };
+                    *value = ifft_work[source_index].norm() / fft_point_usize as f32;
                 }
             }
             let lag_stem = insert_product_before_processing_suffixes(

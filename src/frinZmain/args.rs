@@ -206,6 +206,10 @@ pub struct Args {
     #[arg(long)]
     pub plot: bool,
 
+    /// Save the selected delay-rate or frequency-rate plane as a FITS image.
+    #[arg(long)]
+    pub fits: bool,
+
     /// Frequency-domain mode.
     #[arg(long)]
     pub frequency: bool,
@@ -489,6 +493,7 @@ impl Default for Args {
             histogram_bins: 256,
             rfi_npz_mask: None,
             plot: false,
+            fits: false,
             frequency: false,
             cor2bin: false,
             mkcor: false,

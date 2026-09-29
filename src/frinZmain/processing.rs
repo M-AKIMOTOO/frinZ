@@ -26,6 +26,7 @@ use crate::fft::{
     apply_phase_correction_in_place_at_frequency, cached_fft_plan, process_fft,
     process_fft_with_phase_correction_at_frequency, process_ifft,
 };
+use crate::fits_output::{write_fits_image, FitsAxis, FitsMetadata};
 use crate::header::{available_cor_sectors, parse_header, CorHeader};
 use crate::input_support::{open_input_data, open_input_data_copy_on_write};
 use crate::norm_acf::NormAcfContext;
@@ -343,7 +344,7 @@ pub fn process_cor_file(
 
     // --- Create Output Directories ---
     let mut plot_path: Option<PathBuf> = None;
-    if args.plot {
+    if args.plot || args.fits {
         let path = if args.in_beam {
             frinz_dir.clone()
         } else {
@@ -1504,6 +1505,93 @@ pub fn process_cor_file(
                 add_plot_noise.push(analysis_results.freq_noise * 100.0);
                 add_plot_res_delay.push(analysis_results.residual_delay);
                 add_plot_res_rate.push(analysis_results.residual_rate);
+            }
+        }
+
+        if args.fits && args.cumulate == 0 {
+            if let Some(path) = &plot_path {
+                let length_label = if args.length == 0 {
+                    "0".to_string()
+                } else {
+                    args.length.to_string()
+                };
+                let plot_dir = if args.in_beam {
+                    path.clone()
+                } else if !args.frequency {
+                    path.join(format!("time_domain/len{}s", length_label))
+                } else {
+                    path.join(format!("freq_domain/len{}s", length_label))
+                };
+                fs::create_dir_all(&plot_dir)?;
+                let product = if args.frequency {
+                    "freq_rate_search"
+                } else {
+                    "delay_rate_search"
+                };
+                let output_stem =
+                    insert_product_before_processing_suffixes(&base_filename, product);
+                let output_filename = plot_dir.join(format!("{output_stem}.fits"));
+                let date_obs = current_obs_time.to_rfc3339();
+                let metadata = FitsMetadata {
+                    source_name: &analysis_results.source_name,
+                    date_obs: &date_obs,
+                    observing_frequency_hz: processing_header.observing_frequency,
+                };
+
+                if args.frequency {
+                    let frequency_axis = analysis_results
+                        .freq_range
+                        .as_slice()
+                        .ok_or("frequency axis is not contiguous")?;
+                    let rate_axis = analysis_results.rate_range.as_slice();
+                    let freq_rate = freq_rate_array.as_ref().ok_or(
+                        "--frequency が指定されているのに freq_rate_array が保持されていません",
+                    )?;
+                    let frequency_count = freq_rate.shape()[0];
+                    let rate_count = freq_rate.shape()[1];
+                    let pixels = (0..rate_count).flat_map(|rate_idx| {
+                        (0..frequency_count)
+                            .map(move |frequency_idx| freq_rate[[frequency_idx, rate_idx]].norm())
+                    });
+                    write_fits_image(
+                        &output_filename,
+                        FitsAxis {
+                            name: "FREQ",
+                            unit: "MHz",
+                            values: frequency_axis,
+                        },
+                        FitsAxis {
+                            name: "RATE",
+                            unit: "Hz",
+                            values: rate_axis,
+                        },
+                        metadata,
+                        pixels,
+                    )?;
+                } else {
+                    let delay_axis = analysis_results
+                        .delay_range
+                        .as_slice()
+                        .ok_or("delay axis is not contiguous")?;
+                    let rate_axis = analysis_results.rate_range.as_slice();
+                    let pixels = delay_rate_2d_data_comp.iter().map(|value| value.norm());
+                    write_fits_image(
+                        &output_filename,
+                        FitsAxis {
+                            name: "DELAY",
+                            unit: "sample",
+                            values: delay_axis,
+                        },
+                        FitsAxis {
+                            name: "RATE",
+                            unit: "Hz",
+                            values: rate_axis,
+                        },
+                        metadata,
+                        pixels,
+                    )?;
+                }
+                println!("FITS plane written to {:?}", output_filename);
             }
         }
 

@@ -7,6 +7,7 @@ pub mod bandpass;
 pub mod bispectrum;
 pub mod contamination;
 pub mod fft;
+pub mod fits_output;
 pub mod fitting;
 pub mod folding;
 pub mod frmap;

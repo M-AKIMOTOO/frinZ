@@ -13,6 +13,39 @@ pub(crate) const RFI_WINDOW_RADIUS: usize = 4;
 pub(crate) const RFI_SIGMA_CUT: f64 = 6.0;
 pub(crate) const RFI_RATIO_CUT: f64 = 2.5;
 
+/// Linear interpolation of detected amplitudes. Missing samples remain missing;
+/// exact endpoints (including a one-sample series) are valid observations.
+pub(crate) fn interpolate_amplitude(series: &[(f64, f64)], target: f64) -> Option<f64> {
+    if !target.is_finite() || series.is_empty() {
+        return None;
+    }
+    if target < series[0].0 || target > series.last()?.0 {
+        return None;
+    }
+    let right = series.partition_point(|&(time, _)| time < target);
+    if right < series.len() && series[right].0 == target {
+        return series[right].1.is_finite().then_some(series[right].1);
+    }
+    if right == 0 || right == series.len() {
+        return None;
+    }
+    let (t0, v0) = series[right - 1];
+    let (t1, v1) = series[right];
+    if !v0.is_finite() || !v1.is_finite() || t1 <= t0 {
+        return None;
+    }
+    let fraction = (target - t0) / (t1 - t0);
+    Some(v0 * (1.0 - fraction) + v1 * fraction)
+}
+
+pub(crate) fn dispersion_delays(freqs_mhz: &[f64], reference_mhz: f64, dm: f64) -> Vec<f64> {
+    const K_SECONDS_MHZ2: f64 = 4.148_808e3;
+    freqs_mhz
+        .iter()
+        .map(|&freq| K_SECONDS_MHZ2 * dm * (reference_mhz.powi(-2) - freq.powi(-2)))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RfiCutReport {
     pub(crate) total_channels: usize,
@@ -264,4 +297,51 @@ fn median_of_sorted(sorted: &[f64]) -> f64 {
     } else {
         sorted[n / 2]
     }
+}
+
+/// Break plotted curves at missing samples instead of connecting across gaps.
+pub(crate) fn finite_segments(data: &[(f64, f64)]) -> Vec<Vec<(f64, f64)>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for &point in data {
+        if point.0.is_finite() && point.1.is_finite() {
+            current.push(point);
+        } else if !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn interpolation_retains_exact_endpoints_and_missing_samples() {
+        let s = [(0.0, 1.0), (1.0, 2.0)];
+        assert_eq!(interpolate_amplitude(&s, 0.0), Some(1.0));
+        assert_eq!(interpolate_amplitude(&s, 1.0), Some(2.0));
+        assert_eq!(interpolate_amplitude(&s, 0.5), Some(1.5));
+        assert_eq!(interpolate_amplitude(&s, -0.1), None);
+        assert_eq!(interpolate_amplitude(&[(0.0, 1.0)], 0.0), Some(1.0));
+        assert_eq!(
+            interpolate_amplitude(&[(0.0, f64::NAN), (1.0, 1.0)], 0.5),
+            None
+        );
+    }
+}
+
+/// Stable assignment at exact phase-bin boundaries (e.g. 1/3 * 3).
+pub(crate) fn phase_bin(time: f64, origin: f64, period: f64, bins: usize) -> usize {
+    let scaled = ((time - origin) / period).rem_euclid(1.0) * bins as f64;
+    let nearest = scaled.round();
+    let stable = if (scaled - nearest).abs() < 1e-10 {
+        nearest
+    } else {
+        scaled
+    };
+    (stable.floor() as usize) % bins
 }

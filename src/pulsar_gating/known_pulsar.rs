@@ -1,8 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::shared::{
-    compress_plot_png, detect_rfi_cut, output_stem, prepare_output_directory, scaled_font_size,
-    scaled_legend_font_size, write_rfi_cut_report, RfiCutReport,
+    compress_plot_png, detect_rfi_cut, dispersion_delays, finite_segments, interpolate_amplitude,
+    output_stem, phase_bin, prepare_output_directory, scaled_font_size, scaled_legend_font_size,
+    write_rfi_cut_report, RfiCutReport,
 };
 use anyhow::{anyhow, Context, Result};
 use frinZ::header::{parse_header, CorHeader};
@@ -139,12 +140,14 @@ fn validate_known_args(cli: &KnownArgs) -> Result<()> {
         return Err(anyhow!("--period must be a finite positive value"));
     }
     if let Some(dm) = cli.dm {
-        if !dm.is_finite() {
-            return Err(anyhow!("--dm must be a finite value"));
+        if !dm.is_finite() || dm < 0.0 {
+            return Err(anyhow!("--dm must be a finite non-negative value"));
         }
     }
-    if cli.bins == 0 {
-        return Err(anyhow!("--bins must be greater than 0"));
+    if cli.bins < 3 {
+        return Err(anyhow!(
+            "--bins must be at least 3 (one on-pulse and two off-pulse bins)"
+        ));
     }
     if !(0.0..=1.0).contains(&cli.on_duty) {
         return Err(anyhow!("--on-duty must be within [0, 1]"));
@@ -169,15 +172,39 @@ pub(crate) fn load_sectors_with_limits(
     let mut sectors = Vec::with_capacity(max_length as usize);
     for idx in 0..max_length {
         let loop_index = skip + idx;
-        let (spectra, _timestamp, integ) =
+        let (mut spectra, _timestamp, _integ) =
             read_visibility_data(cursor, header, 1, 0, loop_index as i32, false, &[])
                 .with_context(|| format!("failed to read sector {}", loop_index))?;
 
         if spectra.is_empty() {
             continue;
         }
+        // Preserve the measured cadence: the general fringe reader rounds near
+        // powers of ten, which would accumulate pulsar phase errors over time.
+        let sector_size = 128 + header.fft_point as usize * 4;
+        let offset = 256 + loop_index as usize * sector_size + 112;
+        let bytes = cursor
+            .get_ref()
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow!("missing sector integration time"))?;
+        let integ = f32::from_le_bytes(bytes.try_into().expect("four bytes")) as f64;
+        if !integ.is_finite() || integ <= 0.0 {
+            return Err(anyhow!("invalid integration time in sector {}", loop_index));
+        }
+        // The generic reader sanitizes invalid visibilities to zero. Restore
+        // missingness here so corrupt samples cannot enter pulsar statistics.
+        let payload_offset = 256 + loop_index as usize * sector_size + 128;
+        for (chan, value) in spectra.iter_mut().enumerate() {
+            let start = payload_offset + chan * 8;
+            let bytes = &cursor.get_ref()[start..start + 8];
+            let re = f32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+            let im = f32::from_le_bytes(bytes[4..].try_into().expect("four bytes"));
+            if !re.is_finite() || !im.is_finite() {
+                *value = Complex::new(f32::NAN, f32::NAN);
+            }
+        }
         sectors.push(SectorData {
-            integ_time: integ as f64,
+            integ_time: integ,
             spectra,
         });
     }
@@ -233,118 +260,70 @@ fn build_dedispersed_series(
     freq_axis_mhz: &[f64],
     cli: &KnownArgs,
 ) -> Result<DedispersionOutputs> {
-    let samples_per_sector = freq_axis_mhz.len();
-    if samples_per_sector == 0 {
-        return Err(anyhow!("FFT length is zero, cannot proceed"));
+    let channels = freq_axis_mhz.len();
+    if channels == 0 || sectors.is_empty() {
+        return Err(anyhow!("empty spectra or time series"));
     }
-
-    let mut time_series_amp: Vec<Vec<f64>> =
-        vec![Vec::with_capacity(sectors.len()); samples_per_sector];
-    let mut time_series_complex: Vec<Vec<Complex<f32>>> =
-        vec![Vec::with_capacity(sectors.len()); samples_per_sector];
-    let mut spectra_heatmap = Vec::with_capacity(sectors.len());
+    if freq_axis_mhz.iter().any(|f| !f.is_finite() || *f <= 0.0) {
+        return Err(anyhow!(
+            "dedispersion requires finite positive channel frequencies"
+        ));
+    }
+    let mut elapsed = 0.0;
     let mut pp_elapsed = Vec::with_capacity(sectors.len());
     let mut pp_durations = Vec::with_capacity(sectors.len());
-    let mut cumulative_observation = 0.0;
-
-    for (sector_index, sector) in sectors.iter().enumerate() {
-        let integ = sector.integ_time.max(1e-6);
-        pp_elapsed.push(cumulative_observation);
-        pp_durations.push(integ);
-        cumulative_observation += integ;
-
-        let mut spectrum_row: Vec<Complex<f32>> = Vec::with_capacity(samples_per_sector);
-        for chan_idx in 0..samples_per_sector {
-            let value = sector
-                .spectra
-                .get(chan_idx)
-                .copied()
-                .unwrap_or_else(|| Complex::new(0.0, 0.0));
-            time_series_amp[chan_idx].push(value.norm() as f64);
-            time_series_complex[chan_idx].push(value);
-            spectrum_row.push(value);
-        }
-        spectra_heatmap.push(spectrum_row);
-        if sector_index == 0 && sector.integ_time == 0.0 {
+    let mut centers = Vec::with_capacity(sectors.len());
+    let mut spectra_heatmap = Vec::with_capacity(sectors.len());
+    let mut channel_series = vec![Vec::with_capacity(sectors.len()); channels];
+    let mut raw_sums = vec![0.0; channels];
+    let mut raw_weights = vec![0.0; channels];
+    for sector in sectors {
+        let duration = sector.integ_time;
+        if !duration.is_finite() || duration <= 0.0 || sector.spectra.len() != channels {
             return Err(anyhow!(
-                "effective integration time is zero; cannot determine time resolution"
+                "invalid sector duration or inconsistent channel count"
             ));
         }
-    }
-
-    let reference_freq_mhz = freq_axis_mhz
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("frequency axis is empty"))?;
-    let channel_delays = cli
-        .dm
-        .map(|dm| compute_dispersion_delays(freq_axis_mhz, reference_freq_mhz, dm));
-    let dm_delay_stats = channel_delays.as_ref().and_then(|v| {
-        let mut finite = v.iter().copied().filter(|delay| delay.is_finite());
-        let first = finite.next()?;
-        Some(
-            finite.fold((first, first), |(min_delay, max_delay), delay| {
-                (min_delay.min(delay), max_delay.max(delay))
-            }),
-        )
-    });
-
-    let mut raw_weights = vec![0.0f64; sectors.len()];
-    let mut raw_spectrum_sums = vec![0.0f64; samples_per_sector];
-    let mut raw_spectrum_weights = vec![0.0f64; samples_per_sector];
-
-    for sample_idx in 0..sectors.len() {
-        let integ = pp_durations[sample_idx].max(1e-6);
-        for chan_idx in 0..samples_per_sector {
-            let amp_value = time_series_amp[chan_idx][sample_idx];
-            raw_spectrum_sums[chan_idx] += amp_value * integ;
-            raw_spectrum_weights[chan_idx] += integ;
-        }
-        raw_weights[sample_idx] = integ;
-    }
-
-    let mut centers = Vec::with_capacity(sectors.len());
-    for idx in 0..sectors.len() {
-        let duration = pp_durations[idx].max(1e-6);
-        let center = pp_elapsed[idx] + duration / 2.0;
+        pp_elapsed.push(elapsed);
+        pp_durations.push(duration);
+        let center = elapsed + duration / 2.0;
         centers.push(center);
-    }
-
-    let mut dedispersed_heatmap =
-        vec![vec![Complex::new(0.0, 0.0); samples_per_sector]; sectors.len()];
-
-    if let Some(delays) = channel_delays.as_ref() {
-        let last_index = sectors.len().saturating_sub(1);
-        for (chan_idx, &delay) in delays.iter().enumerate() {
-            let src_series = &time_series_complex[chan_idx];
-            for dest_idx in 0..sectors.len() {
-                // Dedisperse by delaying early-arriving channels (positive delay)
-                // so all channels align to the reference channel timeline.
-                let target_time = centers[dest_idx] - delay;
-                let value = interpolate_complex(&centers, src_series, target_time, last_index);
-                dedispersed_heatmap[dest_idx][chan_idx] = value;
+        elapsed += duration;
+        spectra_heatmap.push(sector.spectra.clone());
+        for (chan, &value) in sector.spectra.iter().enumerate() {
+            let amp = value.norm() as f64;
+            channel_series[chan].push((center, amp));
+            if amp.is_finite() {
+                raw_sums[chan] += amp * duration;
+                raw_weights[chan] += duration;
             }
         }
-    } else {
-        dedispersed_heatmap.clone_from(&spectra_heatmap);
     }
-
+    let delays = compute_dispersion_delays(freq_axis_mhz, freq_axis_mhz[0], cli.dm.unwrap_or(0.0));
+    let mut dedispersed_heatmap = vec![vec![Complex::new(f32::NAN, 0.0); channels]; sectors.len()];
     let mut dedispersed_time_series = Vec::with_capacity(sectors.len());
-    let mut dedispersed_weights_vec = Vec::with_capacity(sectors.len());
-    let mut integrated_time_series = Vec::with_capacity(sectors.len());
-
-    for (row_idx, duration) in pp_durations.iter().enumerate() {
-        let center = centers[row_idx];
-        let mut amp_sum = 0.0f64;
-        for cell in dedispersed_heatmap[row_idx].iter().take(samples_per_sector) {
-            let amp = cell.norm() as f64;
-            amp_sum += amp;
+    let mut dedispersed_weights = Vec::with_capacity(sectors.len());
+    for (row, &center) in centers.iter().enumerate() {
+        let mut sum = 0.0;
+        let mut complete = true;
+        for chan in 0..channels {
+            if let Some(amp) = interpolate_amplitude(&channel_series[chan], center - delays[chan]) {
+                // These are detected amplitudes, not complex visibilities. Interpolating
+                // the latter before taking their norm would mix fringe phase into intensity.
+                dedispersed_heatmap[row][chan] = Complex::new(amp as f32, 0.0);
+                sum += amp;
+            } else {
+                complete = false;
+            }
         }
-        dedispersed_time_series.push((center, amp_sum * duration));
-        dedispersed_weights_vec.push(*duration);
-        integrated_time_series.push((center, amp_sum));
+        // Use the same full band at every valid time. Partial-band samples are missing,
+        // never zero-filled or renormalized using a changing channel count.
+        dedispersed_time_series.push((center, if complete { sum } else { f64::NAN }));
+        dedispersed_weights.push(if complete { pp_durations[row] } else { 0.0 });
     }
-
+    if !dedispersed_weights.iter().any(|w| *w > 0.0) {
+        return Err(anyhow!("no full-band samples remain after dedispersion"));
+    }
     let raw_phase_heatmap = build_phase_aligned_heatmap(
         &spectra_heatmap,
         &centers,
@@ -355,145 +334,53 @@ fn build_dedispersed_series(
     let dedispersed_phase_heatmap = build_phase_aligned_heatmap(
         &dedispersed_heatmap,
         &centers,
-        &pp_durations,
+        &dedispersed_weights,
         cli.bins,
         cli.period,
     );
-
-    let mut raw_spectrum = Vec::with_capacity(samples_per_sector);
-    for (idx, freq) in freq_axis_mhz.iter().enumerate() {
-        let raw_weight = raw_spectrum_weights[idx];
-        let raw_amp = if raw_weight > 0.0 {
-            raw_spectrum_sums[idx] / raw_weight
-        } else {
-            0.0
-        };
-        raw_spectrum.push((*freq, raw_amp));
-    }
-
-    let total_integration: f64 = raw_weights.iter().sum();
-
+    let raw_spectrum = freq_axis_mhz
+        .iter()
+        .enumerate()
+        .map(|(chan, &freq)| {
+            (
+                freq,
+                if raw_weights[chan] > 0.0 {
+                    raw_sums[chan] / raw_weights[chan]
+                } else {
+                    f64::NAN
+                },
+            )
+        })
+        .collect();
     Ok(DedispersionOutputs {
+        integrated_time_series: dedispersed_time_series.clone(),
         dedispersed_time_series,
-        dedispersed_weights: dedispersed_weights_vec,
-        integrated_time_series,
+        dedispersed_weights,
         raw_spectrum,
         spectra_heatmap,
         dedispersed_heatmap,
         raw_phase_heatmap,
         dedispersed_phase_heatmap,
-        total_integration,
+        total_integration: elapsed,
         pp_elapsed,
         pp_durations,
-        dm_delay_min: dm_delay_stats.map(|(mn, _)| mn),
-        dm_delay_max: dm_delay_stats.map(|(_, mx)| mx),
+        dm_delay_min: cli
+            .dm
+            .map(|_| delays.iter().copied().fold(f64::INFINITY, f64::min)),
+        dm_delay_max: cli
+            .dm
+            .map(|_| delays.iter().copied().fold(f64::NEG_INFINITY, f64::max)),
     })
 }
 
-#[allow(dead_code)]
-pub(crate) fn build_onpulse_dedispersed_sectors(
-    sectors: &[SectorData],
-    freq_axis_mhz: &[f64],
-    period: f64,
-    bins: usize,
-    on_duty: f64,
-    dm: Option<f64>,
-) -> Result<Vec<SectorData>> {
-    if sectors.is_empty() {
-        return Ok(Vec::new());
-    }
-    if period <= 0.0 || bins == 0 || !(0.0..=1.0).contains(&on_duty) {
-        return Err(anyhow!(
-            "invalid gating parameters (period, bins, on_duty) for on-pulse sector construction"
-        ));
-    }
-
-    let cli = KnownArgs {
-        input: PathBuf::new(),
-        period,
-        dm,
-        bins,
-        skip: 0,
-        length: 0,
-        on_duty,
-        full_output: false,
-    };
-    let dedispersed = build_dedispersed_series(sectors, freq_axis_mhz, &cli)?;
-    let folded = fold_profile(
-        &dedispersed.dedispersed_time_series,
-        &dedispersed.dedispersed_weights,
-        period,
-        bins,
-    )?;
-    let gating = determine_gating(&folded, on_duty);
-
-    let mut on_mask = vec![false; bins];
-    for &bin in &gating.on_bins {
-        if bin < bins {
-            on_mask[bin] = true;
-        }
-    }
-    if !on_mask.iter().any(|&v| v) {
-        return Err(anyhow!(
-            "failed to determine on-pulse bins for gated delay-rate analysis"
-        ));
-    }
-
-    let channels = dedispersed
-        .dedispersed_heatmap
-        .first()
-        .map(|r| r.len())
-        .unwrap_or(0);
-    let first_center = dedispersed.pp_elapsed.first().copied().unwrap_or(0.0)
-        + dedispersed.pp_durations.first().copied().unwrap_or(0.0) / 2.0;
-
-    let on_count = on_mask.iter().filter(|&&v| v).count();
-    let off_count = bins.saturating_sub(on_count);
-    let off_scale = if off_count > 0 {
-        on_count as f32 / off_count as f32
-    } else {
-        0.0
-    };
-
-    let mut out = Vec::with_capacity(dedispersed.dedispersed_heatmap.len());
-    for idx in 0..dedispersed.dedispersed_heatmap.len() {
-        let center = dedispersed.pp_elapsed[idx] + dedispersed.pp_durations[idx] / 2.0;
-        let phase = ((center - first_center) / period).rem_euclid(1.0);
-        let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
-        // Use a zero-mean gate (+1 for on-pulse, -alpha for off-pulse) to reduce
-        // periodic window leakage in delay-rate space while preserving cadence.
-        let weight: f32 = if on_mask[bin] { 1.0 } else { -off_scale };
-        let spectra = if weight.abs() <= f32::EPSILON {
-            vec![Complex::new(0.0, 0.0); channels]
-        } else {
-            dedispersed.dedispersed_heatmap[idx]
-                .iter()
-                .map(|v| *v * weight)
-                .collect()
-        };
-        out.push(SectorData {
-            integ_time: dedispersed.pp_durations[idx],
-            spectra,
-        });
-    }
-    Ok(out)
-}
-
 fn compute_dispersion_delays(freq_axis_mhz: &[f64], ref_freq_mhz: f64, dm: f64) -> Vec<f64> {
-    const DM_CONST_MS: f64 = 4.148_808e6;
-    freq_axis_mhz
-        .iter()
-        .map(|&f| {
-            let delay_ms = DM_CONST_MS * dm * (1.0 / (ref_freq_mhz * ref_freq_mhz) - 1.0 / (f * f));
-            delay_ms / 1e3
-        })
-        .collect()
+    dispersion_delays(freq_axis_mhz, ref_freq_mhz, dm)
 }
 
 fn build_phase_aligned_heatmap(
     heatmap: &[Vec<Complex<f32>>],
     centers: &[f64],
-    _durations: &[f64],
+    durations: &[f64],
     bins: usize,
     period: f64,
 ) -> Vec<Vec<Complex<f32>>> {
@@ -507,67 +394,47 @@ fn build_phase_aligned_heatmap(
     }
     let channels = heatmap[0].len();
     let mut accum = vec![vec![0.0f64; channels]; bins];
+    let mut weights = vec![vec![0.0f64; channels]; bins];
     let t0 = centers[0];
 
     for (row_idx, row) in heatmap.iter().enumerate() {
         if row.len() != channels {
             continue;
         }
+        let duration = durations.get(row_idx).copied().unwrap_or(0.0);
+        if !duration.is_finite() || duration <= 0.0 {
+            continue;
+        }
         let center = centers.get(row_idx).copied().unwrap_or(t0);
-        let phase = ((center - t0) / period).rem_euclid(1.0);
-        let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
+        let bin = phase_bin(center, t0, period, bins);
         for (chan_idx, value) in row.iter().enumerate() {
             let amp = value.norm() as f64;
             if amp.is_finite() {
-                accum[bin][chan_idx] += amp;
+                accum[bin][chan_idx] += amp * duration;
+                weights[bin][chan_idx] += duration;
             }
         }
     }
 
     accum
         .into_iter()
-        .map(|row_accum| {
-            row_accum
-                .into_iter()
-                .map(|sum| Complex::new(sum as f32, 0.0))
+        .zip(weights)
+        .map(|(sums, weights)| {
+            sums.into_iter()
+                .zip(weights)
+                .map(|(sum, weight)| {
+                    Complex::new(
+                        if weight > 0.0 {
+                            (sum / weight) as f32
+                        } else {
+                            f32::NAN
+                        },
+                        0.0,
+                    )
+                })
                 .collect()
         })
         .collect()
-}
-
-fn interpolate_complex(
-    times: &[f64],
-    values: &[Complex<f32>],
-    target: f64,
-    last_index: usize,
-) -> Complex<f32> {
-    if times.is_empty() || values.is_empty() || last_index == 0 {
-        return Complex::new(0.0, 0.0);
-    }
-    if target <= times[0] || target >= times[last_index] {
-        return Complex::new(0.0, 0.0);
-    }
-
-    let mut left = 0usize;
-    let mut right = last_index;
-    while left + 1 < right {
-        let mid = (left + right) / 2;
-        if times[mid] <= target {
-            left = mid;
-        } else {
-            right = mid;
-        }
-    }
-
-    let t0 = times[left];
-    let t1 = times[left + 1];
-    if t1 <= t0 {
-        return Complex::new(0.0, 0.0);
-    }
-    let frac = ((target - t0) / (t1 - t0)).clamp(0.0, 1.0);
-    let c0 = values[left];
-    let c1 = values[left + 1];
-    c0 * (1.0 - frac as f32) + c1 * (frac as f32)
 }
 
 pub(crate) fn fold_profile(
@@ -578,6 +445,12 @@ pub(crate) fn fold_profile(
 ) -> Result<Vec<(f64, f64)>> {
     if dedispersed.is_empty() {
         return Err(anyhow!("dedispersed time series is empty"));
+    }
+    if !period.is_finite() || period <= 0.0 || bins == 0 || weights.len() != dedispersed.len() {
+        return Err(anyhow!("invalid period, bins, or time-series weight count"));
+    }
+    if dedispersed.iter().any(|(time, _)| !time.is_finite()) {
+        return Err(anyhow!("non-finite sample time"));
     }
     Ok(accumulate_phase_series(dedispersed, weights, period, bins))
 }
@@ -598,11 +471,10 @@ fn accumulate_phase_series(
 
     for (idx, &(time, amp)) in timeseries.iter().enumerate() {
         let weight = weights.get(idx).copied().unwrap_or(1.0);
-        if weight <= 0.0 {
+        if !weight.is_finite() || weight <= 0.0 || !amp.is_finite() {
             continue;
         }
-        let phase = ((time - t0) / period).rem_euclid(1.0);
-        let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
+        let bin = phase_bin(time, t0, period, bins);
         accum[bin] += amp * weight;
         weight_sums[bin] += weight;
     }
@@ -613,7 +485,7 @@ fn accumulate_phase_series(
         .enumerate()
         .map(|(idx, (sum, w))| {
             let phase = (idx as f64 + 0.5) / bins as f64;
-            let amp = if *w > 0.0 { sum / w } else { 0.0 };
+            let amp = if *w > 0.0 { sum / w } else { f64::NAN };
             (phase, amp)
         })
         .collect()
@@ -648,7 +520,11 @@ fn determine_gating(profile: &[(f64, f64)], on_duty: f64) -> GatingResult {
     if profile.is_empty() || on_duty <= 0.0 {
         return GatingResult {
             on_bins: Vec::new(),
-            off_bins: (0..profile.len()).collect(),
+            off_bins: profile
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.1.is_finite().then_some(i))
+                .collect(),
             peak_phase: 0.0,
             snr: 0.0,
         };
@@ -663,15 +539,23 @@ fn determine_gating(profile: &[(f64, f64)], on_duty: f64) -> GatingResult {
     if sorted.is_empty() {
         return GatingResult {
             on_bins: Vec::new(),
-            off_bins: (0..bins).collect(),
+            off_bins: Vec::new(),
             peak_phase: 0.0,
             snr: 0.0,
         };
     }
     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let max_on_bins = if bins > 1 { bins - 1 } else { 1 };
-    let on_bin_count = ((bins as f64 * on_duty).ceil() as usize)
+    if sorted.len() < 3 {
+        return GatingResult {
+            on_bins: Vec::new(),
+            off_bins: sorted.iter().map(|p| p.0).collect(),
+            peak_phase: 0.0,
+            snr: 0.0,
+        };
+    }
+    let max_on_bins = sorted.len() - 2;
+    let on_bin_count = ((sorted.len() as f64 * on_duty).ceil() as usize)
         .clamp(1, max_on_bins)
         .min(sorted.len());
     let on_bins: Vec<usize> = sorted
@@ -685,7 +569,9 @@ fn determine_gating(profile: &[(f64, f64)], on_duty: f64) -> GatingResult {
             is_on[idx] = true;
         }
     }
-    let off_bins: Vec<usize> = (0..bins).filter(|idx| !is_on[*idx]).collect();
+    let off_bins: Vec<usize> = (0..bins)
+        .filter(|idx| !is_on[*idx] && profile[*idx].1.is_finite())
+        .collect();
 
     let peak_idx = sorted.first().map(|(idx, _)| *idx).unwrap_or(0);
     let peak_phase = profile[peak_idx].0;
@@ -712,8 +598,10 @@ fn determine_gating(profile: &[(f64, f64)], on_duty: f64) -> GatingResult {
     let peak_amp = profile[peak_idx].1;
     let snr = if off_std > 0.0 {
         (peak_amp - off_mean) / off_std
-    } else {
+    } else if peak_amp == off_mean {
         0.0
+    } else {
+        f64::NAN
     };
 
     GatingResult {
@@ -771,8 +659,7 @@ fn compute_gated_aggregation(
     for (idx, elapsed) in dedispersed.pp_elapsed.iter().enumerate() {
         let duration = dedispersed.pp_durations.get(idx).copied().unwrap_or(0.0);
         let center = elapsed + duration / 2.0;
-        let phase = ((center - first_center) / period).rem_euclid(1.0);
-        let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
+        let bin = phase_bin(center, first_center, period, bins);
         bin_assignments.push((center, bin));
     }
 
@@ -781,6 +668,7 @@ fn compute_gated_aggregation(
     let mut on_total = 0.0f64;
     let mut off_total = 0.0f64;
     let mut off_square_total = 0.0f64;
+    let mut off_weight_square = 0.0f64;
     let mut on_spectrum_sum = vec![0.0f64; channels];
     let mut off_spectrum_sum = vec![0.0f64; channels];
     let mut off_channel_sums = vec![0.0f64; channels];
@@ -794,7 +682,10 @@ fn compute_gated_aggregation(
             .copied()
             .unwrap_or(0.0)
             .max(0.0);
-        let weight = duration.max(0.0);
+        let weight = dedispersed.dedispersed_weights[sector_idx];
+        if weight <= 0.0 {
+            continue;
+        }
         let (center, bin) = bin_assignments.get(sector_idx).copied().unwrap_or((0.0, 0));
         let is_on = on_mask[bin];
 
@@ -802,7 +693,7 @@ fn compute_gated_aggregation(
             dedispersed
                 .dedispersed_time_series
                 .get(sector_idx)
-                .map(|(_, amp)| *amp / duration)
+                .map(|(_, amp)| *amp)
                 .unwrap_or(0.0)
         } else {
             0.0
@@ -827,10 +718,11 @@ fn compute_gated_aggregation(
             off_weight += weight;
             off_total += avg_amp * weight;
             off_square_total += avg_amp * avg_amp * weight;
+            off_weight_square += weight * weight;
         }
     }
 
-    if on_weight == 0.0 {
+    if on_weight == 0.0 || off_weight == 0.0 {
         return None;
     }
 
@@ -844,9 +736,13 @@ fn compute_gated_aggregation(
     } else {
         0.0
     };
-    let off_sigma = if off_weight > 0.0 {
-        let var = (off_square_total / off_weight) - off_mean * off_mean;
-        Some(var.max(0.0).sqrt())
+    let off_dof = off_weight - off_weight_square / off_weight;
+    let off_sigma = if off_dof > 0.0 {
+        Some(
+            ((off_square_total - off_weight * off_mean.powi(2)) / off_dof)
+                .max(0.0)
+                .sqrt(),
+        )
     } else {
         None
     };
@@ -887,22 +783,19 @@ fn compute_gated_aggregation(
     // Build on-pulse means per phase bin for S/N estimation
     let mut gated_bin_sums = vec![0.0f64; bins];
     let mut gated_bin_weights = vec![0.0f64; bins];
-    let base_time = time_series.first().map(|&(t, _, _)| t).unwrap_or(0.0);
-    for (idx, &(center, avg_amp, is_on)) in time_series.iter().enumerate() {
+    let base_time = first_center;
+    for &(center, avg_amp, is_on) in &time_series {
         if !is_on {
             continue;
         }
-        let duration = dedispersed
-            .pp_durations
-            .get(idx)
-            .copied()
-            .unwrap_or(0.0)
-            .max(0.0);
+        let idx = dedispersed
+            .dedispersed_time_series
+            .partition_point(|&(t, _)| t < center);
+        let duration = dedispersed.dedispersed_weights[idx];
         if duration <= 0.0 {
             continue;
         }
-        let phase = ((center - base_time) / period).rem_euclid(1.0);
-        let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
+        let bin = phase_bin(center, base_time, period, bins);
         gated_bin_sums[bin] += avg_amp * duration;
         gated_bin_weights[bin] += duration;
     }
@@ -928,62 +821,51 @@ fn compute_gated_aggregation(
             let value = if gated_bin_weights[idx] > 0.0 {
                 gated_bin_means[idx] - off_mean
             } else {
-                0.0
+                f64::NAN
             };
             (phase, value)
         })
         .collect();
 
     let mut diff_time_series = Vec::with_capacity(sectors);
-    let mut on_diff_values = Vec::new();
-    let mut off_diff_values = Vec::new();
     for (sector_idx, row) in dedispersed.dedispersed_heatmap.iter().enumerate() {
-        let (center, bin) = bin_assignments[sector_idx];
-        let is_on = on_mask[bin];
-        let mut diff_sum = 0.0f64;
-        for (chan_idx, value) in row.iter().enumerate() {
-            let amp = value.norm() as f64;
-            let diff = amp - off_channel_means[chan_idx];
-            diff_sum += diff;
+        if dedispersed.dedispersed_weights[sector_idx] <= 0.0 {
+            continue;
         }
-        diff_time_series.push((center, diff_sum));
-
-        if is_on {
-            on_diff_values.push(diff_sum);
-        } else {
-            off_diff_values.push(diff_sum);
-        }
-    }
-
-    let diff_peak = on_diff_values
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max)
-        .max(0.0);
-
-    let diff_sigma = if off_diff_values.len() > 1 {
-        let mean = off_diff_values.iter().copied().sum::<f64>() / off_diff_values.len() as f64;
-        let var = off_diff_values
+        let (center, _) = bin_assignments[sector_idx];
+        let diff_sum = row
             .iter()
-            .map(|&v| {
-                let diff = v - mean;
-                diff * diff
-            })
-            .sum::<f64>()
-            / (off_diff_values.len() - 1) as f64;
-        Some(var.max(0.0).sqrt())
+            .enumerate()
+            .map(|(chan, value)| value.norm() as f64 - off_channel_means[chan])
+            .sum();
+        diff_time_series.push((center, diff_sum));
+    }
+    // Profile S/N uses profile-bin noise, rather than the largest individual
+    // time sample divided by time-domain noise.
+    let folded = fold_profile(
+        &dedispersed.dedispersed_time_series,
+        &dedispersed.dedispersed_weights,
+        period,
+        bins,
+    )
+    .ok()?;
+    let off_values: Vec<_> = gating
+        .off_bins
+        .iter()
+        .map(|&bin| folded[bin].1)
+        .filter(|v| v.is_finite())
+        .collect();
+    let gated_sigma = if off_values.len() >= 2 {
+        let mean = off_values.iter().sum::<f64>() / off_values.len() as f64;
+        Some(
+            (off_values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                / (off_values.len() - 1) as f64)
+                .sqrt(),
+        )
     } else {
         None
     };
-
-    let gated_sigma = diff_sigma.or(off_sigma);
-    let gated_snr = gated_sigma.and_then(|sigma| {
-        if sigma > 0.0 {
-            Some(diff_peak / sigma)
-        } else {
-            None
-        }
-    });
+    let gated_snr = gated_sigma.filter(|sigma| *sigma > 0.0).map(|_| gating.snr);
 
     Some(GatedAggregation {
         on_spectrum,
@@ -1001,6 +883,111 @@ fn compute_gated_aggregation(
         gated_profile_sigma: gated_sigma,
         diff_time_series,
     })
+}
+
+#[derive(Debug)]
+struct GatedVisibility {
+    frequency_mhz: f64,
+    on: Complex<f64>,
+    off: Complex<f64>,
+    on_weight: f64,
+    off_weight: f64,
+}
+
+fn compute_gated_visibilities(
+    data: &DedispersionOutputs,
+    gating: &GatingResult,
+    frequencies: &[f64],
+    cli: &KnownArgs,
+) -> Vec<GatedVisibility> {
+    let centers: Vec<_> = data
+        .pp_elapsed
+        .iter()
+        .zip(&data.pp_durations)
+        .map(|(t, d)| t + d / 2.0)
+        .collect();
+    let valid: Vec<_> = centers
+        .iter()
+        .zip(&data.dedispersed_weights)
+        .filter_map(|(&t, &w)| (w > 0.0).then_some(t))
+        .collect();
+    if valid.is_empty() || gating.on_bins.is_empty() || gating.off_bins.is_empty() {
+        return Vec::new();
+    }
+    let delays = compute_dispersion_delays(frequencies, frequencies[0], cli.dm.unwrap_or(0.0));
+    frequencies
+        .iter()
+        .enumerate()
+        .map(|(chan, &frequency_mhz)| {
+            let mut on = Complex::new(0.0, 0.0);
+            let mut off = on;
+            let mut on_weight = 0.0;
+            let mut off_weight = 0.0;
+            for (row, &center) in centers.iter().enumerate() {
+                // Shift the gate, not the complex samples: raw fringe phase is preserved.
+                let reference_time = center + delays[chan];
+                if reference_time < valid[0] || reference_time > *valid.last().unwrap() {
+                    continue;
+                }
+                let bin = phase_bin(reference_time, centers[0], cli.period, cli.bins);
+                let value = data.spectra_heatmap[row][chan];
+                if !value.re.is_finite() || !value.im.is_finite() {
+                    continue;
+                }
+                let value = Complex::new(value.re as f64, value.im as f64);
+                let weight = data.pp_durations[row];
+                if gating.on_bins.contains(&bin) {
+                    on += value * weight;
+                    on_weight += weight;
+                } else if gating.off_bins.contains(&bin) {
+                    off += value * weight;
+                    off_weight += weight;
+                }
+            }
+            let missing = Complex::new(f64::NAN, f64::NAN);
+            GatedVisibility {
+                frequency_mhz,
+                on: if on_weight > 0.0 {
+                    on / on_weight
+                } else {
+                    missing
+                },
+                off: if off_weight > 0.0 {
+                    off / off_weight
+                } else {
+                    missing
+                },
+                on_weight,
+                off_weight,
+            }
+        })
+        .collect()
+}
+
+fn write_gated_visibilities(path: &Path, values: &[GatedVisibility]) -> Result<()> {
+    let mut file = fs::File::create(path)?;
+    writeln!(
+        file,
+        "channel,freq_mhz,on_re,on_im,off_re,off_im,diff_re,diff_im,on_weight_s,off_weight_s"
+    )?;
+    for (chan, value) in values.iter().enumerate() {
+        let diff = value.on - value.off;
+        writeln!(
+            file,
+            "{},{:.9},{:.12e},{:.12e},{:.12e},{:.12e},{:.12e},{:.12e},{:.9},{:.9}",
+            chan,
+            value.frequency_mhz,
+            value.on.re,
+            value.on.im,
+            value.off.re,
+            value.off.im,
+            diff.re,
+            diff.im,
+            value.on_weight,
+            value.off_weight
+        )?;
+    }
+    Ok(())
 }
 
 fn write_outputs(
@@ -1053,12 +1040,32 @@ fn write_outputs(
             dedisp_rows, dedisp_cols, raw_rows, raw_cols
         );
     }
+    let visibilities = compute_gated_visibilities(dedispersed, gating, freq_axis_mhz, cli);
+    write_gated_visibilities(
+        &output_dir.join(format!("{stem}_gated_visibilities.csv")),
+        &visibilities,
+    )?;
     let profile_path = output_dir.join(format!("{stem}_profile.csv"));
     let mut profile_file = fs::File::create(&profile_path)
         .with_context(|| format!("failed to write {profile_path:?}"))?;
-    writeln!(profile_file, "bin,phase,amplitude")?;
+    let mut bin_exposure = vec![0.0; cli.bins];
+    let origin = dedispersed.dedispersed_time_series[0].0;
+    for (&(time, amp), &weight) in dedispersed
+        .dedispersed_time_series
+        .iter()
+        .zip(&dedispersed.dedispersed_weights)
+    {
+        if amp.is_finite() && weight > 0.0 {
+            bin_exposure[phase_bin(time, origin, cli.period, cli.bins)] += weight;
+        }
+    }
+    writeln!(profile_file, "bin,phase,amplitude,exposure_s")?;
     for (idx, (phase, amp)) in folded.iter().enumerate() {
-        writeln!(profile_file, "{idx},{phase:.6},{amp:.6}")?;
+        writeln!(
+            profile_file,
+            "{idx},{phase:.6},{amp:.6},{:.9}",
+            bin_exposure[idx]
+        )?;
     }
 
     let profile_plot = output_dir.join(format!("{stem}_folded_profile.png"));
@@ -1221,6 +1228,26 @@ fn write_outputs(
     let mut summary_file = fs::File::create(&summary_path)
         .with_context(|| format!("failed to write {summary_path:?}"))?;
     writeln!(summary_file, "# Pulsar gating summary")?;
+    writeln!(
+        summary_file,
+        "valid full-band [s]  : {:.9}",
+        dedispersed.dedispersed_weights.iter().sum::<f64>()
+    )?;
+    writeln!(
+        summary_file,
+        "observed phase bins : {} / {}",
+        folded.iter().filter(|p| p.1.is_finite()).count(),
+        folded.len()
+    )?;
+    writeln!(
+        summary_file,
+        "amplitude processing : detected-amplitude interpolation; missing bins are NaN"
+    )?;
+    writeln!(
+        summary_file,
+        "complex product      : {}_gated_visibilities.csv (original fringe phase retained)",
+        stem
+    )?;
     writeln!(
         summary_file,
         "input                : {}",
@@ -1509,10 +1536,19 @@ fn print_summary(
             }
         );
     }
+    println!(
+        "Valid full-band  : {:.6} s",
+        dedispersed.dedispersed_weights.iter().sum::<f64>()
+    );
+    println!(
+        "Observed bins    : {} / {}",
+        folded.iter().filter(|p| p.1.is_finite()).count(),
+        folded.len()
+    );
     println!("Fold bins        : {}", folded.len());
     println!("Peak phase       : {:.4}", gating.peak_phase);
     println!("Estimated S/N    : {:.2}", gating.snr);
-    println!("Gating note      : folded and gating profiles are identical; refer to folded output");
+    println!("Gating note      : amplitudes are exposure-weighted; missing phase bins are NaN");
     if let Some(gated_data) = gated {
         println!("Gated on-weight  : {:.6} s", gated_data.on_weight);
         println!("Gated off-weight : {:.6} s", gated_data.off_weight);
@@ -1556,7 +1592,7 @@ fn plot_folded_profile(
     gating: &GatingResult,
     cli: &KnownArgs,
 ) -> Result<()> {
-    if data.len() < 2 {
+    if data.len() < 2 || !data.iter().any(|p| p.1.is_finite()) {
         return Ok(());
     }
 
@@ -1634,7 +1670,11 @@ fn plot_folded_profile(
         .draw()?;
 
     chart
-        .draw_series(LineSeries::new(data.iter().map(|&(x, y)| (x, y)), &BLUE))?
+        .draw_series(
+            finite_segments(data)
+                .into_iter()
+                .map(|segment| PathElement::new(segment, BLUE)),
+        )?
         .label("Folded amplitude")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], BLUE));
 
@@ -1680,7 +1720,7 @@ fn plot_gated_profile(
     snr: Option<f64>,
     sigma: Option<f64>,
 ) -> Result<()> {
-    if data.len() < 2 {
+    if data.len() < 2 || !data.iter().any(|p| p.1.is_finite()) {
         return Ok(());
     }
 
@@ -1719,7 +1759,11 @@ fn plot_gated_profile(
         .draw()?;
 
     chart
-        .draw_series(LineSeries::new(data.iter().map(|&(x, y)| (x, y)), &RED))?
+        .draw_series(
+            finite_segments(data)
+                .into_iter()
+                .map(|segment| PathElement::new(segment, RED)),
+        )?
         .label("Gated profile")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], RED));
 
@@ -1780,7 +1824,7 @@ fn plot_time_series(
     _title: &str,
     y_label: &str,
 ) -> Result<()> {
-    if data.len() < 2 {
+    if data.len() < 2 || !data.iter().any(|p| p.1.is_finite()) {
         return Ok(());
     }
 
@@ -1819,7 +1863,11 @@ fn plot_time_series(
         .draw()?;
 
     chart
-        .draw_series(LineSeries::new(data.iter().copied(), &BLUE))?
+        .draw_series(
+            finite_segments(data)
+                .into_iter()
+                .map(|segment| PathElement::new(segment, BLUE)),
+        )?
         .label("Time series")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], BLUE));
 
@@ -2090,6 +2138,9 @@ fn heatmap_difference_stats(
     for (row_raw, row_dedisp) in raw.iter().zip(dedispersed.iter()) {
         for (cell_raw, cell_dedisp) in row_raw.iter().zip(row_dedisp.iter()) {
             let diff = (cell_dedisp.norm() - cell_raw.norm()).abs() as f64;
+            if !diff.is_finite() {
+                continue;
+            }
             max_diff = max_diff.max(diff);
             accum += diff;
             count += 1;
@@ -2120,18 +2171,21 @@ fn plot_phase_aligned_heatmap(
         return Ok(());
     }
 
-    let mut amplitudes = vec![vec![0.0f32; channels]; bins];
+    let mut amplitudes = vec![vec![f32::NAN; channels]; bins];
     let mut min_amp = f32::MAX;
     let mut max_amp = f32::MIN;
     for (bin_idx, row) in heatmap.iter().enumerate() {
         for chan_idx in 0..channels {
-            let amp = row[chan_idx].norm();
+            let amp = row[chan_idx].re;
+            if !amp.is_finite() {
+                continue;
+            }
             amplitudes[bin_idx][chan_idx] = amp;
             min_amp = min_amp.min(amp);
             max_amp = max_amp.max(amp);
         }
     }
-    if !min_amp.is_finite() || !max_amp.is_finite() {
+    if min_amp == f32::MAX || max_amp == f32::MIN || !min_amp.is_finite() || !max_amp.is_finite() {
         return Ok(());
     }
     if (max_amp - min_amp).abs() < f32::EPSILON {
@@ -2205,6 +2259,9 @@ fn plot_phase_aligned_heatmap(
             let freq_low = freq_edges[chan_idx];
             let freq_high = freq_edges[chan_idx + 1];
             let amp = amplitudes[bin_idx][chan_idx];
+            if !amp.is_finite() {
+                continue;
+            }
             let norm = ((amp - min_amp) / (max_amp - min_amp)).clamp(0.0, 1.0);
             let color = ViridisRGB.get_color(norm as f64);
             chart.draw_series(std::iter::once(Rectangle::new(
@@ -2274,11 +2331,13 @@ fn build_on_pulse_phase_difference_heatmap(
         .zip(dedispersed_heatmap.iter())
     {
         let duration = (*duration).max(0.0);
+        if row.iter().any(|v| !v.norm().is_finite()) {
+            continue;
+        }
         if duration <= 0.0 {
             continue;
         }
-        let phase = ((*center - first_center) / period).rem_euclid(1.0);
-        let bin = ((phase * bins as f64).floor() as usize).min(bins - 1);
+        let bin = phase_bin(*center, first_center, period, bins);
         let is_on = on_mask[bin];
         for (chan_idx, cell) in row.iter().enumerate().take(channels) {
             let amp = cell.norm() as f64;
@@ -2300,7 +2359,7 @@ fn build_on_pulse_phase_difference_heatmap(
         }
     }
 
-    let mut result = vec![vec![Complex::new(0.0f32, 0.0f32); channels]; bins];
+    let mut result = vec![vec![Complex::new(f32::NAN, 0.0f32); channels]; bins];
     for bin_idx in 0..bins {
         if !on_mask[bin_idx] {
             continue;
@@ -2310,8 +2369,11 @@ fn build_on_pulse_phase_difference_heatmap(
             if weight <= 0.0 {
                 continue;
             }
+            if off_weights[chan_idx] <= 0.0 {
+                continue;
+            }
             let on_mean = on_sums[bin_idx][chan_idx] / weight;
-            let diff = (on_mean - off_means[chan_idx]).max(0.0);
+            let diff = on_mean - off_means[chan_idx];
             result[bin_idx][chan_idx] = Complex::new(diff as f32, 0.0);
         }
     }
@@ -2323,59 +2385,194 @@ fn build_on_pulse_phase_difference_heatmap(
 mod tests {
     use super::*;
 
-    #[test]
-    fn dedispersion_shifts_low_frequency_power_earlier() {
-        let sectors = vec![
-            SectorData {
-                integ_time: 1.0,
-                spectra: vec![Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)],
-            },
-            SectorData {
-                integ_time: 1.0,
-                spectra: vec![Complex::new(1.0, 0.0), Complex::new(0.0, 0.0)],
-            },
-        ];
-        let freq_axis_mhz = vec![100.0, 200.0];
-        let cli = KnownArgs {
+    fn test_args(dm: Option<f64>, period: f64, bins: usize) -> KnownArgs {
+        KnownArgs {
             input: PathBuf::new(),
-            period: 1.0,
-            dm: Some(3.212),
-            bins: 8,
+            period,
+            dm,
+            bins,
             skip: 0,
             length: 0,
             on_duty: 0.1,
             full_output: false,
+        }
+    }
+
+    #[test]
+    fn sector_loader_preserves_measured_cadence_and_missing_visibility() {
+        let header = CorHeader {
+            magic_word: [0x83, 0xf9, 0xa2, 0x3e],
+            sampling_speed: 32_000_000,
+            observing_frequency: 316e6,
+            fft_point: 4,
+            number_of_sector: 1,
+            ..CorHeader::default()
         };
-        let outputs = build_dedispersed_series(&sectors, &freq_axis_mhz, &cli).unwrap();
-
-        let raw_heatmap_amp = outputs.spectra_heatmap[0][1].norm();
-        let dedisp_heatmap_amp = outputs.dedispersed_heatmap[0][1].norm();
+        let mut bytes = vec![0u8; 256 + 128 + 16];
+        bytes[256 + 112..256 + 116].copy_from_slice(&0.0105f32.to_le_bytes());
+        bytes[256 + 128..256 + 132].copy_from_slice(&f32::NAN.to_le_bytes());
+        let sectors =
+            load_sectors_with_limits(&mut Cursor::new(bytes.as_slice()), &header, 0, 0).unwrap();
+        assert_eq!(sectors[0].integ_time, 0.0105f32 as f64);
+        assert!(sectors[0].spectra[0].re.is_nan());
+        bytes[256 + 112..256 + 116].copy_from_slice(&0.0f32.to_le_bytes());
         assert!(
-            dedisp_heatmap_amp < raw_heatmap_amp,
-            "DM 適用によって高周波チャネルが先頭ビンから移動していません"
+            load_sectors_with_limits(&mut Cursor::new(bytes.as_slice()), &header, 0, 0).is_err()
         );
+    }
 
-        assert_eq!(outputs.raw_phase_heatmap.len(), cli.bins);
-        assert!(
-            outputs
-                .raw_phase_heatmap
-                .iter()
-                .flat_map(|row| row.iter())
-                .map(|c| c.norm())
-                .sum::<f32>()
-                > 0.0
-        );
+    #[test]
+    fn dedispersion_aligns_early_high_frequency_pulse_to_low_frequency_reference() {
+        let mut sectors: Vec<_> = (0..4)
+            .map(|_| SectorData {
+                integ_time: 1.0,
+                spectra: vec![Complex::new(0.0, 0.0); 2],
+            })
+            .collect();
+        sectors[1].spectra[1] = Complex::new(1.0, 0.0);
+        sectors[2].spectra[0] = Complex::new(1.0, 0.0);
+        let dm = 1.0 / (4.148_808e3 * (100.0f64.powi(-2) - 200.0f64.powi(-2)));
+        let out = build_dedispersed_series(&sectors, &[100.0, 200.0], &test_args(Some(dm), 4.0, 4))
+            .unwrap();
+        assert!((out.integrated_time_series[2].1 - 2.0).abs() < 1e-6);
+        assert!(!out.integrated_time_series[0].1.is_finite());
+        assert_eq!(out.dedispersed_weights[0], 0.0);
+    }
 
-        assert_eq!(outputs.dedispersed_phase_heatmap.len(), cli.bins);
-        assert!(
-            outputs
-                .dedispersed_phase_heatmap
-                .iter()
-                .flat_map(|row| row.iter())
-                .map(|c| c.norm())
-                .sum::<f32>()
-                > 0.0
-        );
+    #[test]
+    fn zero_dm_is_identity_including_both_endpoints_and_single_sample() {
+        for count in [1, 4] {
+            let sectors: Vec<_> = (0..count)
+                .map(|_| SectorData {
+                    integ_time: 1.0,
+                    spectra: vec![Complex::new(1.0, 0.0); 2],
+                })
+                .collect();
+            let raw = build_dedispersed_series(&sectors, &[100.0, 200.0], &test_args(None, 4.0, 4))
+                .unwrap();
+            let dm0 =
+                build_dedispersed_series(&sectors, &[100.0, 200.0], &test_args(Some(0.0), 4.0, 4))
+                    .unwrap();
+            assert_eq!(raw.integrated_time_series, dm0.integrated_time_series);
+            assert!(dm0.integrated_time_series.iter().all(|p| p.1 == 2.0));
+            assert_eq!(raw.dedispersed_weights, dm0.dedispersed_weights);
+        }
+    }
+
+    #[test]
+    fn constant_amplitude_fold_is_independent_of_duration() {
+        let sectors: Vec<_> = [1.0, 2.0]
+            .iter()
+            .map(|&d| SectorData {
+                integ_time: d,
+                spectra: vec![Complex::new(1.0, 0.0)],
+            })
+            .collect();
+        let out = build_dedispersed_series(&sectors, &[100.0], &test_args(None, 100.0, 4)).unwrap();
+        let folded = fold_profile(
+            &out.dedispersed_time_series,
+            &out.dedispersed_weights,
+            100.0,
+            4,
+        )
+        .unwrap();
+        assert_eq!(folded[0].1, 1.0);
+    }
+
+    #[test]
+    fn empty_bins_are_missing_and_cannot_manufacture_signal_to_noise() {
+        let series: Vec<_> = (0..10).map(|i| (i as f64, 1.0)).collect();
+        let profile = fold_profile(&series, &[1.0; 10], 10.0, 128).unwrap();
+        assert_eq!(profile.iter().filter(|p| p.1.is_finite()).count(), 10);
+        let gate = determine_gating(&profile, 0.05);
+        assert_eq!(gate.snr, 0.0);
+        assert!(gate
+            .on_bins
+            .iter()
+            .chain(&gate.off_bins)
+            .all(|&i| profile[i].1.is_finite()));
+    }
+
+    #[test]
+    fn phase_reversal_does_not_attenuate_detected_amplitude() {
+        let sectors = vec![
+            SectorData {
+                integ_time: 1.0,
+                spectra: vec![Complex::new(1.0, 0.0); 2],
+            },
+            SectorData {
+                integ_time: 1.0,
+                spectra: vec![Complex::new(-1.0, 0.0); 2],
+            },
+            SectorData {
+                integ_time: 1.0,
+                spectra: vec![Complex::new(1.0, 0.0); 2],
+            },
+        ];
+        let dm = 0.5 / (4.148_808e3 * (100.0f64.powi(-2) - 200.0f64.powi(-2)));
+        let out = build_dedispersed_series(&sectors, &[100.0, 200.0], &test_args(Some(dm), 3.0, 4))
+            .unwrap();
+        assert_eq!(out.integrated_time_series[1].1, 2.0);
+    }
+
+    #[test]
+    fn gated_aggregation_ignores_partial_band_and_preserves_amplitude_scale() {
+        let sectors: Vec<_> = (0..7)
+            .map(|_| SectorData {
+                integ_time: 1.0,
+                spectra: vec![Complex::new(1.0, 0.0); 2],
+            })
+            .collect();
+        let dm = 0.5 / (4.148_808e3 * (100.0f64.powi(-2) - 200.0f64.powi(-2)));
+        let out = build_dedispersed_series(&sectors, &[100.0, 200.0], &test_args(Some(dm), 3.0, 3))
+            .unwrap();
+        let gate = GatingResult {
+            on_bins: vec![0],
+            off_bins: vec![1, 2],
+            peak_phase: 0.0,
+            snr: 0.0,
+        };
+        let agg = compute_gated_aggregation(&out, &gate, &[100.0, 200.0], 3.0, 3).unwrap();
+        assert_eq!(agg.on_mean, 2.0);
+        assert_eq!(agg.off_mean, 2.0);
+        assert!(agg.diff_spectrum.iter().all(|p| p.1 == 0.0));
+        assert_eq!(agg.on_weight + agg.off_weight, 6.0);
+    }
+
+    #[test]
+    fn complex_gating_preserves_phase_and_uses_channel_dispersion_time() {
+        let sectors: Vec<_> = (0..6)
+            .map(|i| SectorData {
+                integ_time: 1.0,
+                spectra: vec![
+                    Complex::new(0.0, if i % 3 == 0 { 3.0 } else { 1.0 }),
+                    Complex::new(0.0, if i % 3 == 2 { 3.0 } else { 1.0 }),
+                ],
+            })
+            .collect();
+        let dm = 1.0 / (4.148_808e3 * (100.0f64.powi(-2) - 200.0f64.powi(-2)));
+        let cli = test_args(Some(dm), 3.0, 3);
+        let out = build_dedispersed_series(&sectors, &[100.0, 200.0], &cli).unwrap();
+        let gate = GatingResult {
+            on_bins: vec![0],
+            off_bins: vec![1, 2],
+            peak_phase: 0.0,
+            snr: 0.0,
+        };
+        let vis = compute_gated_visibilities(&out, &gate, &[100.0, 200.0], &cli);
+        for v in vis {
+            assert_eq!(v.on, Complex::new(0.0, 3.0));
+            assert_eq!(v.off, Complex::new(0.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn fold_rejects_invalid_parameters_and_skips_nonfinite_amplitude() {
+        assert!(fold_profile(&[(0.0, 1.0)], &[], 1.0, 4).is_err());
+        assert!(fold_profile(&[(0.0, 1.0)], &[1.0], f64::NAN, 4).is_err());
+        let p = fold_profile(&[(0.0, f64::NAN), (1.0, 1.0)], &[1.0, 1.0], 4.0, 4).unwrap();
+        assert!(p[0].1.is_nan());
+        assert_eq!(p[1].1, 1.0);
     }
 
     #[test]
@@ -2401,14 +2598,12 @@ mod tests {
     }
 
     #[test]
-    fn determine_gating_keeps_off_pulse_bin_even_at_full_duty() {
-        let profile = vec![(0.1, 1.0), (0.5, f64::NAN), (0.9, 3.0)];
+    fn determine_gating_reserves_two_observed_off_bins_even_at_full_duty() {
+        let profile = vec![(0.1, 1.0), (0.3, f64::NAN), (0.5, 2.0), (0.9, 3.0)];
         let gating = determine_gating(&profile, 1.0);
-
-        assert_eq!(gating.on_bins.len(), 2);
-        assert_eq!(gating.off_bins.len(), 1);
-        assert_eq!(gating.off_bins[0], 1);
-        assert!((gating.peak_phase - 0.9).abs() < f64::EPSILON);
+        assert_eq!(gating.on_bins, vec![3]);
+        assert_eq!(gating.off_bins, vec![0, 2]);
+        assert_eq!(gating.peak_phase, 0.9);
     }
 
     #[test]

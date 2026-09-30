@@ -5,8 +5,9 @@ use super::known_pulsar::{
     load_sectors_with_limits, KnownArgs, SectorData,
 };
 use super::shared::{
-    compress_plot_png, output_stem, prepare_output_directory, scaled_font_size,
-    scaled_legend_font_size, write_rfi_cut_report, RfiCutReport,
+    compress_plot_png, dispersion_delays, finite_segments, interpolate_amplitude, output_stem,
+    phase_bin, prepare_output_directory, scaled_font_size, scaled_legend_font_size,
+    write_rfi_cut_report, RfiCutReport,
 };
 use anyhow::{anyhow, Result};
 use frinZ::fft::{process_fft, process_ifft};
@@ -14,6 +15,7 @@ use frinZ::header::parse_header;
 use ndarray::{Array2, Axis};
 use num_complex::Complex;
 use plotters::prelude::*;
+use rustfft::FftPlanner;
 use std::fs;
 use std::io::Cursor;
 use std::io::Write;
@@ -31,8 +33,8 @@ pub struct UnknownArgs {
 }
 
 pub fn run(args: UnknownArgs) -> Result<()> {
-    if args.bins == 0 {
-        return Err(anyhow!("--bins must be greater than 0"));
+    if args.bins < 3 {
+        return Err(anyhow!("--bins must be at least 3"));
     }
     if !(0.0..=1.0).contains(&args.on_duty) {
         return Err(anyhow!("--on-duty must be within [0, 1]"));
@@ -61,9 +63,9 @@ pub fn run(args: UnknownArgs) -> Result<()> {
 
     let header = parse_header(&mut cursor)?;
     let mut sectors = load_sectors_with_limits(&mut cursor, &header, skip, length)?;
-    if sectors.len() < 4 {
+    if sectors.len() < 16 {
         return Err(anyhow!(
-            "at least 4 sectors are required to estimate pulsar parameters"
+            "at least 16 sectors are required to estimate pulsar parameters"
         ));
     }
 
@@ -75,8 +77,8 @@ pub fn run(args: UnknownArgs) -> Result<()> {
 
     let samples_per_sector = freq_axis_mhz.len();
     let (channel_series, durations) = build_time_series(&sectors, samples_per_sector);
-    let (coherent_series, coherent_weights) =
-        build_coherent_time_series(&sectors, samples_per_sector);
+    let (amplitude_series, amplitude_weights) =
+        build_band_amplitude_time_series(&sectors, samples_per_sector);
     let output_dir = prepare_output_directory(&input)?;
     let stem = output_stem(&input);
     cleanup_legacy_unknown_gated_outputs(&output_dir, &stem);
@@ -105,8 +107,14 @@ pub fn run(args: UnknownArgs) -> Result<()> {
                 (axis, prof)
             });
     let base_amp_threshold = resolve_amp_threshold(&rate_profile_raw, configured_amp_threshold);
-    let (rate_above_amp_points, amp_threshold) =
-        select_rate_candidate_points(&rate_axis_raw, &rate_profile_raw, base_amp_threshold);
+    let (rate_above_amp_points, amp_threshold) = if configured_amp_threshold.is_some() {
+        (
+            extract_rate_profile_above_amp(&rate_axis_raw, &rate_profile_raw, base_amp_threshold),
+            base_amp_threshold,
+        )
+    } else {
+        select_rate_candidate_points(&rate_axis_raw, &rate_profile_raw, base_amp_threshold)
+    };
     let rate_bin_hz = estimate_rate_bin_hz(&rate_axis_raw).unwrap_or(1e-12);
     let rate_fundamental =
         estimate_fundamental_from_rate_diffs(&rate_above_amp_points, rate_bin_hz);
@@ -138,23 +146,32 @@ pub fn run(args: UnknownArgs) -> Result<()> {
         println!("Rate diff sigma [Hz]: n/a");
         println!("Estimated period from rate diff [s]: n/a");
     }
-    let selected_period = rate_fundamental
-        .as_ref()
-        .map(|est| est.period_s)
-        .filter(|p| p.is_finite() && *p > 0.0)
-        .ok_or_else(|| anyhow!("failed to estimate period from rate-diff peaks"))?;
+    let amplitude_candidates = estimate_amplitude_period_candidates(&amplitude_series, &durations)?;
+    let selected_period = amplitude_candidates.first().copied().ok_or_else(|| {
+        anyhow!(
+            "no significant periodic amplitude signal; specify --period for known-mode analysis"
+        )
+    })?;
     println!(
-        "Selected period [s] (source=rate-diff) : {:.9}",
+        "Selected initial period [s] (source=amplitude FFT) : {:.9}",
         selected_period
     );
-    let refine_result = refine_period_by_fold_snr(
-        &coherent_series,
-        &coherent_weights,
-        selected_period,
-        rate_fundamental.as_ref(),
+    let mut candidates = amplitude_candidates;
+    if let Some(est) = &rate_fundamental {
+        candidates.push(est.period_s);
+    }
+    let refine_result = select_refined_period(
+        &amplitude_series,
+        &amplitude_weights,
+        &candidates,
         bins,
         on_duty,
     )?;
+    if refine_result.is_none() {
+        return Err(anyhow!(
+            "period candidates have insufficient fold evidence (BIC gain < 10)"
+        ));
+    }
     if let Some(result) = &refine_result {
         println!(
             "Period refine window [s]      : source={}, coarse=[{:.9}, {:.9}], fine=[{:.9}, {:.9}]",
@@ -171,7 +188,7 @@ pub fn run(args: UnknownArgs) -> Result<()> {
         .unwrap_or(selected_period);
     if (refined_period - selected_period).abs() > 0.0 {
         println!(
-            "Refined period [s] (fold-snr)   : {:.9} (delta {:+.9})",
+            "Refined period [s] (fold-evidence)   : {:.9} (delta {:+.9})",
             refined_period,
             refined_period - selected_period
         );
@@ -231,7 +248,7 @@ pub fn run(args: UnknownArgs) -> Result<()> {
     if full_output && rate_fundamental.is_some() {
         let folded_plot = output_dir.join(format!("{stem}_rate_diff_folded_profile.png"));
         let folded_profile =
-            fold_profile(&coherent_series, &coherent_weights, refined_period, 128)?;
+            fold_profile(&amplitude_series, &amplitude_weights, refined_period, 128)?;
         plot_folded_profile_from_period(&folded_plot, &folded_profile, refined_period, None)?;
     }
 
@@ -743,7 +760,7 @@ fn cleanup_legacy_unknown_gated_outputs(output_dir: &Path, stem: &str) {
     let _ = fs::remove_dir_all(legacy_dir);
 }
 
-fn build_coherent_time_series(
+fn build_band_amplitude_time_series(
     sectors: &[SectorData],
     samples_per_sector: usize,
 ) -> (Vec<(f64, f64)>, Vec<f64>) {
@@ -756,24 +773,13 @@ fn build_coherent_time_series(
         let center = cumulative_time + duration / 2.0;
         cumulative_time += duration;
 
-        let mut coherent_sum = Complex::new(0.0f32, 0.0f32);
-        let mut coherent_count = 0usize;
-        for chan_idx in 0..samples_per_sector {
-            let value = sector
-                .spectra
-                .get(chan_idx)
-                .copied()
-                .unwrap_or_else(|| Complex::new(0.0, 0.0));
-            if value.re.is_finite() && value.im.is_finite() {
-                coherent_sum += value;
-                coherent_count += 1;
-            }
-        }
-        let amp = if coherent_count > 0 {
-            (coherent_sum / coherent_count as f32).norm() as f64
-        } else {
-            0.0
-        };
+        let amp = sector
+            .spectra
+            .iter()
+            .take(samples_per_sector)
+            .map(|value| value.norm() as f64)
+            .sum::<f64>()
+            / samples_per_sector as f64;
         series.push((center, amp));
         weights.push(duration);
     }
@@ -781,7 +787,35 @@ fn build_coherent_time_series(
     (series, weights)
 }
 
-fn refine_period_by_fold_snr(
+fn select_refined_period(
+    series: &[(f64, f64)],
+    weights: &[f64],
+    candidates: &[f64],
+    bins: usize,
+    on_duty: f64,
+) -> Result<Option<PeriodRefineResult>> {
+    let mut best = None;
+    let mut best_evidence = 10.0;
+    let sample_dt = weights.first().copied().unwrap_or(0.0);
+    for initial in candidates.iter().flat_map(|p| [p * 0.5, *p, p * 2.0]) {
+        if initial <= 2.0 * sample_dt {
+            continue;
+        }
+        if let Some(result) =
+            refine_period_by_fold_evidence(series, weights, initial, None, bins, on_duty)?
+        {
+            if let Some(evidence) = score_period_evidence(series, weights, result.period_s, bins) {
+                if evidence > best_evidence {
+                    best_evidence = evidence;
+                    best = Some(result);
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn refine_period_by_fold_evidence(
     series: &[(f64, f64)],
     weights: &[f64],
     initial_period_s: f64,
@@ -808,7 +842,7 @@ fn refine_period_by_fold_snr(
         choose_period_refine_half_span(initial_period_s, span, rate_fundamental);
     let coarse_steps = 401usize;
 
-    let coarse = scan_period_snr_grid(
+    let coarse = scan_period_evidence_grid(
         series,
         weights,
         initial_period_s,
@@ -830,7 +864,7 @@ fn refine_period_by_fold_snr(
         rate_fundamental,
     );
     let fine_steps = 401usize;
-    let fine = scan_period_snr_grid(
+    let fine = scan_period_evidence_grid(
         series,
         weights,
         best_coarse.period_s,
@@ -859,14 +893,15 @@ fn choose_period_refine_half_span(
     rate_fundamental: Option<&RateFundamentalEstimate>,
 ) -> (f64, &'static str) {
     let base_res = (initial_period_s * initial_period_s / observation_span_s).abs();
-    let fallback_half = (6.0 * base_res).clamp(2.0e-4, 1.0e-2);
+    let max_half = (initial_period_s * 0.2).max(2.0e-6);
+    let fallback_half = (6.0 * base_res).clamp(2.0e-6, max_half);
     let sigma_half = rate_fundamental
         .and_then(period_half_span_from_rate_sigma)
         .filter(|half| half.is_finite() && *half > 0.0);
     sigma_half
         .map(|half| {
             (
-                half.max(3.0 * base_res).clamp(2.0e-6, 1.0e-2),
+                half.max(3.0 * base_res).clamp(2.0e-6, max_half),
                 "rate-diff-3sigma",
             )
         })
@@ -884,13 +919,13 @@ fn choose_period_refine_fine_half_span(
     let sigma_half = rate_fundamental
         .and_then(period_half_span_from_rate_sigma)
         .filter(|half| half.is_finite() && *half > 0.0);
-    let fallback_half = (coarse_step_s * 8.0).clamp(2.0e-6, coarse_half_s / 3.0);
+    let fallback_half = (coarse_step_s * 8.0).clamp(2.0e-6, (coarse_half_s / 3.0).max(2.0e-6));
     sigma_half
         .map(|half| {
             (half / 6.0)
                 .max(2.0 * base_res)
                 .max(coarse_step_s * 4.0)
-                .clamp(2.0e-6, coarse_half_s / 3.0)
+                .clamp(2.0e-6, (coarse_half_s / 3.0).max(2.0e-6))
         })
         .unwrap_or(fallback_half)
 }
@@ -927,14 +962,14 @@ fn period_half_span_from_rate_sigma(est: &RateFundamentalEstimate) -> Option<f64
     }
 }
 
-fn scan_period_snr_grid(
+fn scan_period_evidence_grid(
     series: &[(f64, f64)],
     weights: &[f64],
     center_period_s: f64,
     half_span_s: f64,
     steps: usize,
     bins: usize,
-    on_duty: f64,
+    _on_duty: f64,
 ) -> Result<Option<FoldPeriodScore>> {
     if steps < 3
         || !center_period_s.is_finite()
@@ -952,14 +987,13 @@ fn scan_period_snr_grid(
         if !trial.is_finite() || trial <= 0.0 {
             continue;
         }
-        let folded = fold_profile(series, weights, trial, bins)?;
-        if let Some(snr) = score_folded_profile_snr(&folded, on_duty) {
+        if let Some(evidence) = score_period_evidence(series, weights, trial, bins) {
             match best {
-                Some(current) if current.snr >= snr => {}
+                Some(current) if current.evidence >= evidence => {}
                 _ => {
                     best = Some(FoldPeriodScore {
                         period_s: trial,
-                        snr,
+                        evidence,
                     });
                 }
             }
@@ -974,7 +1008,7 @@ fn score_folded_profile_snr(folded: &[(f64, f64)], on_duty: f64) -> Option<f64> 
     }
 
     let bins = folded.len();
-    let on_count = ((bins as f64 * on_duty).ceil() as usize).clamp(1, bins.saturating_sub(1));
+
     let mut ranked: Vec<(usize, f64)> = folded
         .iter()
         .enumerate()
@@ -989,6 +1023,7 @@ fn score_folded_profile_snr(folded: &[(f64, f64)], on_duty: f64) -> Option<f64> 
     if ranked.len() < 4 {
         return None;
     }
+    let on_count = ((ranked.len() as f64 * on_duty).ceil() as usize).clamp(1, ranked.len() - 2);
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut on_mask = vec![false; bins];
@@ -1080,7 +1115,7 @@ struct FringeSpectra {
 #[derive(Debug, Clone, Copy)]
 struct FoldPeriodScore {
     period_s: f64,
-    snr: f64,
+    evidence: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1201,55 +1236,36 @@ fn extract_periodic_rate_points(
     fundamental_rate_hz: f64,
 ) -> Vec<RateProfileAboveAmpPoint> {
     if rate_axis.len() != profile.len()
-        || rate_axis.is_empty()
         || !fundamental_rate_hz.is_finite()
         || fundamental_rate_hz <= 0.0
     {
         return Vec::new();
     }
-
-    let step_hz = fundamental_rate_hz.abs();
-    let mut min_rate = f64::INFINITY;
-    let mut max_rate = f64::NEG_INFINITY;
-    for (&rate_hz, &amplitude) in rate_axis.iter().zip(profile.iter()) {
-        if rate_hz.is_finite() && amplitude.is_finite() {
-            min_rate = min_rate.min(rate_hz);
-            max_rate = max_rate.max(rate_hz);
-        }
-    }
-    if !min_rate.is_finite() || !max_rate.is_finite() || min_rate > max_rate {
+    let mut finite: Vec<_> = profile.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
         return Vec::new();
     }
-    let mut points = Vec::new();
-    let mut left = min_rate;
-    while left <= max_rate {
-        let right = left + step_hz;
-        let mut best_idx: Option<usize> = None;
-        let mut best_amp = f64::NEG_INFINITY;
-        for (idx, (&rate_hz, &amplitude)) in rate_axis.iter().zip(profile.iter()).enumerate() {
-            if !rate_hz.is_finite() || !amplitude.is_finite() {
-                continue;
-            }
-            let in_window = if right > max_rate {
-                rate_hz >= left && rate_hz <= right
-            } else {
-                rate_hz >= left && rate_hz < right
-            };
-            if in_window && amplitude > best_amp {
-                best_amp = amplitude;
-                best_idx = Some(idx);
-            }
-        }
-        if let Some(idx) = best_idx {
-            points.push(RateProfileAboveAmpPoint {
-                rate_hz: rate_axis[idx],
-                amplitude: profile[idx],
-            });
-        }
-        left = right;
-    }
-
-    points
+    finite.sort_by(f64::total_cmp);
+    let median = median_of_sorted(&finite);
+    let mut deviations: Vec<_> = finite.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_by(f64::total_cmp);
+    let threshold = median + 6.0 * 1.4826 * median_of_sorted(&deviations);
+    let peaks = extract_rate_profile_above_amp(rate_axis, profile, threshold);
+    let Some(anchor) = peaks
+        .iter()
+        .max_by(|a, b| a.amplitude.total_cmp(&b.amplitude))
+    else {
+        return Vec::new();
+    };
+    let carrier = anchor.rate_hz;
+    let tolerance = estimate_rate_bin_hz(rate_axis).unwrap_or(0.0);
+    peaks
+        .into_iter()
+        .filter(|p| {
+            let harmonic = ((p.rate_hz - carrier) / fundamental_rate_hz).round();
+            (p.rate_hz - carrier - harmonic * fundamental_rate_hz).abs() <= tolerance
+        })
+        .collect()
 }
 
 fn write_rate_profile_above_amp_csv(
@@ -1454,7 +1470,9 @@ fn estimate_dispersion_measure(
 
     let sample_dt = durations.iter().copied().sum::<f64>() / durations.len().max(1) as f64;
     let dm_floor = estimate_dm_resolution_floor(sample_dt, &scan_freq_axis).unwrap_or(1.0);
-    let dm_max = choose_dm_scan_max(dm_floor);
+    // Do not consume the entire observation while comparing high-DM trials.
+    let observation_dm_limit = dm_floor * rows.saturating_sub(1) as f64 * 0.25;
+    let dm_max = choose_dm_scan_max(dm_floor).min(observation_dm_limit);
     let dm_bins = (bins.saturating_mul(8)).clamp(256, 2048);
 
     let coarse_points = scan_dm_snr_grid(
@@ -1475,7 +1493,7 @@ fn estimate_dispersion_measure(
     let coarse_step = dm_max / 120.0;
     let fine_half = (coarse_step * 6.0).max(dm_floor.max(0.25));
     let fine_min = (coarse_best_dm - fine_half).max(0.0);
-    let fine_max = coarse_best_dm + fine_half;
+    let fine_max = (coarse_best_dm + fine_half).min(observation_dm_limit);
     let fine_points = scan_dm_snr_grid(
         &scan_series,
         durations,
@@ -1549,7 +1567,7 @@ fn estimate_dispersion_measure_from_phase_fit(
     for sb in 0..subband_count {
         let start = sb * channels / subband_count;
         let end = (sb + 1) * channels / subband_count;
-        if end <= start + 1 {
+        if end <= start {
             continue;
         }
         let avg_series = build_subband_average_series(channel_series, start, end, rows);
@@ -1695,7 +1713,7 @@ fn build_dm_scan_subbands(
     for sb in 0..subband_count {
         let start = sb * channels / subband_count;
         let end = (sb + 1) * channels / subband_count;
-        if end <= start + 1 {
+        if end <= start {
             continue;
         }
         let avg_series = build_subband_average_series(channel_series, start, end, rows);
@@ -1727,6 +1745,22 @@ fn scan_dm_snr_grid(
     if steps < 2 || !dm_min.is_finite() || !dm_max.is_finite() || dm_max <= dm_min {
         return Ok(Vec::new());
     }
+    if channel_series.is_empty() || freq_axis_mhz.is_empty() || durations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let first_time = channel_series[0]
+        .first()
+        .ok_or_else(|| anyhow!("empty DM time series"))?
+        .0;
+    let last_time = channel_series[0].last().unwrap().0;
+    let delays = compute_dispersion_delays_seconds(freq_axis_mhz, freq_axis_mhz[0], dm_max);
+    let lower = first_time + delays.iter().copied().fold(0.0, f64::max);
+    let upper = last_time + delays.iter().copied().fold(0.0, f64::min);
+    let scan_weights: Vec<_> = channel_series[0]
+        .iter()
+        .zip(durations)
+        .map(|(&(t, _), &w)| if t >= lower && t <= upper { w } else { 0.0 })
+        .collect();
     let mut out = Vec::with_capacity(steps);
     let step = (dm_max - dm_min) / (steps - 1) as f64;
     for idx in 0..steps {
@@ -1734,7 +1768,7 @@ fn scan_dm_snr_grid(
         let dedispersed =
             build_dedispersed_scalar_series(channel_series, durations, freq_axis_mhz, dm);
         let fold_snr = if let Some(series) = dedispersed {
-            let folded = fold_profile(&series, durations, period, bins)?;
+            let folded = fold_profile(&series, &scan_weights, period, bins)?;
             score_folded_profile_snr(&folded, on_duty).unwrap_or(f64::NAN)
         } else {
             f64::NAN
@@ -1843,7 +1877,11 @@ fn build_dedispersed_scalar_series(
                 }
             }
         }
-        let amplitude = if count > 0 { sum / count as f64 } else { 0.0 };
+        let amplitude = if count == channels {
+            sum / channels as f64
+        } else {
+            f64::NAN
+        };
         out.push((center, amplitude));
     }
     Some(out)
@@ -1854,52 +1892,11 @@ fn compute_dispersion_delays_seconds(
     ref_freq_mhz: f64,
     dm_pc_cm3: f64,
 ) -> Vec<f64> {
-    const DM_CONST_MS: f64 = 4.148_808e6;
-    freq_axis_mhz
-        .iter()
-        .map(|&freq_mhz| {
-            if !freq_mhz.is_finite()
-                || freq_mhz <= 0.0
-                || !ref_freq_mhz.is_finite()
-                || ref_freq_mhz <= 0.0
-            {
-                return 0.0;
-            }
-            let delay_ms = DM_CONST_MS
-                * dm_pc_cm3
-                * (1.0 / (ref_freq_mhz * ref_freq_mhz) - 1.0 / (freq_mhz * freq_mhz));
-            delay_ms / 1e3
-        })
-        .collect()
+    dispersion_delays(freq_axis_mhz, ref_freq_mhz, dm_pc_cm3)
 }
 
 fn interpolate_series_value(series: &[(f64, f64)], target: f64) -> Option<f64> {
-    if series.len() < 2 {
-        return None;
-    }
-    if target <= series[0].0 || target >= series[series.len() - 1].0 {
-        return None;
-    }
-    let mut left = 0usize;
-    let mut right = series.len() - 1;
-    while left + 1 < right {
-        let mid = (left + right) / 2;
-        if series[mid].0 <= target {
-            left = mid;
-        } else {
-            right = mid;
-        }
-    }
-    let (t0, v0) = series[left];
-    let (t1, v1) = series[left + 1];
-    if !t0.is_finite() || !t1.is_finite() || t1 <= t0 {
-        return None;
-    }
-    let frac = ((target - t0) / (t1 - t0)).clamp(0.0, 1.0);
-    if !v0.is_finite() || !v1.is_finite() {
-        return None;
-    }
-    Some(v0 * (1.0 - frac) + v1 * frac)
+    interpolate_amplitude(series, target)
 }
 
 fn choose_subband_count(channels: usize) -> usize {
@@ -2045,7 +2042,7 @@ fn generate_rate_axis(len: usize, sample_dt: f64) -> Vec<f64> {
     }
     let sample_rate = 1.0 / sample_dt;
     let bin_width = sample_rate / len as f64;
-    let half = (len / 2) as isize;
+    let half = len.div_ceil(2) as isize;
     for idx in 0..len {
         let offset = idx as isize - half;
         axis.push(offset as f64 * bin_width);
@@ -2087,98 +2084,168 @@ fn estimate_fundamental_from_rate_diffs(
     points: &[RateProfileAboveAmpPoint],
     rate_bin_hz: f64,
 ) -> Option<RateFundamentalEstimate> {
-    if points.len() < 2 || !rate_bin_hz.is_finite() || rate_bin_hz <= 0.0 {
+    if points.len() < 3 || !rate_bin_hz.is_finite() || rate_bin_hz <= 0.0 {
         return None;
     }
-    let mut rates: Vec<f64> = points.iter().map(|p| p.rate_hz).collect();
-    rates.retain(|v| v.is_finite());
-    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    rates.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
-    if rates.len() < 2 {
-        return None;
-    }
-
-    let min_valid_gap_hz = (2.0 * rate_bin_hz).max(1e-12);
-    let adjacent_diffs: Vec<f64> = rates
-        .windows(2)
-        .filter_map(|pair| {
-            let dr = (pair[1] - pair[0]).abs();
-            if dr.is_finite() && dr >= min_valid_gap_hz {
-                Some(dr)
-            } else {
-                None
-            }
-        })
+    let mut rates: Vec<_> = points
+        .iter()
+        .map(|p| p.rate_hz)
+        .filter(|r| r.is_finite())
         .collect();
-    if adjacent_diffs.is_empty() {
+    rates.sort_by(f64::total_cmp);
+    rates.dedup_by(|a, b| (*a - *b).abs() < rate_bin_hz * 0.5);
+    let diffs: Vec<_> = rates.windows(2).map(|p| p[1] - p[0]).collect();
+    if diffs.len() < 2 {
         return None;
     }
-
-    let mut counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
-    for &dr in &adjacent_diffs {
-        let bin = (dr / rate_bin_hz).round() as i64;
-        if bin > 0 {
-            *counts.entry(bin).or_insert(0) += 1;
+    let mut candidates = Vec::new();
+    for &gap in &diffs {
+        for harmonic in 1..=8 {
+            candidates.push(gap / harmonic as f64);
         }
     }
-    if counts.is_empty() {
+    candidates.sort_by(|a, b| b.total_cmp(a));
+    for spacing in candidates {
+        if spacing < 2.0 * rate_bin_hz {
+            continue;
+        }
+        let multiples: Vec<_> = diffs.iter().map(|d| (d / spacing).round()).collect();
+        if diffs
+            .iter()
+            .zip(&multiples)
+            .any(|(d, m)| *m < 1.0 || *m > 8.0 || (d - m * spacing).abs() > rate_bin_hz)
+        {
+            continue;
+        }
+        let estimates: Vec<_> = diffs.iter().zip(&multiples).map(|(d, m)| d / m).collect();
+        let rate = estimates.iter().sum::<f64>() / estimates.len() as f64;
+        let sigma = (estimates.iter().map(|r| (r - rate).powi(2)).sum::<f64>()
+            / estimates.len() as f64)
+            .sqrt()
+            .max(rate_bin_hz / 12.0f64.sqrt());
+        return Some(RateFundamentalEstimate {
+            fundamental_rate_hz: rate,
+            fundamental_sigma_hz: sigma,
+            fundamental_count: estimates.len(),
+            period_s: 1.0 / rate,
+        });
+    }
+    None
+}
+
+/// Positive-frequency amplitude peaks supply seeds even when a fringe spectrum
+/// contains only two sidebands. The observed cadence must be uniform for an FFT.
+fn estimate_amplitude_period_candidates(
+    series: &[(f64, f64)],
+    durations: &[f64],
+) -> Result<Vec<f64>> {
+    if series.len() < 16 || durations.len() != series.len() {
+        return Ok(Vec::new());
+    }
+    let dt = durations[0];
+    if !dt.is_finite()
+        || dt <= 0.0
+        || durations
+            .iter()
+            .any(|d| !d.is_finite() || (*d - dt).abs() > dt * 1e-5)
+    {
+        return Err(anyhow!("unknown-mode FFT requires uniform sector durations; use known mode for variable cadence"));
+    }
+    if series.iter().any(|p| !p.1.is_finite()) {
+        return Err(anyhow!("invalid amplitude samples for period FFT"));
+    }
+    let mean = series.iter().map(|p| p.1).sum::<f64>() / series.len() as f64;
+    let mut buffer: Vec<_> = series
+        .iter()
+        .map(|p| Complex::new(p.1 - mean, 0.0))
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    planner.plan_fft_forward(buffer.len()).process(&mut buffer);
+    let amps: Vec<_> = buffer[1..buffer.len() / 2]
+        .iter()
+        .map(|v| v.norm())
+        .collect();
+    if amps.len() < 3 {
+        return Ok(Vec::new());
+    }
+    let mut sorted = amps.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median = median_of_sorted(&sorted);
+    let mut deviations: Vec<_> = amps.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_by(f64::total_cmp);
+    let noise = (median_of_sorted(&deviations) * 1.4826).max(median * 0.1);
+    let max_amp = amps.iter().copied().fold(0.0, f64::max);
+    if max_amp <= f64::EPSILON {
+        return Ok(Vec::new());
+    }
+    let threshold = (median + 6.0 * noise).max(max_amp * 0.1);
+    let mut peaks: Vec<_> = (1..amps.len() - 1)
+        .filter(|&i| amps[i] >= threshold && amps[i] > amps[i - 1] && amps[i] >= amps[i + 1])
+        .collect();
+    // The first positive bin is a valid low-frequency candidate.
+    if amps[0] >= threshold && amps[0] > amps[1] {
+        peaks.push(0);
+    }
+    peaks.sort_by(|&a, &b| amps[b].total_cmp(&amps[a]));
+    Ok(peaks
+        .into_iter()
+        .take(3)
+        .map(|i| series.len() as f64 * dt / (i + 1) as f64)
+        .collect())
+}
+
+/// Evidence for a periodic profile versus a constant signal, with a BIC penalty
+/// for fitted phase means. Adequate repeated exposure is required in each fit.
+fn score_period_evidence(
+    series: &[(f64, f64)],
+    weights: &[f64],
+    period: f64,
+    requested_bins: usize,
+) -> Option<f64> {
+    if !period.is_finite() || period <= 0.0 || series.len() != weights.len() {
         return None;
     }
-
-    let local_count = |bin: i64| -> usize {
-        let c0 = *counts.get(&(bin - 1)).unwrap_or(&0);
-        let c1 = *counts.get(&bin).unwrap_or(&0);
-        let c2 = *counts.get(&(bin + 1)).unwrap_or(&0);
-        c0 + c1 + c2
-    };
-
-    let best_bin = *counts.keys().max_by(|a, b| {
-        let ca = local_count(**a);
-        let cb = local_count(**b);
-        ca.cmp(&cb).then_with(|| b.cmp(a))
-    })?;
-    let selected_diffs: Vec<f64> = adjacent_diffs
+    let span = series.last()?.0 - series.first()?.0;
+    if span / period < 3.0 {
+        return None;
+    }
+    let dt = weights
         .iter()
         .copied()
-        .filter(|dr| {
-            let bin = (*dr / rate_bin_hz).round() as i64;
-            (best_bin - 1..=best_bin + 1).contains(&bin)
-        })
-        .collect();
-    if selected_diffs.is_empty() {
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let bins = requested_bins.min((period / dt).floor() as usize).max(3);
+    let folded = fold_profile(series, weights, period, bins).ok()?;
+    let mut total = 0.0;
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for (&(_, amp), &weight) in series.iter().zip(weights) {
+        if amp.is_finite() && weight.is_finite() && weight > 0.0 {
+            total += weight;
+            sum += amp * weight;
+            count += 1;
+        }
+    }
+    let occupied = folded.iter().filter(|p| p.1.is_finite()).count();
+    if total <= 0.0 || occupied < 3 || count < occupied * 4 {
         return None;
     }
-    let fundamental_rate_hz =
-        selected_diffs.iter().copied().sum::<f64>() / selected_diffs.len() as f64;
-    if !fundamental_rate_hz.is_finite() || fundamental_rate_hz <= 0.0 {
+    let mean = sum / total;
+    let mut baseline = 0.0;
+    let mut residual = 0.0;
+    for (&(time, amp), &weight) in series.iter().zip(weights) {
+        if !amp.is_finite() || !weight.is_finite() || weight <= 0.0 {
+            continue;
+        }
+        let bin = phase_bin(time, series[0].0, period, bins);
+        baseline += weight * (amp - mean).powi(2);
+        residual += weight * (amp - folded[bin].1).powi(2);
+    }
+    if baseline <= total * (mean.abs().max(1.0) * 1e-12).powi(2) {
         return None;
     }
-    let fundamental_sigma_hz = if selected_diffs.len() >= 2 {
-        let var = selected_diffs
-            .iter()
-            .map(|v| {
-                let dv = *v - fundamental_rate_hz;
-                dv * dv
-            })
-            .sum::<f64>()
-            / selected_diffs.len() as f64;
-        var.sqrt()
-    } else {
-        0.0
-    };
-    let sigma_window = fundamental_sigma_hz;
-    let fundamental_count = adjacent_diffs
-        .iter()
-        .filter(|&&d| (d - fundamental_rate_hz).abs() <= sigma_window)
-        .count();
-
-    let period_s = 1.0 / fundamental_rate_hz;
-    Some(RateFundamentalEstimate {
-        fundamental_rate_hz,
-        fundamental_sigma_hz,
-        fundamental_count: fundamental_count.max(1),
-        period_s,
-    })
+    let ratio = baseline / residual.max(baseline * 1e-12);
+    Some(count as f64 * ratio.ln() - (occupied - 1) as f64 * (count as f64).ln())
 }
 
 fn extract_rate_profile_from_delay_rate(
@@ -2356,7 +2423,11 @@ fn plot_folded_profile_from_period(
         .axis_desc_style(("sans-serif", scaled_font_size(22)).into_font())
         .draw()?;
     chart
-        .draw_series(LineSeries::new(folded.iter().copied(), &RED))?
+        .draw_series(
+            finite_segments(folded)
+                .into_iter()
+                .map(|segment| PathElement::new(segment, RED)),
+        )?
         .label("Folded profile")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], RED));
     chart
@@ -2374,6 +2445,127 @@ fn plot_folded_profile_from_period(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noise_does_not_pass_period_evidence_and_variable_cadence_is_rejected() {
+        let mut state = 12345u64;
+        let series: Vec<_> = (0..1024)
+            .map(|i| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (
+                    i as f64 * 0.01,
+                    1.0 + ((state >> 32) as f64 / u32::MAX as f64 - 0.5),
+                )
+            })
+            .collect();
+        let weights = vec![0.01; series.len()];
+        assert!(
+            select_refined_period(&series, &weights, &[0.253, 0.5], 32, 0.1)
+                .unwrap()
+                .is_none()
+        );
+        let mut unequal = weights.clone();
+        unequal[1] = 0.02;
+        assert!(estimate_amplitude_period_candidates(&series, &unequal).is_err());
+    }
+
+    #[test]
+    fn odd_length_rate_axis_matches_shared_fft_shift() {
+        for (actual, expected) in generate_rate_axis(5, 1.0)
+            .iter()
+            .zip([-0.6, -0.4, -0.2, 0.0, 0.2])
+        {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn two_sidebands_alone_do_not_establish_a_fundamental() {
+        let points = vec![
+            RateProfileAboveAmpPoint {
+                rate_hz: -2.0,
+                amplitude: 1.0,
+            },
+            RateProfileAboveAmpPoint {
+                rate_hz: 2.0,
+                amplitude: 1.0,
+            },
+        ];
+        assert!(estimate_fundamental_from_rate_diffs(&points, 0.01).is_none());
+    }
+
+    #[test]
+    fn harmonic_spacing_handles_missing_harmonics_and_has_resolution_uncertainty() {
+        let points: Vec<_> = [-6.0, -2.0, 4.0]
+            .iter()
+            .map(|&rate_hz| RateProfileAboveAmpPoint {
+                rate_hz,
+                amplitude: 1.0,
+            })
+            .collect();
+        let est = estimate_fundamental_from_rate_diffs(&points, 0.01).unwrap();
+        assert!((est.fundamental_rate_hz - 2.0).abs() < 1e-12);
+        assert!(est.fundamental_sigma_hz > 0.0);
+    }
+
+    #[test]
+    fn constant_signal_and_empty_bins_have_no_period_evidence_or_fold_snr() {
+        let series: Vec<_> = (0..1024).map(|i| (i as f64 * 0.01, 1.0)).collect();
+        let weights = vec![0.01; series.len()];
+        assert!(estimate_amplitude_period_candidates(&series, &weights)
+            .unwrap()
+            .is_empty());
+        assert!(score_period_evidence(&series, &weights, 0.5, 128).is_none());
+        let folded = fold_profile(&series[..10], &weights[..10], 0.5, 128).unwrap();
+        assert!(score_folded_profile_snr(&folded, 0.05).is_none());
+    }
+
+    #[test]
+    fn amplitude_period_search_avoids_half_and_double_period_aliases() {
+        let dt = 0.01;
+        let period = 0.5;
+        let series: Vec<_> = (0..1024)
+            .map(|i| {
+                let t = i as f64 * dt;
+                let phase = (t / period).rem_euclid(1.0);
+                let pulse = if phase < 0.15 { 3.0 } else { 0.0 };
+                (t, 1.0 + pulse + 0.1 * (i as f64 * 1.718).sin())
+            })
+            .collect();
+        let weights = vec![dt; series.len()];
+        let candidates = estimate_amplitude_period_candidates(&series, &weights).unwrap();
+        assert!(candidates.iter().any(|p| (*p - period).abs() < 0.02));
+        let true_score = score_period_evidence(&series, &weights, period, 32).unwrap();
+        assert!(true_score > score_period_evidence(&series, &weights, period / 2.0, 32).unwrap());
+        assert!(true_score > score_period_evidence(&series, &weights, period * 2.0, 32).unwrap());
+        let refined = select_refined_period(&series, &weights, &candidates, 32, 0.1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (refined.period_s - period).abs() < 0.002,
+            "candidates={:?}, refined={}",
+            candidates,
+            refined.period_s
+        );
+    }
+
+    #[test]
+    fn scalar_dedispersion_preserves_endpoints_and_marks_partial_band_missing() {
+        let series = vec![vec![(0.0, 1.0), (1.0, 1.0), (2.0, 1.0)]; 2];
+        let zero =
+            build_dedispersed_scalar_series(&series, &[1.0; 3], &[100.0, 200.0], 0.0).unwrap();
+        assert!(zero.iter().all(|p| p.1 == 1.0));
+        let shifted =
+            build_dedispersed_scalar_series(&series, &[1.0; 3], &[100.0, 200.0], 1.0).unwrap();
+        assert!(shifted[0].1.is_nan());
+        assert_eq!(shifted[1].1, 1.0);
+    }
+
+    #[test]
+    fn short_period_fine_window_does_not_panic() {
+        let half = choose_period_refine_fine_half_span(0.001, 1000.0, 2e-6, 1e-8, None);
+        assert!(half.is_finite() && half > 0.0);
+    }
 
     #[test]
     fn shell_quote_arg_wraps_spaces_and_apostrophes() {

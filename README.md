@@ -269,16 +269,20 @@ cargo run -p frinZ-tools --bin pulsar_gating --release -- --help
 #### Modes
 
 - **Known mode** (`--period` required, `--dm` optional): Performs dedispersion (if DM is given), fold, on/off pulse bin selection, and gated spectrum/profile products.
-- **Unknown mode** (`--period` omitted): Estimates period from fringe-derived products, estimates DM from sub-band delay fit, writes handoff parameters, then automatically runs known mode with estimated values.
+- **Unknown mode** (`--period` omitted): Estimates period from detected-amplitude FFT peaks with fringe-spacing diagnostics, estimates DM from a dedispersion scan, writes handoff parameters, then automatically runs known mode with estimated values.
 
 #### Core algorithm flow
 
-1. Read `.cor` sectors and build channel-wise time series.
-2. Build fringe products (`rate spectrum`, `delay-rate` plane).
-3. Estimate period from spacing of periodic peaks in the rate spectrum (`rate-diff`).
-4. Refine period by fold-SNR scan.
-5. Estimate DM by fitting delay vs `1/f^2` from phase-shifted sub-band folded profiles.
-6. Run known-mode gating with selected/refined parameters.
+1. Read `.cor` sectors using their measured integration times, without cadence rounding.
+2. Detect narrowband RFI and build channel-wise detected-amplitude time series.
+3. Find significant amplitude FFT peaks. Fringe rate peak spacing is a diagnostic candidate and requires at least three peaks; gaps may contain missing harmonics.
+4. Compare each candidate, its half period, and its double period. Refine using evidence for a folded profile against a constant model, penalizing the number of fitted phase means (BIC gain must exceed 10). Unknown-mode FFT requires uniform cadence and at least 16 sectors.
+5. Estimate DM with a coarse/fine dedispersion scan using a common valid time interval for every trial in each grid. A separate sub-band phase fit provides diagnostics; its R² does not validate the selected scan DM.
+6. Run known-mode gating with the selected parameters.
+
+Dedispersion interpolates detected amplitudes, preserving exact endpoints. Full-band time samples that cannot be reconstructed are missing, and empty phase bins are `NaN`. Fold and phase heatmaps use integration-time weighted means, applying the weight once. `*_profile.csv` includes `exposure_s`; on/off selection uses observed bins and reserves at least two off bins (`--bins` must be at least 3).
+
+`*_gated_visibilities.csv` separately records complex on/off means and their difference, with channel-specific exposure weights. Dispersion shifts the gate applied to original complex samples rather than interpolating their fringe phase. Original residual fringe phase is retained; this product does not apply fringe stopping or calibration.
 
 Estimated/refined period and estimated DM are printed to stdout.
 
@@ -288,7 +292,7 @@ Estimated/refined period and estimated DM are printed to stdout.
 
 1. **Before gating (folded profile)**
    - On-pulse bins are chosen by `--on-duty` (largest folded amplitudes).
-   - Off-pulse bins are the remaining bins.
+   - Off-pulse bins are the remaining observed bins; missing bins are excluded.
    - `off_mean` and `off_sigma` are computed from off-pulse folded amplitudes.
    - `Estimated S/N` is:
      - `(peak_amp - off_mean) / off_sigma`
@@ -300,8 +304,7 @@ Estimated/refined period and estimated DM are printed to stdout.
      - `off_sigma`: standard deviation of off-pulse sector amplitudes
    - `Gated time S/N` is:
      - `(on_mean - off_mean) / off_sigma`
-   - `Gated profile S/N` is computed from channel-subtracted time series (`on-off`) as:
-     - `peak(on-off) / sigma(off on-off)`
+   - `Gated profile S/N` uses the peak and off-pulse noise of the folded profile, in the same amplitude units. Subtracting the off mean preserves that S/N; it is not a new independent detection significance.
 
 In stdout and `*_summary.txt`, these appear as:
 - `Estimated S/N` (pre-gating folded profile)
@@ -315,7 +318,7 @@ In stdout and `*_summary.txt`, these appear as:
 
 1. **ゲーティング前（folded profile）**
    - `--on-duty` で指定した割合だけ、振幅の大きい位相ビンを on-pulse として選択します。
-   - 残りの位相ビンを off-pulse とします。
+   - 残りの観測済み位相ビンを off-pulse とし、欠損ビンは平均・標準偏差から除外します。
    - off-pulse の振幅から `off_mean` と `off_sigma` を計算します。
    - `Estimated S/N` は次式です。
      - `(peak_amp - off_mean) / off_sigma`
@@ -327,8 +330,7 @@ In stdout and `*_summary.txt`, these appear as:
      - `off_sigma`: off-pulse セクター振幅の標準偏差
    - `Gated time S/N` は次式です。
      - `(on_mean - off_mean) / off_sigma`
-   - `Gated profile S/N` は、チャネルごとの off 平均を引いた on-off 時系列から計算し、次式で定義します。
-     - `peak(on-off) / sigma(off on-off)`
+   - `Gated profile S/N` は、folded profile のピークと off-pulse ビンのノイズから計算します。off 平均の減算では S/N は変わらず、独立した検出有意度ではありません。
 
 `stdout` と `*_summary.txt` では、主に以下の項目として表示されます。
 - `Estimated S/N`（ゲーティング前 folded profile）
@@ -341,22 +343,25 @@ In stdout and `*_summary.txt`, these appear as:
 - `*_rate_spectrum.png` – rate profile with threshold/periodic markers.
 - `*_rate_spectrum_above_amp.csv` – points above `--amp-threshold`.
 - `*_rate_spectrum_periodic_peaks.csv` – periodic peak candidates used for period spacing.
-- `*_delay_rate_peakscan.png` – delay-window peak scan map.
-- `*_rate_diff_folded_profile.png` – folded profile from rate-diff period (when available).
+- `*_rate_diff_folded_profile.png` – amplitude fold at the selected period (`--full-output` and available fringe-spacing diagnostics).
 - `*_dm_fit_points.csv` – DM fit points and residuals (when DM estimation succeeds).
 - `*_unknown_handoff.txt` – estimated `period`, `dm`, and reproducible command.
-- `*_profile.csv`, `*_folded_profile.png` – fold result from known-mode stage.
+- `*_profile.csv`, `*_folded_profile.png` – fold result and phase-bin exposures from known mode.
+- `*_gated_visibilities.csv` – phase-preserving complex on/off means, difference, and per-channel exposures.
 - `*_gated_spectrum_difference.csv`, `*_gated_spectrum.png`
 - `*_gated_profile.csv`, `*_gated_profile.png`
 - `*_onoff_pulse_bins.txt`, `*_summary.txt`
-- `*_dedispersed_time_series.csv`, `*_dedispersed_time_series.png`
-- `*_raw_phase_heatmap.png`, `*_phase_aligned_heatmap.png`, `*_phase_aligned_onminusoff_heatmap.png`
-- `*_gated_spectrum_on.csv`, `*_gated_spectrum_off.csv`
-- `*_gated_time_series.csv`, `*_gated_time_series.png`
-- `*_gated_time_series_diff.csv`, `*_gated_time_series_diff.png`
+- `*_dedispersed_time_series.csv`, `*_dedispersed_time_series.png` (`--full-output`)
+- `*_phase_freq_before_gating.png`, `*_phase_freq_after_dm_before_gating.png` (when DM is specified), `*_phase_freq_after_gating.png`
+- `*_gated_spectrum_on.csv`, `*_gated_spectrum_off.csv` (`--full-output`)
+- `*_gated_time_series.csv`, `*_gated_time_series.png` (`--full-output`)
+- `*_gated_time_series_diff.csv`, `*_gated_time_series_diff.png` (`--full-output`)
 
 #### Notes
 
+- `--period` is the apparent period in the observation time frame. Barycentric timing, spin-down, and binary motion are not modeled.
+- Channel delay correction cannot recover structure smeared within a channel or a sector integration; increasing `--bins` does not increase the input time resolution.
+- Explicit `--amp-threshold` values are respected; automatic threshold relaxation applies only when the option is omitted.
 - Recent versions intentionally reduce redundant CSV/PNG generation to shorten runtime and reduce disk usage.
 - Legacy files from older naming/output schemes are cleaned up automatically when running `pulsar_gating`.
 

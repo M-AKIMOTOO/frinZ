@@ -1,6 +1,6 @@
 [package]
 name = "frinZ-tools"
-version = "4.5.3"
+version = "4.6.0"
 edition = "2021"
 publish = false
 
@@ -32,6 +32,7 @@ memmap2 = "0.9"
 nalgebra = "0.33"
 ndarray = "0.16.1"
 num-complex = "0.4.2"
+rustfft = "6.1.0"
 plotters = "0.3.7"
 image = { version = "0.25.6", features = ["png"] }
 imagequant = "4.4.1"

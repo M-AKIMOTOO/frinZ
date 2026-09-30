@@ -12,7 +12,7 @@ use ndarray::Array2;
 use num_complex::Complex;
 
 use crate::analysis::AnalysisResults;
-use crate::args::Args;
+use crate::args::{Args, DEFAULT_RATE_PADDING};
 use crate::bandpass;
 use crate::fft::apply_phase_correction_in_place_at_frequency;
 use crate::header::CorHeader;
@@ -97,7 +97,7 @@ impl Default for LibraryOptions {
             rate_window: None,
             delay_rate_mask: None,
             frequency_window_mhz: None,
-            rate_padding: 1,
+            rate_padding: DEFAULT_RATE_PADDING,
             iter: 5,
             cpu: 0,
             bandpass: None,

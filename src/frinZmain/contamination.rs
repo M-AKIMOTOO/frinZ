@@ -1221,7 +1221,10 @@ mod tests {
 
         assert_eq!(handoff.format_version, 5);
         assert_eq!(handoff.projection.analysis_rows, 512);
-        assert_eq!(handoff.projection.rate_padding, 1);
+        assert_eq!(
+            handoff.projection.rate_padding,
+            crate::args::DEFAULT_RATE_PADDING
+        );
         assert!(!handoff.projection.bandpass_applied);
         assert_eq!(handoff.spectral_setup.channels, 1);
         assert_eq!(handoff.spectral_setup.original_channels, 512);

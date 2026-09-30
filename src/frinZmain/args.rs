@@ -9,6 +9,8 @@ use crate::rfi::RfiMask;
 use crate::header::{available_cor_sectors, parse_header};
 use crate::input_support::read_input_prefix;
 
+pub const DEFAULT_RATE_PADDING: u32 = 8;
+
 #[derive(Clone, Copy)]
 struct PrefixAliasSpec {
     arg_id: &'static str,
@@ -294,7 +296,7 @@ pub struct Args {
     pub frange: Vec<f32>,
 
     /// Rate FFT padding.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = DEFAULT_RATE_PADDING)]
     pub rate_padding: u32,
 
     /// Cumulate length [s].
@@ -510,7 +512,7 @@ impl Default for Args {
             rrange: Vec::new(),
             mask: Vec::new(),
             frange: Vec::new(),
-            rate_padding: 1,
+            rate_padding: DEFAULT_RATE_PADDING,
             cumulate: 0,
             add_plot: false,
             wwz: false,

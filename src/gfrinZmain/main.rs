@@ -276,7 +276,7 @@ struct Cli {
     ts: Option<f32>,
 
     /// Padding factor for rate FFT (as in frinZ --rate-padding)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = frinZ::args::DEFAULT_RATE_PADDING)]
     rate_padding: u32,
 
     /// Precise search around the peak (as in frinZ --search)

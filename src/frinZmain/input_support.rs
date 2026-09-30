@@ -1,7 +1,7 @@
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use zstd::stream::read::Decoder;
 
@@ -63,7 +63,9 @@ pub fn read_input_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
 
 pub fn open_input_data(path: &Path) -> Result<InputData, Box<dyn Error>> {
     if is_zstd_input(path) {
-        Ok(InputData::Buffer(read_input_bytes(path)?))
+        let decoded = decompress_to_file(path)?;
+        let mmap = unsafe { Mmap::map(&decoded)? };
+        Ok(InputData::Mmap(mmap))
     } else {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -73,12 +75,23 @@ pub fn open_input_data(path: &Path) -> Result<InputData, Box<dyn Error>> {
 
 pub fn open_input_data_copy_on_write(path: &Path) -> Result<InputData, Box<dyn Error>> {
     if is_zstd_input(path) {
-        Ok(InputData::Buffer(read_input_bytes(path)?))
+        let decoded = decompress_to_file(path)?;
+        let mmap = unsafe { MmapOptions::new().map_mut(&decoded)? };
+        Ok(InputData::CopyOnWrite(mmap))
     } else {
         let file = File::open(path)?;
         let mmap = unsafe { MmapOptions::new().map_copy(&file)? };
         Ok(InputData::CopyOnWrite(mmap))
     }
+}
+
+// Keep decoded input in a temporary backing file instead of a file-sized Vec.
+// TMPDIR can select a disk with enough space for large compressed observations.
+fn decompress_to_file(path: &Path) -> Result<File, Box<dyn Error>> {
+    let mut decoder = Decoder::new(File::open(path)?)?;
+    let mut decoded = tempfile::tempfile()?;
+    io::copy(&mut decoder, &mut decoded)?;
+    Ok(decoded)
 }
 
 #[allow(dead_code)]

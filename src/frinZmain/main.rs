@@ -4,7 +4,7 @@ use clap::{parser::ValueSource, FromArgMatches};
 use num_complex::Complex;
 use std::error::Error;
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -17,7 +17,7 @@ use frinZ::folding::run_folding_analysis;
 use frinZ::frmap::run_fringe_rate_map_analysis;
 use frinZ::inband::run_inband_analysis;
 use frinZ::inbeam_vlbi::run_inbeam_vlbi_analysis;
-use frinZ::input_support::read_input_bytes;
+use frinZ::input_support::{open_input_data, read_input_prefix};
 use frinZ::maser::run_maser_analysis;
 use frinZ::mkcor::run_mkcor;
 use frinZ::multisideband::run_multisideband_analysis;
@@ -134,7 +134,7 @@ fn filename_timestamp_key(path: &Path) -> Option<String> {
 }
 
 fn read_cor_header_from_path(path: &Path) -> Result<frinZ::header::CorHeader, Box<dyn Error>> {
-    let buffer = read_input_bytes(path)?;
+    let buffer = read_input_prefix(path, 256)?;
     let mut cursor = Cursor::new(buffer.as_slice());
     Ok(frinZ::header::parse_header(&mut cursor)?)
 }
@@ -338,7 +338,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         let base_filename = input_path.file_stem().unwrap().to_str().unwrap();
 
-        let buffer = match read_input_bytes(input_path) {
+        let buffer = match open_input_data(input_path) {
             Ok(buf) => buf,
             Err(e) => {
                 eprintln!("Error reading input file {:?}: {}", input_path, e);
@@ -358,7 +358,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let output_file_path = output_dir.join(format!("{}.cor.bin", base_filename));
 
         let mut output_file = match fs::File::create(&output_file_path) {
-            Ok(f) => f,
+            Ok(f) => BufWriter::with_capacity(64 * 1024, f),
             Err(e) => {
                 eprintln!("Error creating output file {:?}: {}", output_file_path, e);
                 exit(1);
@@ -424,10 +424,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "Warning: Wrote {} sectors, expected {} sectors.",
                 sectors_written, header.number_of_sector
             );
-            if let Err(e) = output_file.flush() {
-                eprintln!("Error flushing output file: {}", e);
-                exit(1);
-            }
+        }
+        if let Err(e) = output_file.flush() {
+            eprintln!("Error flushing output file: {}", e);
+            exit(1);
         }
         println!(
             "Raw complex visibility data written to {:?}.",

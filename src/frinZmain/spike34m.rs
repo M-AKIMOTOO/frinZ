@@ -11,7 +11,7 @@ use crate::args::Args;
 use crate::fft::{apply_phase_correction_in_place_at_frequency, cached_fft_plan};
 use crate::fitting;
 use crate::header::{available_cor_sectors, parse_header, CorHeader};
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::output::insert_product_before_processing_suffixes;
 use crate::plot::{
     plot_spectrum_amplitude_heatmap_with_spikes, plot_spectrum_phase_heatmap_with_spikes,
@@ -45,10 +45,10 @@ fn output_dir(input_path: &Path) -> PathBuf {
 }
 
 pub fn read_all_spectra(path: &Path) -> Result<SpectraRead, Box<dyn Error>> {
-    let buffer = read_input_bytes(path)?;
+    let buffer = open_input_data(path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
-    let available = available_cor_sectors(&header, buffer.len())?;
+    let available = available_cor_sectors(&header, buffer.as_slice().len())?;
     if available == 0 {
         return Err("truncated .cor file: no complete visibility sectors are available".into());
     }
@@ -2009,7 +2009,7 @@ pub fn run_spike34m_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         out_dir.join(format!("{stem}_delay_time_offset_boundary.tsv"));
     let rate_spectrum_png = out_dir.join(format!("{stem}_rate_spectrum_search_corrected.png"));
     let rate_spectrum_tsv = out_dir.join(format!("{stem}_rate_spectrum_search_corrected.tsv"));
-    let buffer = read_input_bytes(input_path)?;
+    let buffer = open_input_data(input_path)?;
     let mut time_cursor = Cursor::new(buffer.as_slice());
     let _time_header = parse_header(&mut time_cursor)?;
     time_cursor.set_position(0);

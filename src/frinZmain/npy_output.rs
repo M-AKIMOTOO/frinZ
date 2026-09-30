@@ -1,9 +1,8 @@
 //! Compressed self-describing NumPy NPZ sidecars for analysis and plot data.
-use flate2::write::DeflateEncoder;
-use flate2::Compression;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::output::insert_product_before_processing_suffixes;
 
@@ -61,12 +60,11 @@ pub fn write_complex_1d(
     values: &[num_complex::Complex<f32>],
     axis0: &[f64],
 ) -> io::Result<()> {
-    write_npy(
+    write_complex_nd(
         path,
         meta,
         &[values.len()],
-        values.iter().map(|v| v.re),
-        values.iter().map(|v| v.im),
+        values.iter().copied(),
         axis0,
         &[],
     )
@@ -78,12 +76,11 @@ pub fn write_real_1d(
     values: &[f32],
     axis0: &[f64],
 ) -> io::Result<()> {
-    write_npy(
+    write_complex_nd(
         path,
         meta,
         &[values.len()],
-        values.iter().copied(),
-        std::iter::repeat_n(0.0, values.len()),
+        values.iter().map(|&re| num_complex::Complex::new(re, 0.0)),
         axis0,
         &[],
     )
@@ -97,17 +94,7 @@ pub fn write_complex_2d(
     axis0: &[f64],
     axis1: &[f64],
 ) -> io::Result<()> {
-    let values: Vec<_> = values.into_iter().collect();
-    validate_len(values.len(), shape)?;
-    write_npy(
-        path,
-        meta,
-        &[shape.0, shape.1],
-        values.iter().map(|v| v.re),
-        values.iter().map(|v| v.im),
-        axis0,
-        axis1,
-    )
+    write_complex_nd(path, meta, &[shape.0, shape.1], values, axis0, axis1)
 }
 #[allow(dead_code)]
 pub fn write_real_2d(
@@ -118,156 +105,198 @@ pub fn write_real_2d(
     axis0: &[f64],
     axis1: &[f64],
 ) -> io::Result<()> {
-    let values: Vec<_> = values.into_iter().collect();
-    validate_len(values.len(), shape)?;
-    write_npy(
+    write_complex_nd(
         path,
         meta,
         &[shape.0, shape.1],
-        values.iter().copied(),
-        std::iter::repeat_n(0.0, values.len()),
+        values
+            .into_iter()
+            .map(|re| num_complex::Complex::new(re, 0.0)),
         axis0,
         axis1,
     )
 }
 
+/// Stream compressed entries to a temporary archive rather than retaining arrays.
+/// Metadata methods defer I/O errors until write; array methods report them immediately.
 #[allow(dead_code)]
 pub struct NamedNpz {
-    entries: Vec<(String, Vec<u8>)>,
+    writer: Option<ZipWriter<BufWriter<File>>>,
+    error: Option<io::Error>,
 }
-
 #[allow(dead_code)]
 impl NamedNpz {
     pub fn new(meta: NpyMeta<'_>) -> Self {
-        let u32_payload = |values: &[u32]| {
-            values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<u8>>()
+        let mut output = match tempfile::tempfile() {
+            Ok(file) => Self {
+                writer: Some(ZipWriter::new(BufWriter::with_capacity(64 * 1024, file))),
+                error: None,
+            },
+            Err(error) => Self {
+                writer: None,
+                error: Some(error),
+            },
         };
-        let text_entry = |name: &str, value: &str| {
-            (
-                name.to_string(),
-                make_npy("|u1", &[value.len()], value.as_bytes()),
-            )
-        };
-        Self {
-            entries: vec![
-                text_entry("flag.npy", meta.flag),
-                (
-                    "fft_point.npy".to_string(),
-                    make_npy("<u4", &[1], &u32_payload(&[meta.fft_point])),
-                ),
-                (
-                    "pp.npy".to_string(),
-                    make_npy("<u4", &[1], &u32_payload(&[meta.pp])),
-                ),
-                (
-                    "format_version.npy".to_string(),
-                    make_npy("<u4", &[1], &u32_payload(&[FORMAT_VERSION])),
-                ),
-            ],
+        output.add_u8_1d("flag", meta.flag.as_bytes());
+        for (name, value) in [
+            ("fft_point", meta.fft_point),
+            ("pp", meta.pp),
+            ("format_version", FORMAT_VERSION),
+        ] {
+            let _ = output.add_array(name, "<u4", &[1], 4, value.to_le_bytes());
         }
+        output
     }
-
+    fn add_array(
+        &mut self,
+        name: &str,
+        descr: &str,
+        shape: &[usize],
+        item_size: usize,
+        bytes: impl IntoIterator<Item = u8>,
+    ) -> io::Result<()> {
+        if let Some(error) = &self.error {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
+        let result = (|| {
+            let byte_count = shape.iter().try_fold(item_size, |count, &dim| {
+                count.checked_mul(dim).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "NPY shape overflow")
+                })
+            })?;
+            let header = make_npy(descr, shape, &[]);
+            let entry_size = byte_count.checked_add(header.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "NPY entry size overflow")
+            })?;
+            let writer = self.writer.as_mut().expect("NPZ writer initialized");
+            writer.start_file(format!("{name}.npy"), npz_options(entry_size))?;
+            writer.write_all(&header)?;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut used = 0;
+            let mut count = 0usize;
+            for byte in bytes {
+                if count == byte_count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "NPY data length exceeds shape",
+                    ));
+                }
+                buffer[used] = byte;
+                used += 1;
+                count += 1;
+                if used == buffer.len() {
+                    writer.write_all(&buffer)?;
+                    used = 0;
+                }
+            }
+            if count != byte_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("NPY data length {count} bytes does not match {byte_count}"),
+                ));
+            }
+            writer.write_all(&buffer[..used])
+        })();
+        if let Err(error) = &result {
+            self.error = Some(io::Error::new(error.kind(), error.to_string()));
+        }
+        result
+    }
     pub fn add_f64_1d(&mut self, name: &str, values: &[f64]) {
-        let payload = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>();
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("<f8", &[values.len()], &payload),
-        ));
+        let _ = self.add_array(
+            name,
+            "<f8",
+            &[values.len()],
+            8,
+            values.iter().flat_map(|value| value.to_le_bytes()),
+        );
     }
-
     pub fn add_f32_1d(&mut self, name: &str, values: &[f32]) {
-        let payload = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>();
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("<f4", &[values.len()], &payload),
-        ));
+        let _ = self.add_array(
+            name,
+            "<f4",
+            &[values.len()],
+            4,
+            values.iter().flat_map(|value| value.to_le_bytes()),
+        );
     }
-
     pub fn add_u8_1d(&mut self, name: &str, values: &[u8]) {
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("|u1", &[values.len()], values),
-        ));
+        let _ = self.add_array(name, "|u1", &[values.len()], 1, values.iter().copied());
     }
-
     pub fn add_u8_2d(
         &mut self,
         name: &str,
         shape: (usize, usize),
         values: impl IntoIterator<Item = u8>,
     ) -> io::Result<()> {
-        let values: Vec<u8> = values.into_iter().collect();
-        validate_len(values.len(), shape)?;
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("|u1", &[shape.0, shape.1], &values),
-        ));
-        Ok(())
+        self.add_array(name, "|u1", &[shape.0, shape.1], 1, values)
     }
-
     pub fn add_complex64_1d(&mut self, name: &str, values: &[num_complex::Complex<f32>]) {
-        let mut payload = Vec::with_capacity(values.len() * 8);
-        for value in values {
-            payload.extend_from_slice(&value.re.to_le_bytes());
-            payload.extend_from_slice(&value.im.to_le_bytes());
-        }
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("<c8", &[values.len()], &payload),
-        ));
+        let _ = self.add_complex64_inner(name, &[values.len()], values.iter().copied());
     }
-
     pub fn add_f32_2d(
         &mut self,
         name: &str,
         shape: (usize, usize),
         values: impl IntoIterator<Item = f32>,
     ) -> io::Result<()> {
-        let values: Vec<f32> = values.into_iter().collect();
-        validate_len(values.len(), shape)?;
-        let payload = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>();
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("<f4", &[shape.0, shape.1], &payload),
-        ));
-        Ok(())
+        self.add_array(
+            name,
+            "<f4",
+            &[shape.0, shape.1],
+            4,
+            values.into_iter().flat_map(|value| value.to_le_bytes()),
+        )
     }
-
     pub fn add_complex64_2d(
         &mut self,
         name: &str,
         shape: (usize, usize),
         values: impl IntoIterator<Item = num_complex::Complex<f32>>,
     ) -> io::Result<()> {
-        let values: Vec<num_complex::Complex<f32>> = values.into_iter().collect();
-        validate_len(values.len(), shape)?;
-        let mut payload = Vec::with_capacity(values.len() * 8);
-        for value in values {
-            payload.extend_from_slice(&value.re.to_le_bytes());
-            payload.extend_from_slice(&value.im.to_le_bytes());
+        self.add_complex64_inner(name, &[shape.0, shape.1], values)
+    }
+    fn add_complex64_inner(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        values: impl IntoIterator<Item = num_complex::Complex<f32>>,
+    ) -> io::Result<()> {
+        self.add_array(
+            name,
+            "<c8",
+            shape,
+            8,
+            values.into_iter().flat_map(|value| {
+                let mut bytes = [0u8; 8];
+                bytes[..4].copy_from_slice(&value.re.to_le_bytes());
+                bytes[4..].copy_from_slice(&value.im.to_le_bytes());
+                bytes
+            }),
+        )
+    }
+    pub fn write(mut self, path: &Path) -> io::Result<()> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
         }
-        self.entries.push((
-            format!("{name}.npy"),
-            make_npy("<c8", &[shape.0, shape.1], &payload),
-        ));
-        Ok(())
+        let mut source = self
+            .writer
+            .take()
+            .expect("NPZ writer initialized")
+            .finish()?;
+        source.flush()?;
+        source.seek(SeekFrom::Start(0))?;
+        let mut destination = BufWriter::with_capacity(64 * 1024, File::create(path)?);
+        io::copy(source.get_mut(), &mut destination)?;
+        destination.flush()
     }
-
-    pub fn write(self, path: &Path) -> io::Result<()> {
-        write_npz(path, &self.entries)
-    }
+}
+fn npz_options(entry_size: usize) -> SimpleFileOptions {
+    SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        // Reserve ZIP64 before compression can push a near-limit entry past 4 GiB.
+        .compression_level(Some(9))
+        .large_file(entry_size >= u32::MAX as usize / 2)
 }
 
 pub fn write_named_real_1d_npz(
@@ -275,66 +304,25 @@ pub fn write_named_real_1d_npz(
     meta: NpyMeta<'_>,
     series: &[(&str, &[f64])],
 ) -> io::Result<()> {
-    let u32_payload = |values: &[u32]| {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>()
-    };
-    let text_entry = |name: &str, value: &str| {
-        (
-            name.to_string(),
-            make_npy("|u1", &[value.len()], value.as_bytes()),
-        )
-    };
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(series.len() + 5);
+    let mut output = NamedNpz::new(meta);
     for (name, values) in series {
-        let payload = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>();
-        entries.push((
-            format!("{name}.npy"),
-            make_npy("<f8", &[values.len()], &payload),
-        ));
+        output.add_f64_1d(name, values);
     }
-    entries.push(text_entry("flag.npy", meta.flag));
-    entries.push((
-        "fft_point.npy".to_string(),
-        make_npy("<u4", &[1], &u32_payload(&[meta.fft_point])),
-    ));
-    entries.push((
-        "pp.npy".to_string(),
-        make_npy("<u4", &[1], &u32_payload(&[meta.pp])),
-    ));
-    entries.push((
-        "format_version.npy".to_string(),
-        make_npy("<u4", &[1], &u32_payload(&[FORMAT_VERSION])),
-    ));
-    entries.push((
-        "series_count.npy".to_string(),
-        make_npy("<u4", &[1], &u32_payload(&[series.len() as u32])),
-    ));
-    write_npz(path, &entries)
+    output.add_array(
+        "series_count",
+        "<u4",
+        &[1],
+        4,
+        (series.len() as u32).to_le_bytes(),
+    )?;
+    output.write(path)
 }
 
-fn validate_len(len: usize, shape: (usize, usize)) -> io::Result<()> {
-    if len != shape.0.saturating_mul(shape.1) {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("npy data length {len} does not match shape {shape:?}"),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn write_npy(
+fn write_complex_nd(
     path: &Path,
     meta: NpyMeta<'_>,
     shape: &[usize],
-    real: impl IntoIterator<Item = f32>,
-    imag: impl IntoIterator<Item = f32>,
+    values: impl IntoIterator<Item = num_complex::Complex<f32>>,
     axis0: &[f64],
     axis1: &[f64],
 ) -> io::Result<()> {
@@ -344,88 +332,31 @@ fn write_npy(
             "NPZ sidecars support rank 1 or 2",
         ));
     }
-    let element_count = shape.iter().product::<usize>();
-    let real: Vec<f32> = real.into_iter().collect();
-    let imag: Vec<f32> = imag.into_iter().collect();
-    if real.len() != element_count || imag.len() != element_count {
+    if (!axis0.is_empty() && axis0.len() != shape[0])
+        || (shape.len() == 2 && !axis1.is_empty() && axis1.len() != shape[1])
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "complex data length mismatch",
+            "axis length mismatch",
         ));
     }
-    if !axis0.is_empty() && axis0.len() != shape[0] {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "axis0 length mismatch",
-        ));
-    }
-    if shape.len() == 2 && !axis1.is_empty() && axis1.len() != shape[1] {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "axis1 length mismatch",
-        ));
-    }
-
-    let mut complex_payload = Vec::with_capacity(element_count * 8);
-    for (re, im) in real.iter().zip(imag.iter()) {
-        complex_payload.extend_from_slice(&re.to_le_bytes());
-        complex_payload.extend_from_slice(&im.to_le_bytes());
-    }
-    let f64_payload = |values: &[f64]| {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>()
-    };
-    let u32_payload = |values: &[u32]| {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<u8>>()
-    };
-    let text_entry = |name: &str, value: &str| {
-        (
-            name.to_string(),
-            make_npy("|u1", &[value.len()], value.as_bytes()),
-        )
-    };
+    let mut output = NamedNpz::new(meta);
+    output.add_complex64_inner("data", shape, values)?;
+    output.add_f64_1d("axis0", axis0);
+    output.add_f64_1d("axis1", axis1);
+    output.add_u8_1d("axis0_name", meta.axis0_name.as_bytes());
+    output.add_u8_1d("axis0_unit", meta.axis0_unit.as_bytes());
+    output.add_u8_1d("axis1_name", meta.axis1_name.as_bytes());
+    output.add_u8_1d("axis1_unit", meta.axis1_unit.as_bytes());
     let shape_values = [shape[0] as u32, shape.get(1).copied().unwrap_or(0) as u32];
-    let entries = vec![
-        (
-            "data.npy".to_string(),
-            make_npy("<c8", shape, &complex_payload),
-        ),
-        (
-            "axis0.npy".to_string(),
-            make_npy("<f8", &[axis0.len()], &f64_payload(axis0)),
-        ),
-        (
-            "axis1.npy".to_string(),
-            make_npy("<f8", &[axis1.len()], &f64_payload(axis1)),
-        ),
-        text_entry("flag.npy", meta.flag),
-        text_entry("axis0_name.npy", meta.axis0_name),
-        text_entry("axis0_unit.npy", meta.axis0_unit),
-        text_entry("axis1_name.npy", meta.axis1_name),
-        text_entry("axis1_unit.npy", meta.axis1_unit),
-        (
-            "fft_point.npy".to_string(),
-            make_npy("<u4", &[1], &u32_payload(&[meta.fft_point])),
-        ),
-        (
-            "pp.npy".to_string(),
-            make_npy("<u4", &[1], &u32_payload(&[meta.pp])),
-        ),
-        (
-            "format_version.npy".to_string(),
-            make_npy("<u4", &[1], &u32_payload(&[FORMAT_VERSION])),
-        ),
-        (
-            "shape.npy".to_string(),
-            make_npy("<u4", &[2], &u32_payload(&shape_values)),
-        ),
-    ];
-    write_npz(path, &entries)
+    output.add_array(
+        "shape",
+        "<u4",
+        &[2],
+        4,
+        shape_values.iter().flat_map(|value| value.to_le_bytes()),
+    )?;
+    output.write(path)
 }
 
 fn make_npy(descr: &str, shape: &[usize], payload: &[u8]) -> Vec<u8> {
@@ -443,94 +374,6 @@ fn make_npy(descr: &str, shape: &[usize], payload: &[u8]) -> Vec<u8> {
     output.extend_from_slice(&header);
     output.extend_from_slice(payload);
     output
-}
-
-fn write_npz(path: &Path, entries: &[(String, Vec<u8>)]) -> io::Result<()> {
-    struct CentralEntry {
-        name: String,
-        crc: u32,
-        compressed: u32,
-        uncompressed: u32,
-        offset: u32,
-    }
-    let mut out = BufWriter::new(File::create(path)?);
-    let mut central = Vec::with_capacity(entries.len());
-    let mut offset = 0_u32;
-    for (name, npy) in entries {
-        let name_bytes = name.as_bytes();
-        let uncompressed = u32::try_from(npy.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "NPZ entry exceeds ZIP32 size limit",
-            )
-        })?;
-        let crc = crc32fast::hash(npy);
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
-        encoder.write_all(npy)?;
-        let compressed_data = encoder.finish()?;
-        let compressed = u32::try_from(compressed_data.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "compressed NPZ entry exceeds ZIP32 size limit",
-            )
-        })?;
-        out.write_all(&0x04034b50_u32.to_le_bytes())?;
-        out.write_all(&20_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&8_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&crc.to_le_bytes())?;
-        out.write_all(&compressed.to_le_bytes())?;
-        out.write_all(&uncompressed.to_le_bytes())?;
-        out.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(name_bytes)?;
-        out.write_all(&compressed_data)?;
-        central.push(CentralEntry {
-            name: name.clone(),
-            crc,
-            compressed,
-            uncompressed,
-            offset,
-        });
-        offset += 30 + name_bytes.len() as u32 + compressed;
-    }
-    let central_offset = offset;
-    for entry in &central {
-        let name = entry.name.as_bytes();
-        out.write_all(&0x02014b50_u32.to_le_bytes())?;
-        out.write_all(&20_u16.to_le_bytes())?;
-        out.write_all(&20_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&8_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&entry.crc.to_le_bytes())?;
-        out.write_all(&entry.compressed.to_le_bytes())?;
-        out.write_all(&entry.uncompressed.to_le_bytes())?;
-        out.write_all(&(name.len() as u16).to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&0_u16.to_le_bytes())?;
-        out.write_all(&0_u32.to_le_bytes())?;
-        out.write_all(&entry.offset.to_le_bytes())?;
-        out.write_all(name)?;
-        offset += 46 + name.len() as u32;
-    }
-    let central_size = offset - central_offset;
-    let entry_count = u16::try_from(central.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many NPZ entries"))?;
-    out.write_all(&0x06054b50_u32.to_le_bytes())?;
-    out.write_all(&0_u16.to_le_bytes())?;
-    out.write_all(&0_u16.to_le_bytes())?;
-    out.write_all(&entry_count.to_le_bytes())?;
-    out.write_all(&entry_count.to_le_bytes())?;
-    out.write_all(&central_size.to_le_bytes())?;
-    out.write_all(&central_offset.to_le_bytes())?;
-    out.write_all(&0_u16.to_le_bytes())?;
-    out.flush()
 }
 
 fn tuple_descr(shape: &[usize]) -> String {

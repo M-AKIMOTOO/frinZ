@@ -1,7 +1,7 @@
 // Maser analysis keeps plotting and spectral-axis parameters explicit.
 #![allow(clippy::too_many_arguments)]
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
-use ndarray::{Array1, Axis};
+use ndarray::Array1;
 use plotters::prelude::*;
 use std::error::Error;
 use std::fs::{self, File};
@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::args::Args;
-use crate::fft::process_fft;
 use crate::header::{parse_header, CorHeader};
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::read::read_visibility_data;
 use crate::rfi::parse_rfi_ranges;
+use num_complex::Complex;
 
 // New use statements for LSR velocity correction
 use astro::ecliptic;
@@ -870,14 +870,14 @@ fn compute_lsr_average(
 
 fn get_spectrum_segment(
     file_path: &Path,
+    buffer: &[u8],
     args: &Args,
     sampling_scale: f64,
     chunk_length: i32,
     loop_index: i32,
     log_lines: &mut Vec<String>,
 ) -> Result<Option<SpectrumData>, Box<dyn Error>> {
-    let buffer = read_input_bytes(file_path)?;
-    let mut cursor = Cursor::new(buffer.as_slice());
+    let mut cursor = Cursor::new(buffer);
 
     let header = parse_header(&mut cursor)?;
 
@@ -934,20 +934,33 @@ fn get_spectrum_segment(
         return Ok(None);
     }
 
-    let (freq_rate_array, padding_length) = process_fft(
-        &complex_vec,
-        sector_count as i32,
-        header.fft_point,
-        sampling_speed_for_fft,
-        &rfi_ranges,
-        args.rate_padding,
+    // Only the zero-rate bin is used. Its unnormalized FFT is the temporal
+    // complex sum, so no time FFT or frequency-rate plane is necessary.
+    let mut spectrum_complex = vec![Complex::<f32>::new(0.0, 0.0); fft_point_half];
+    for row in complex_vec.chunks_exact(fft_point_half) {
+        for (sum, &sample) in spectrum_complex.iter_mut().zip(row).skip(1) {
+            *sum += sample;
+        }
+    }
+    let bandwidth_mhz = sampling_speed_for_fft as f32 / 2.0 / 1_000_000.0;
+    let scale = header.fft_point as f32 / sector_count as f32
+        * if bandwidth_mhz > 0.0 {
+            512.0 / bandwidth_mhz
+        } else {
+            1.0
+        };
+    let mut spectrum_abs = Array1::from_iter(
+        spectrum_complex
+            .into_iter()
+            .map(|value| (value * scale).norm()),
     );
-
-    // Get spectrum at zero rate (center of rate dimension)
-    let zero_rate_idx = padding_length / 2;
-    let spectrum_complex = freq_rate_array.index_axis(Axis(1), zero_rate_idx);
-
-    let spectrum_abs = spectrum_complex.mapv(|x| x.norm());
+    for (min, max) in rfi_ranges {
+        if min < fft_point_half {
+            for channel in min..=max.min(fft_point_half - 1) {
+                spectrum_abs[channel] = 0.0;
+            }
+        }
+    }
 
     Ok(Some(SpectrumData {
         header,
@@ -1479,15 +1492,25 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         1
     };
 
+    let on_input = open_input_data(on_source_path)?;
     let (off_full_segment, baseline_model) = match &off_spec {
         OffSpec::File(off_path) => {
-            let off_seg = get_spectrum_segment(off_path, args, corrfreq, 0, 0, &mut log_lines)?
-                .ok_or_else(|| {
-                    format!(
-                        "Off-source file {:?} contains no usable data for maser analysis.",
-                        off_path
-                    )
-                })?;
+            let off_input = open_input_data(off_path)?;
+            let off_seg = get_spectrum_segment(
+                off_path,
+                off_input.as_slice(),
+                args,
+                corrfreq,
+                0,
+                0,
+                &mut log_lines,
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "Off-source file {:?} contains no usable data for maser analysis.",
+                    off_path
+                )
+            })?;
             (Some(off_seg), None)
         }
         OffSpec::Baseline(kind) => (None, Some(*kind)),
@@ -1500,6 +1523,7 @@ pub fn run_maser_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
 
         let on_chunk = get_spectrum_segment(
             on_source_path,
+            on_input.as_slice(),
             args,
             corrfreq,
             chunk_length,

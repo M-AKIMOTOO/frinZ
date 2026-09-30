@@ -11,7 +11,7 @@ use num_complex::Complex;
 
 use crate::args::Args;
 use crate::fitting;
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::write_phase_corrected_spectrum_binary;
 use crate::plot::phase_reference_plot;
@@ -367,7 +367,7 @@ pub fn run_phase_reference_analysis(
                     "\nApplying phase correction to target file and writing to binary output..."
                 );
 
-                let target_buffer = read_input_bytes(&target_path)?;
+                let target_buffer = open_input_data(&target_path)?;
 
                 let mut file_header = vec![0u8; 256];
                 let mut cursor = Cursor::new(target_buffer.as_slice());

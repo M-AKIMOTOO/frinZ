@@ -1,7 +1,6 @@
 use byteorder::ReadBytesExt;
 use chrono::{DateTime, TimeZone, Utc};
 use num_complex::Complex;
-use std::fs;
 use std::io::{self, Cursor, Error, ErrorKind, Read};
 use std::path::Path;
 
@@ -53,8 +52,9 @@ pub fn read_cor_file_with_options<P: AsRef<Path>>(
     path: P,
     options: &CorReadOptions,
 ) -> io::Result<CorData> {
-    let bytes = fs::read(path)?;
-    read_cor_bytes(&bytes, options)
+    let bytes = crate::input_support::open_input_data(path.as_ref())
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    read_cor_bytes(bytes.as_slice(), options)
 }
 
 /// Read visibility data from in-memory `.cor` bytes.
@@ -136,6 +136,32 @@ pub fn normalize_effective_integration_time(value: f32) -> f32 {
     }
 
     value
+}
+
+/// Read timing metadata without decoding the sector's complex spectrum.
+pub fn read_sector_metadata(
+    cursor: &mut Cursor<&[u8]>,
+    header: &CorHeader,
+    sector: i32,
+) -> io::Result<(DateTime<Utc>, f32)> {
+    let available = available_cor_sectors(header, cursor.get_ref().len())?;
+    if sector < 0 || sector >= available.min(header.number_of_sector) {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "sector is unavailable",
+        ));
+    }
+    let sector_size = SECTOR_HEADER_SIZE + header.fft_point as u64 * 4;
+    let offset = FILE_HEADER_SIZE + sector as u64 * sector_size;
+    cursor.set_position(offset);
+    let seconds = cursor.read_i32::<byteorder::LittleEndian>()?;
+    let time = Utc
+        .timestamp_opt(seconds as i64, 0)
+        .single()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "invalid sector timestamp"))?;
+    cursor.set_position(offset + EFFECTIVE_INTEG_TIME_OFFSET);
+    let integration = cursor.read_f32::<byteorder::LittleEndian>()?;
+    Ok((time, normalize_effective_integration_time(integration)))
 }
 
 pub fn read_visibility_data(

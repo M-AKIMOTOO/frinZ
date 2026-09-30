@@ -10,7 +10,7 @@ use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, read_bandpass_file};
 use crate::fft::{apply_phase_correction_in_place_at_frequency, process_fft, process_ifft};
 use crate::header::{parse_header, CorHeader};
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::frequency_plane_msb;
 use crate::read::{read_sector_header, read_visibility_data};
@@ -191,7 +191,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     writeln!(tee_writer, "  X-Band Input Delay: {} s", x_band_input_delay)?;
 
     // --- Process C-band data ---
-    let c_band_buffer = read_input_bytes(&c_band_path)?;
+    let c_band_buffer = open_input_data(&c_band_path)?;
     let mut c_band_cursor = Cursor::new(c_band_buffer.as_slice());
 
     let c_band_header = parse_header(&mut c_band_cursor)?;
@@ -214,7 +214,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
     )?;
 
     // --- Process X-band data ---
-    let x_band_buffer = read_input_bytes(&x_band_path)?;
+    let x_band_buffer = open_input_data(&x_band_path)?;
     let mut x_band_cursor = Cursor::new(x_band_buffer.as_slice());
 
     let x_band_header = parse_header(&mut x_band_cursor)?;
@@ -500,7 +500,7 @@ pub fn run_multisideband_analysis(args: &Args) -> Result<(), Box<dyn Error>> {
         Complex::<f32>::new(0.0, phase_difference_deg.to_radians() as f32).exp() as C32;
 
     // --- Prepare output header ---
-    let mut output_header_bytes = c_band_buffer[..256].to_vec();
+    let mut output_header_bytes = c_band_buffer.as_slice()[..256].to_vec();
     let new_observing_frequency = c_band_header.observing_frequency;
     let new_sampling_speed = c_band_header.sampling_speed + x_band_header.sampling_speed;
     let new_fft_point = c_band_header.fft_point + x_band_header.fft_point;

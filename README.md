@@ -501,6 +501,13 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 
 ## Performance Notes
 
+Large `.cor` inputs use memory mapping, and `.zst` inputs are decoded to a temporary
+backing file. NPZ entries are compressed sequentially into a temporary archive
+with fixed-size buffers and ZIP64 support, rather than keeping an additional
+copy of each exported plane in RAM. Set `TMPDIR` to a disk directory with enough
+free space for the decoded input and compressed NPZ output; avoid a RAM-backed
+temporary directory for large observations. Temporary files are removed automatically.
+
 frinZ provides significant performance improvements over the Python version:
 - **Faster FFT processing** using rustfft
 - **Optimized memory usage** for large datasets

@@ -177,6 +177,11 @@ fn process_fft_impl(
         complex_vec.len() / fft_point_half
     };
     let base_length = rows.max(1);
+    let signal_rows = if physical_length > 0 {
+        rows.min(physical_length as usize)
+    } else {
+        rows
+    };
     let mut padding_length = base_length.saturating_mul(rate_padding.max(1) as usize);
     if base_length == 1 {
         padding_length = padding_length.saturating_mul(2);
@@ -224,7 +229,7 @@ fn process_fft_impl(
         build_phase_factors(
             phase,
             fft_point_half,
-            rows,
+            signal_rows,
             sampling_speed as u32,
             fft_point as u32,
         )
@@ -232,7 +237,7 @@ fn process_fft_impl(
 
     for i in 1..fft_point_half {
         if let Some((channel_steps, channel_factors, _)) = &mut phase_factors {
-            for j in 0..rows {
+            for j in 0..signal_rows {
                 channel_factors[j] *= channel_steps[j];
             }
         }
@@ -240,7 +245,7 @@ fn process_fft_impl(
             continue;
         }
 
-        for j in 0..rows {
+        for j in 0..signal_rows {
             let mut sample = complex_vec[j * fft_point_half + i];
             if let Some((_, channel_factors, row_factors)) = &phase_factors {
                 let channel_factor =
@@ -249,7 +254,7 @@ fn process_fft_impl(
             }
             fft_exe[j] = sample;
         }
-        fft_exe[rows..].fill(C32::new(0.0, 0.0));
+        fft_exe[signal_rows..].fill(C32::new(0.0, 0.0));
 
         fft.process_with_scratch(&mut fft_exe, &mut fft_scratch);
 

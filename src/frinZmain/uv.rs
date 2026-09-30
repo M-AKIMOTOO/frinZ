@@ -1,11 +1,10 @@
 use crate::args::Args;
 use crate::header::parse_header;
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::plot_uv_tracks;
-use crate::read::{read_sector_header, read_visibility_data};
+use crate::read::read_sector_metadata;
 use crate::utils::{radec2azalt, uvw_cal};
-use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{Duration, TimeZone, Timelike, Utc};
 use std::error::Error;
 use std::fs;
@@ -23,7 +22,7 @@ pub fn run_uv_plot(args: &Args, uv_mode: i32) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .ok_or("Error: --uv requires an --input file.")?;
 
-    let buffer = read_input_bytes(input_path)?;
+    let buffer = open_input_data(input_path)?;
 
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
@@ -51,32 +50,17 @@ pub fn run_uv_plot(args: &Args, uv_mode: i32) -> Result<(), Box<dyn Error>> {
     }
 
     let mut data_cursor = Cursor::new(buffer.as_slice());
-    let (_, first_time, effective_integ_time) =
-        read_visibility_data(&mut data_cursor, &header, 1, 0, start_sector, false, &[])?;
+    let (first_time, effective_integ_time) =
+        read_sector_metadata(&mut data_cursor, &header, start_sector)?;
 
     if effective_integ_time <= 0.0 {
         return Err("Effective integration time is zero; cannot compute UV coverage.".into());
     }
 
     let mut sector_cursor = Cursor::new(buffer.as_slice());
-    let sector_headers = read_sector_header(
-        &mut sector_cursor,
-        &header,
-        sectors_to_use,
-        start_sector,
-        0,
-        false,
-    )?;
-
-    let mut observation_times = Vec::with_capacity(sector_headers.len());
-    for header_bytes in sector_headers {
-        let mut sector_reader = Cursor::new(header_bytes);
-        let correlation_time_sec = sector_reader.read_i32::<LittleEndian>()?;
-        let obs_time = Utc
-            .timestamp_opt(correlation_time_sec as i64, 0)
-            .single()
-            .ok_or_else(|| format!("Invalid timestamp seconds: {}", correlation_time_sec))?;
-        observation_times.push(obs_time);
+    let mut observation_times = Vec::with_capacity(sectors_to_use as usize);
+    for sector in start_sector..start_sector + sectors_to_use {
+        observation_times.push(read_sector_metadata(&mut sector_cursor, &header, sector)?.0);
     }
 
     if observation_times.is_empty() {

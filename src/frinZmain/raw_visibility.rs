@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::args::Args;
 use crate::fft::apply_phase_correction_in_place_at_frequency;
 use crate::header::{parse_header, CorHeader};
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{NamedNpz, NpyMeta};
 use crate::plot;
 use crate::read::read_visibility_data;
@@ -60,7 +60,7 @@ pub fn run_raw_visibility_plot(args: &Args) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&output_dir)?;
     let base_filename = input_path.file_stem().unwrap().to_str().unwrap();
 
-    let buffer = read_input_bytes(input_path)?;
+    let buffer = open_input_data(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     let header = parse_header(&mut cursor)?;

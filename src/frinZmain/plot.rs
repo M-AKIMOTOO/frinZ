@@ -369,8 +369,8 @@ where
     buffer
 }
 
-// Preserve the sampled grid's normalization, then rasterize it at the chart's
-// actual pixel size instead of drawing every sample as a Plotters rectangle.
+// Sample only displayed pixels. A supplied maximum avoids rescanning the plane;
+// otherwise compute it without retaining a second copy of the sampled grid.
 fn build_sampled_heatmap_rgb_buffer<F>(
     output_width: u32,
     output_height: u32,
@@ -380,6 +380,7 @@ fn build_sampled_heatmap_rgb_buffer<F>(
     x_max: f64,
     y_min: f64,
     y_max: f64,
+    max_amplitude: Option<f64>,
     heatmap_func: &F,
 ) -> Vec<u8>
 where
@@ -387,33 +388,53 @@ where
 {
     let sample_x_den = (sample_width.saturating_sub(1)).max(1) as f64;
     let sample_y_den = (sample_height.saturating_sub(1)).max(1) as f64;
-    let mut values = vec![0.0; sample_width * sample_height];
-
-    plot_pool().install(|| {
-        values.par_iter_mut().enumerate().for_each(|(idx, value)| {
-            let px = idx % sample_width;
-            let py = idx / sample_width;
-            let x = x_min + (x_max - x_min) * px as f64 / sample_x_den;
-            let y = y_min + (y_max - y_min) * py as f64 / sample_y_den;
-            *value = heatmap_func(x, y);
-        });
+    if sample_width == 0 || sample_height == 0 || output_width == 0 || output_height == 0 {
+        return Vec::new();
+    }
+    let sample = |px: usize, py: usize| {
+        let x = x_min + (x_max - x_min) * px as f64 / sample_x_den;
+        let y = y_min + (y_max - y_min) * py as f64 / sample_y_den;
+        heatmap_func(x, y)
+    };
+    let amplitude_norm = max_amplitude.unwrap_or_else(|| {
+        plot_pool().install(|| {
+            (0..sample_height)
+                .into_par_iter()
+                .map(|py| {
+                    (0..sample_width)
+                        .map(|px| sample(px, py))
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .reduce(|| f64::NEG_INFINITY, f64::max)
+        })
     });
-
-    let amplitude_norm = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let amp = amplitude_norm.max(1e-30);
-    rasterize_rgb_grid(
-        output_width,
-        output_height,
-        sample_width,
-        sample_height,
-        &values,
-        false,
-        true,
-        &|value| {
-            let normalized = (value / amp).clamp(0.0, 1.0);
-            HSLColor((1.0 - normalized) * 0.7, 1.0, 0.5).rgb()
-        },
-    )
+    let width = output_width as usize;
+    let height = output_height as usize;
+    let x_indices: Vec<usize> = (0..width)
+        .map(|px| {
+            (px as f64 * sample_x_den / width.saturating_sub(1).max(1) as f64).floor() as usize
+        })
+        .map(|px| px.min(sample_width - 1))
+        .collect();
+    let mut buffer = vec![0u8; width * height * 3];
+    plot_pool().install(|| {
+        buffer
+            .par_chunks_mut(width * 3)
+            .enumerate()
+            .for_each(|(py, row)| {
+                let sample_y = (py as f64 * (sample_height - 1) as f64
+                    / height.saturating_sub(1).max(1) as f64)
+                    .floor() as usize;
+                let sample_y = sample_height - 1 - sample_y;
+                for (pixel, &sample_x) in row.chunks_exact_mut(3).zip(&x_indices) {
+                    let normalized = (sample(sample_x, sample_y) / amp).clamp(0.0, 1.0);
+                    let (r, g, b) = HSLColor((1.0 - normalized) * 0.7, 1.0, 0.5).rgb();
+                    pixel.copy_from_slice(&[r, g, b]);
+                }
+            });
+    });
+    buffer
 }
 
 pub fn delay_plane(
@@ -1161,6 +1182,7 @@ pub fn frequency_plane(
         bw,
         rate_min_x,
         rate_max_x,
+        Some(max_amplitude),
         &heatmap_func,
     );
     let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
@@ -2572,18 +2594,18 @@ pub fn plot_dynamic_spectrum_lag(
     Ok(())
 }
 
-fn gaussian_blur_2d(data: &[Vec<f32>], sigma: f32) -> Vec<Vec<f32>> {
+fn gaussian_blur_2d(data: &[Vec<f32>], sigma: f32) -> std::borrow::Cow<'_, [Vec<f32>]> {
     if sigma <= 0.0 {
-        return data.to_vec();
+        return std::borrow::Cow::Borrowed(data);
     }
 
     let rows = data.len();
     if rows == 0 {
-        return Vec::new();
+        return std::borrow::Cow::Borrowed(data);
     }
     let cols = data[0].len();
     if cols == 0 {
-        return data.to_vec();
+        return std::borrow::Cow::Borrowed(data);
     }
 
     let kernel_radius = (sigma * 3.0).ceil() as usize;
@@ -2630,7 +2652,7 @@ fn gaussian_blur_2d(data: &[Vec<f32>], sigma: f32) -> Vec<Vec<f32>> {
         }
     }
 
-    blurred_data
+    std::borrow::Cow::Owned(blurred_data)
 }
 
 fn draw_heatmap_with_colorbar(
@@ -2682,23 +2704,33 @@ fn draw_heatmap_with_colorbar(
         .y_label_formatter(&y_label_formatter)
         .draw()?;
 
-    let values: Vec<f32> = data.iter().flat_map(|row| row.iter().copied()).collect();
     let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
     let bitmap_width = plot_x.len().max(1) as u32;
     let bitmap_height = plot_y.len().max(1) as u32;
-    let heatmap_buffer = rasterize_rgb_grid(
-        bitmap_width,
-        bitmap_height,
-        cols,
-        rows,
-        &values,
-        false,
-        true,
-        &|value| {
-            let color_value = color_value_normalizer(value as f32).clamp(0.0, 1.0);
-            ViridisRGB.get_color(color_value).rgb()
-        },
-    );
+    let width = bitmap_width as usize;
+    let height = bitmap_height as usize;
+    let x_indices: Vec<usize> = (0..width)
+        .map(|x| {
+            (x as f64 * (cols - 1) as f64 / width.saturating_sub(1).max(1) as f64).floor() as usize
+        })
+        .collect();
+    let mut heatmap_buffer = vec![0u8; width * height * 3];
+    plot_pool().install(|| {
+        heatmap_buffer
+            .par_chunks_mut(width * 3)
+            .enumerate()
+            .for_each(|(y, pixels)| {
+                let row = rows
+                    - 1
+                    - (y as f64 * (rows - 1) as f64 / height.saturating_sub(1).max(1) as f64)
+                        .floor() as usize;
+                for (pixel, &column) in pixels.chunks_exact_mut(3).zip(&x_indices) {
+                    let normalized = color_value_normalizer(data[row][column]).clamp(0.0, 1.0);
+                    let (r, g, b) = ViridisRGB.get_color(normalized).rgb();
+                    pixel.copy_from_slice(&[r, g, b]);
+                }
+            });
+    });
     let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
         (0, rows),
         (bitmap_width, bitmap_height),
@@ -4116,6 +4148,7 @@ pub fn frequency_plane_msb(
         bw,
         rate_min_x,
         rate_max_x,
+        None,
         &heatmap_func,
     );
     let bitmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
@@ -4442,8 +4475,8 @@ pub fn plot_spike34_delay_time_offset_phase_heatmap<P: AsRef<Path>>(
             })
             .collect()
     };
-    let before_phase = gaussian_blur_2d(&make_phase(before), 0.0);
-    let after_phase = gaussian_blur_2d(&make_phase(after), 0.0);
+    let before_phase = make_phase(before);
+    let after_phase = make_phase(after);
     draw_heatmap_with_colorbar(
         &before_plot,
         &before_phase,

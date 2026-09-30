@@ -500,24 +500,27 @@ pub fn analyze_results(
         let peak_rate_hz = rate_range[peak_rate_col_idx];
         let noise_rate_threshold = 0.1; // Hz
 
-        let mut noise_sum = C32::new(0.0, 0.0);
-        let mut noise_count = 0usize;
-        for (r_idx, &rate_val) in rate_range.iter().enumerate() {
-            if (rate_val - peak_rate_hz).abs() > noise_rate_threshold {
-                for f_idx in 0..freq_rate_array.shape()[0] {
-                    noise_sum += freq_rate_array[[f_idx, r_idx]];
-                    noise_count += 1;
+        let noise_rates: Vec<bool> = rate_range
+            .iter()
+            .map(|&rate| (rate - peak_rate_hz).abs() > noise_rate_threshold)
+            .collect();
+        let noise_count =
+            noise_rates.iter().filter(|&&included| included).count() * freq_rate_array.nrows();
+        if noise_count > 0 {
+            let mut noise_sum = C32::new(0.0, 0.0);
+            for row in freq_rate_array.rows() {
+                for (&value, &included) in row.iter().zip(&noise_rates) {
+                    if included {
+                        noise_sum += value;
+                    }
                 }
             }
-        }
-
-        if noise_count > 0 {
             let noise_mean = noise_sum / noise_count as f32;
             let mut noise_abs_dev_sum = 0.0f32;
-            for (r_idx, &rate_val) in rate_range.iter().enumerate() {
-                if (rate_val - peak_rate_hz).abs() > noise_rate_threshold {
-                    for f_idx in 0..freq_rate_array.shape()[0] {
-                        noise_abs_dev_sum += (freq_rate_array[[f_idx, r_idx]] - noise_mean).norm();
+            for row in freq_rate_array.rows() {
+                for (&value, &included) in row.iter().zip(&noise_rates) {
+                    if included {
+                        noise_abs_dev_sum += (value - noise_mean).norm();
                     }
                 }
             }

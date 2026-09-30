@@ -2,10 +2,10 @@
 #![allow(clippy::too_many_arguments)]
 use crate::args::Args;
 use crate::header::parse_header;
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
-use crate::read::read_visibility_data;
+use crate::read::read_sector_metadata;
 use crate::utils::radec2azalt;
 use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use plotters::coord::Shift;
@@ -25,14 +25,14 @@ pub fn run_uptime_plot(args: &Args) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let buffer = read_input_bytes(input_path)?;
+    let buffer = open_input_data(input_path)?;
 
     let mut cursor = Cursor::new(buffer.as_slice());
     let header = parse_header(&mut cursor)?;
 
     let mut data_cursor = Cursor::new(buffer.as_slice());
-    let (_, start_time, effective_integ_time) =
-        read_visibility_data(&mut data_cursor, &header, 1, args.skip, 0, false, &[])?;
+    let (start_time, effective_integ_time) =
+        read_sector_metadata(&mut data_cursor, &header, args.skip.max(0))?;
 
     if effective_integ_time <= 0.0 {
         return Err("Effective integration time is zero; cannot generate uptime plot.".into());

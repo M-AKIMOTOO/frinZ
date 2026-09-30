@@ -2,7 +2,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use ndarray::prelude::*;
 use num_complex::Complex;
 use plotters::prelude::*;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufReader, Read};
 
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
@@ -40,30 +40,20 @@ pub fn read_bandpass_file(path: &std::path::Path) -> io::Result<Vec<C32>> {
 }
 
 fn read_bandpass_npz(path: &std::path::Path) -> io::Result<Vec<C32>> {
-    let archive = fs::read(path)?;
-    let entries = read_npz_entries(&archive)?;
-
-    if let Some(data_npy) = entries
-        .iter()
-        .find_map(|(name, npy)| (name == "data.npy").then_some(npy))
-    {
-        return parse_complex64_npy(data_npy);
+    let mut archive = zip::ZipArchive::new(File::open(path)?)?;
+    let read_entry = |archive: &mut zip::ZipArchive<File>, name: &str| -> io::Result<Vec<u8>> {
+        let mut entry = archive.by_name(name)?;
+        let mut npy = Vec::new();
+        entry.read_to_end(&mut npy)?;
+        Ok(npy)
+    };
+    match read_entry(&mut archive, "data.npy") {
+        Ok(data) => return parse_complex64_npy(&data),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-
-    let real_npy = entries
-        .iter()
-        .find_map(|(name, npy)| (name == "real.npy").then_some(npy))
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "NPZ real.npy entry is missing")
-        })?;
-    let imag_npy = entries
-        .iter()
-        .find_map(|(name, npy)| (name == "imag.npy").then_some(npy))
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "NPZ imag.npy entry is missing")
-        })?;
-    let real = parse_real_npy(real_npy)?;
-    let imag = parse_real_npy(imag_npy)?;
+    let real = parse_real_npy(&read_entry(&mut archive, "real.npy")?)?;
+    let imag = parse_real_npy(&read_entry(&mut archive, "imag.npy")?)?;
     if real.len() != imag.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -79,82 +69,6 @@ fn read_bandpass_npz(path: &std::path::Path) -> io::Result<Vec<C32>> {
         .zip(imag)
         .map(|(re, im)| C32::new(re, im))
         .collect())
-}
-
-fn read_npz_entries(archive: &[u8]) -> io::Result<Vec<(String, Vec<u8>)>> {
-    if archive.len() < 30 || &archive[..4] != b"PK\x03\x04" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid NPZ local header",
-        ));
-    }
-    let mut entries = Vec::new();
-    let mut offset = 0usize;
-    while offset + 30 <= archive.len() {
-        if &archive[offset..offset + 4] == b"PK\x01\x02"
-            || &archive[offset..offset + 4] == b"PK\x05\x06"
-        {
-            break;
-        }
-        if &archive[offset..offset + 4] != b"PK\x03\x04" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid NPZ local entry signature at byte {offset}"),
-            ));
-        }
-        let u16_at = |base: usize, rel: usize| {
-            u16::from_le_bytes([archive[base + rel], archive[base + rel + 1]]) as usize
-        };
-        let u32_at = |base: usize, rel: usize| {
-            u32::from_le_bytes([
-                archive[base + rel],
-                archive[base + rel + 1],
-                archive[base + rel + 2],
-                archive[base + rel + 3],
-            ]) as usize
-        };
-        let method = u16_at(offset, 8);
-        let compressed_size = u32_at(offset, 18);
-        let name_len = u16_at(offset, 26);
-        let extra_len = u16_at(offset, 28);
-        let name_start = offset + 30;
-        let name_end = name_start.checked_add(name_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "NPZ name offset overflow")
-        })?;
-        let data_start = name_end.checked_add(extra_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "NPZ data offset overflow")
-        })?;
-        let data_end = data_start
-            .checked_add(compressed_size)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NPZ data size overflow"))?;
-        if data_end > archive.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NPZ entry exceeds archive length",
-            ));
-        }
-        let name = std::str::from_utf8(&archive[name_start..name_end])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "NPZ entry name is not UTF-8"))?
-            .to_string();
-        let npy = match method {
-            0 => archive[data_start..data_end].to_vec(),
-            8 => {
-                let mut decoder = flate2::read::DeflateDecoder::new(&archive[data_start..data_end]);
-                let mut decoded = Vec::new();
-                decoder.read_to_end(&mut decoded)?;
-                decoded
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported NPZ compression method {method}"),
-                ))
-            }
-        };
-        entries.push((name, npy));
-        offset = data_end;
-    }
-    Ok(entries)
 }
 
 fn npy_payload(npy: &[u8]) -> io::Result<(&str, &[u8])> {

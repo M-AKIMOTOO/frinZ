@@ -18,7 +18,7 @@ use crate::fft::{
     apply_phase_correction_in_place_at_frequency, process_fft, process_ifft_with_delay_padding,
 };
 use crate::header::{parse_header, CorHeader};
-use crate::input_support::read_input_bytes;
+use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::{plot_cross_section, plot_sky_map, plot_uv_coverage};
 use crate::read::read_visibility_data;
@@ -272,7 +272,7 @@ pub fn run_fringe_rate_map_analysis(
     let file_stem = input_path.file_stem().unwrap().to_str().unwrap();
 
     // --- Read .cor File ---
-    let buffer = read_input_bytes(input_path)?;
+    let buffer = open_input_data(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     // --- Parse Header ---
@@ -753,7 +753,7 @@ fn run_frmap_maser(
     fs::create_dir_all(&frinz_dir)?;
     let file_stem = input_path.file_stem().unwrap().to_str().unwrap();
 
-    let buffer = read_input_bytes(input_path)?;
+    let buffer = open_input_data(input_path)?;
     let mut cursor = Cursor::new(buffer.as_slice());
 
     let header = parse_header(&mut cursor)?;

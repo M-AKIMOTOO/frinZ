@@ -312,20 +312,13 @@ fn compute_wwz(times: &[f64], values: &[f64]) -> Result<WwzTransform, Box<dyn Er
             };
             let coeffs = s_inverse * p;
 
-            let mut model_sum = 0.0;
-            let mut model_square_sum = 0.0;
-            for &time in times {
-                let delta = time - *tau_value;
-                let phase = omega * delta;
-                let weight = (-DEFAULT_C * omega * omega * delta * delta).exp();
-                let model_value = coeffs[0] + coeffs[1] * phase.cos() + coeffs[2] * phase.sin();
-                model_sum += weight * model_value;
-                model_square_sum += weight * model_value * model_value;
-            }
-
+            // S already contains every weighted basis product. Reuse it
+            // for the model moments instead of repeating exp/sin/cos per sample.
+            let model_mean = s.row(0).transpose().dot(&coeffs);
+            let model_second_moment = coeffs.dot(&(s * coeffs));
             let data_variance =
                 (weighted_square_sum / weight_sum) - (weighted_sum / weight_sum).powi(2);
-            let model_variance = (model_square_sum / weight_sum) - (model_sum / weight_sum).powi(2);
+            let model_variance = model_second_moment - model_mean.powi(2);
             let effective_points = weight_sum * weight_sum / weight_square_sum;
             let denominator = 2.0 * (data_variance - model_variance);
             let power = if effective_points > 3.0

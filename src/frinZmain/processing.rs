@@ -1146,6 +1146,8 @@ pub fn process_cor_file(
             )?;
         }
 
+        drop(raw_contamination_visibility);
+
         if args.spectrum {
             if let Some(path) = &spectrum_output_path {
                 let output_stem =
@@ -1315,6 +1317,9 @@ pub fn process_cor_file(
                 let _ = fs::remove_file(output_path_lag.with_extension("npz"));
             }
         }
+
+        // The time-domain samples are no longer needed by plots or exporters.
+        drop(complex_vec);
 
         if !args.frequency {
             let delay_output_line = format!(
@@ -2092,8 +2097,9 @@ pub fn process_cor_file(
                     }
                     let max_norm_freq = freq_rate_array
                         .iter()
-                        .map(|c| c.norm())
-                        .fold(0.0f32, |acc, x| acc.max(x));
+                        .map(|c| c.norm_sqr())
+                        .fold(0.0f32, f32::max)
+                        .sqrt();
                     frequency_plane(
                         &freq_amp_profile,
                         freq_amp_profile_pre_bp.as_deref(),

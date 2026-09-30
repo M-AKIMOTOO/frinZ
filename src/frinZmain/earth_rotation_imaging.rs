@@ -364,10 +364,11 @@ pub fn perform_imaging_with_config(
     let gridded = grid_visibilities(visibilities, config)?;
     println!("Gridding complete.");
 
-    let mut dirty_complex = fft_2d_inverse(&gridded.vis_grid, config.image_size)?;
+    let mut dirty_complex = fft_2d_inverse(gridded.vis_grid, config.image_size)?;
     normalize_complex(&mut dirty_complex, config.image_size);
     fftshift_inplace(&mut dirty_complex, config.image_size);
     let dirty_image: Vec<f64> = dirty_complex.iter().map(|c| c.re).collect();
+    drop(dirty_complex);
     println!("FFT complete. Dirty image created.");
 
     let sampling_complex: Vec<Complex<f64>> = gridded
@@ -375,10 +376,11 @@ pub fn perform_imaging_with_config(
         .iter()
         .map(|&w| Complex::new(w, 0.0))
         .collect();
-    let mut dirty_beam_complex = fft_2d_inverse(&sampling_complex, config.image_size)?;
+    let mut dirty_beam_complex = fft_2d_inverse(sampling_complex, config.image_size)?;
     normalize_complex(&mut dirty_beam_complex, config.image_size);
     fftshift_inplace(&mut dirty_beam_complex, config.image_size);
     let mut dirty_beam: Vec<f64> = dirty_beam_complex.iter().map(|c| c.re).collect();
+    drop(dirty_beam_complex);
     normalize_beam_peak(&mut dirty_beam, config.image_size);
 
     let (clean_image, residual_image, clean_components) = if let Some(clean_cfg) = &config.clean {
@@ -564,7 +566,7 @@ fn grid_visibilities(
     })
 }
 
-fn fft_2d_inverse(grid: &[Complex<f64>], size: usize) -> Result<Vec<Complex<f64>>, String> {
+fn fft_2d_inverse(mut grid: Vec<Complex<f64>>, size: usize) -> Result<Vec<Complex<f64>>, String> {
     if grid.len() != size * size {
         return Err("Grid size does not match expected dimensions".to_string());
     }
@@ -573,31 +575,29 @@ fn fft_2d_inverse(grid: &[Complex<f64>], size: usize) -> Result<Vec<Complex<f64>
     let fft = planner.plan_fft_inverse(size);
     let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
 
-    let mut buffer = grid.to_vec();
-
-    for row in buffer.chunks_mut(size) {
+    for row in grid.chunks_mut(size) {
         fft.process_with_scratch(row, &mut scratch);
     }
-
-    let mut transposed = vec![Complex::new(0.0, 0.0); size * size];
-    for r in 0..size {
-        for c in 0..size {
-            transposed[c * size + r] = buffer[r * size + c];
-        }
-    }
-
-    for row in transposed.chunks_mut(size) {
+    transpose_square_inplace(&mut grid, size);
+    for row in grid.chunks_mut(size) {
         fft.process_with_scratch(row, &mut scratch);
     }
+    transpose_square_inplace(&mut grid, size);
+    Ok(grid)
+}
 
-    let mut final_grid = vec![Complex::new(0.0, 0.0); size * size];
-    for r in 0..size {
-        for c in 0..size {
-            final_grid[r * size + c] = transposed[c * size + r];
+fn transpose_square_inplace(data: &mut [Complex<f64>], size: usize) {
+    // Tiled swaps keep both sides of the transpose local without another grid.
+    const TILE: usize = 32;
+    for rb in (0..size).step_by(TILE) {
+        for cb in (rb..size).step_by(TILE) {
+            for r in rb..(rb + TILE).min(size) {
+                for c in cb.max(r + 1)..(cb + TILE).min(size) {
+                    data.swap(r * size + c, c * size + r);
+                }
+            }
         }
     }
-
-    Ok(final_grid)
 }
 
 fn normalize_complex(data: &mut [Complex<f64>], size: usize) {
@@ -608,16 +608,14 @@ fn normalize_complex(data: &mut [Complex<f64>], size: usize) {
 }
 
 fn fftshift_inplace(data: &mut [Complex<f64>], size: usize) {
-    let mut shifted = vec![Complex::new(0.0, 0.0); data.len()];
-    let half = size / 2;
-    for r in 0..size {
-        for c in 0..size {
-            let sr = (r + half) % size;
-            let sc = (c + half) % size;
-            shifted[sr * size + sc] = data[r * size + c];
-        }
+    if size == 0 {
+        return;
     }
-    data.copy_from_slice(&shifted);
+    let half = size / 2;
+    for row in data.chunks_exact_mut(size) {
+        row.rotate_right(half);
+    }
+    data.rotate_right(half * size);
 }
 
 fn normalize_beam_peak(beam: &mut [f64], size: usize) {

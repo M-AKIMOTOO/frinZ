@@ -19,7 +19,7 @@ mod acel {
     use crate::fft::apply_phase_correction_in_place_at_frequency;
     use crate::fitting;
     use crate::header::{parse_header, CorHeader};
-    use crate::input_support::read_input_bytes;
+    use crate::input_support::open_input_data;
     use crate::plot::plot_acel_search_result;
     use crate::read::read_visibility_data;
     use crate::rfi::parse_rfi_ranges;
@@ -235,7 +235,7 @@ mod acel {
         fs::create_dir_all(&output_dir)?;
         let base_filename = input_path.file_stem().unwrap().to_str().unwrap();
 
-        let buffer = read_input_bytes(input_path)?;
+        let buffer = open_input_data(input_path)?;
         let mut cursor = Cursor::new(buffer.as_slice());
 
         let header = parse_header(&mut cursor)?;
@@ -600,6 +600,7 @@ mod deep {
     use rayon::prelude::*;
     use std::error::Error;
     use std::f64::consts::PI;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::analysis::{analyze_results, AnalysisResults};
     use crate::args::Args;
@@ -608,6 +609,7 @@ mod deep {
         cached_fft_plan, process_fft, process_fft_with_phase_correction_at_frequency, process_ifft,
     };
     use crate::header::CorHeader;
+    use crate::rfi::has_histogram_mode;
     use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, positive_or_epsilon, rate_cal};
 
     type C32 = Complex<f32>;
@@ -617,6 +619,27 @@ mod deep {
         Array2<C32>,
         Option<AnalysisResults>,
     );
+
+    fn search_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, Box<dyn Error>> {
+        type PoolCache = Option<(usize, Arc<rayon::ThreadPool>)>;
+        static POOL: OnceLock<Mutex<PoolCache>> = OnceLock::new();
+        let mut cached = POOL
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((count, pool)) = cached.as_ref() {
+            if *count == threads {
+                return Ok(Arc::clone(pool));
+            }
+        }
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()?,
+        );
+        *cached = Some((threads, Arc::clone(&pool)));
+        Ok(pool)
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DeepSearchAlgorithm {
@@ -943,6 +966,21 @@ mod deep {
             }
         }
 
+        fn delay_plane_for_analysis(
+            &self,
+            frequencies: &Array2<C32>,
+            padding_length: usize,
+            args: &Args,
+        ) -> Array2<C32> {
+            if args.frequency && args.drange.is_empty() && !has_histogram_mode(&args.rfi) {
+                // analyze_results does not inspect delay pixels in this mode.
+                return Array2::zeros((1, 1));
+            }
+            let mut values = process_ifft(frequencies, self.effective_fft_point, padding_length);
+            self.apply_delay_rate_mask(&mut values);
+            values
+        }
+
         fn coarse_estimates(
             &self,
             algorithm: DeepSearchAlgorithm,
@@ -966,9 +1004,8 @@ mod deep {
                         search_args,
                     ));
                 }
-                let mut delay_rate_2d_data_comp =
-                    process_ifft(&freq_rate_array, self.effective_fft_point, padding_length);
-                self.apply_delay_rate_mask(&mut delay_rate_2d_data_comp);
+                let delay_rate_2d_data_comp =
+                    self.delay_plane_for_analysis(&freq_rate_array, padding_length, &search_args);
                 let analysis_results = analyze_results(
                     &freq_rate_array,
                     &delay_rate_2d_data_comp,
@@ -1004,9 +1041,8 @@ mod deep {
                         &search_args,
                     ));
                 }
-                let mut delay_rate_2d_data_comp =
-                    process_ifft(&freq_rate_array, self.effective_fft_point, padding_length);
-                self.apply_delay_rate_mask(&mut delay_rate_2d_data_comp);
+                let delay_rate_2d_data_comp =
+                    self.delay_plane_for_analysis(&freq_rate_array, padding_length, &search_args);
                 let analysis_results = analyze_results(
                     &freq_rate_array,
                     &delay_rate_2d_data_comp,
@@ -1030,7 +1066,8 @@ mod deep {
             let fft_point = self.effective_fft_point as usize;
             let channel_count = fft_point / 2;
             let sampling_speed = self.header.sampling_speed;
-            let row_count = self.complex_vec.len() / channel_count.max(1);
+            let row_count = (self.complex_vec.len() / channel_count.max(1))
+                .min(self.physical_length.max(0) as usize);
             if fft_point == 0 || channel_count <= 1 || sampling_speed <= 0 || row_count == 0 {
                 return (0.0, 0.0);
             }
@@ -1103,25 +1140,79 @@ mod deep {
             power_scale / self.physical_length.max(1) as f64
         }
 
+        fn coherent_spectrum_at_rate(&self, rate: f32, spectrum: &mut [Complex<f64>]) {
+            spectrum.fill(Complex::new(0.0, 0.0));
+            let channel_count = spectrum.len();
+            let frequency_step =
+                self.header.sampling_speed as f64 / self.effective_fft_point as f64;
+            let reference_frequency = self.header.observing_frequency;
+            let wideband =
+                reference_frequency.is_finite() && reference_frequency.abs() > f64::EPSILON;
+            for (row_index, row) in self
+                .complex_vec
+                .chunks_exact(channel_count)
+                .take(self.phase_times.len())
+                .enumerate()
+            {
+                let cycles =
+                    rate as f64 * self.phase_times[row_index] + self.static_phase_cycles[row_index];
+                let angle = -2.0 * PI * cycles;
+                let row_factor = Complex::new(angle.cos(), angle.sin());
+                let drift = if wideband {
+                    cycles / reference_frequency
+                } else {
+                    0.0
+                };
+                let step_angle = -2.0 * PI * drift * frequency_step;
+                let step = Complex::new(step_angle.cos(), step_angle.sin());
+                let mut channel_factor = step;
+                for channel in 1..channel_count {
+                    if !self.rfi_mask[channel] {
+                        let mut sample = row[channel];
+                        if let Some(gains) = &self.bandpass_gains {
+                            sample *= gains[channel];
+                        }
+                        spectrum[channel] += Complex::new(sample.re as f64, sample.im as f64)
+                            * row_factor
+                            * channel_factor;
+                    }
+                    channel_factor *= step;
+                }
+            }
+        }
+
+        fn evaluate_spectrum_snr(&self, spectrum: &[Complex<f64>], delay: f32, rate: f32) -> f32 {
+            if self.candidate_is_masked(delay, rate) {
+                return 0.0;
+            }
+            let angle = -2.0 * PI * delay as f64 / self.effective_fft_point as f64;
+            let step = Complex::new(angle.cos(), angle.sin());
+            let mut factor = step;
+            let mut sum = Complex::<f64>::new(0.0, 0.0);
+            for &sample in spectrum.iter().skip(1) {
+                sum += sample * factor;
+                factor *= step;
+            }
+            (sum.re.hypot(sum.im) * self.coherent_sum_scale()) as f32
+        }
+
         fn evaluate_coherent_amplitude(&self, delay: f32, rate: f32) -> f32 {
             let (sum_re, sum_im) = self.evaluate_coherent_sum(delay, rate);
             (sum_re.hypot(sum_im) * self.coherent_sum_scale()) as f32
         }
 
+        fn candidate_is_masked(&self, delay: f32, rate: f32) -> bool {
+            !self.args.frequency
+                && (in_delay_rate_mask(delay, rate, delay_rate_mask_bounds(&self.args.mask))
+                    || self
+                        .args
+                        .rfi_npz_mask
+                        .as_deref()
+                        .is_some_and(|mask| mask.contains_delay_rate(delay, rate)))
+        }
+
         fn evaluate_candidate_snr(&self, delay: f32, rate: f32) -> f32 {
-            // All search modes optimize the same corrected coherent amplitude.
-            if !self.args.frequency
-                && in_delay_rate_mask(delay, rate, delay_rate_mask_bounds(&self.args.mask))
-            {
-                return 0.0;
-            }
-            if !self.args.frequency
-                && self
-                    .args
-                    .rfi_npz_mask
-                    .as_deref()
-                    .is_some_and(|mask| mask.contains_delay_rate(delay, rate))
-            {
+            if self.candidate_is_masked(delay, rate) {
                 return 0.0;
             }
             // Evaluate it directly from the visibility rows so candidate scans
@@ -1151,23 +1242,11 @@ mod deep {
             final_args.mask.clear();
 
             let pre_bandpass_analysis_results = if self.args.plot && self.bandpass_data.is_some() {
-                let mut pre_bandpass_delay_rate_2d_data_comp = process_ifft(
+                let pre_bandpass_delay_rate_2d_data_comp = self.delay_plane_for_analysis(
                     &final_freq_rate_array,
-                    self.effective_fft_point,
                     padding_length,
+                    &final_args,
                 );
-                if let Some(mask) = self.args.rfi_npz_mask.as_deref() {
-                    let (rate_count, delay_count) = pre_bandpass_delay_rate_2d_data_comp.dim();
-                    if let Some(values) = pre_bandpass_delay_rate_2d_data_comp.as_slice_mut() {
-                        mask.apply_delay_rate(
-                            values,
-                            rate_count,
-                            delay_count,
-                            self.effective_integ_time,
-                            self.effective_fft_point,
-                        );
-                    }
-                }
                 Some(analyze_results(
                     &final_freq_rate_array,
                     &pre_bandpass_delay_rate_2d_data_comp,
@@ -1184,23 +1263,8 @@ mod deep {
             };
 
             self.apply_bandpass(&mut final_freq_rate_array);
-            let mut final_delay_rate_2d_data_comp = process_ifft(
-                &final_freq_rate_array,
-                self.effective_fft_point,
-                padding_length,
-            );
-            if let Some(mask) = self.args.rfi_npz_mask.as_deref() {
-                let (rate_count, delay_count) = final_delay_rate_2d_data_comp.dim();
-                if let Some(values) = final_delay_rate_2d_data_comp.as_slice_mut() {
-                    mask.apply_delay_rate(
-                        values,
-                        rate_count,
-                        delay_count,
-                        self.effective_integ_time,
-                        self.effective_fft_point,
-                    );
-                }
-            }
+            let final_delay_rate_2d_data_comp =
+                self.delay_plane_for_analysis(&final_freq_rate_array, padding_length, &final_args);
             let mut analysis_results = analyze_results(
                 &final_freq_rate_array,
                 &final_delay_rate_2d_data_comp,
@@ -1442,7 +1506,7 @@ mod deep {
         let bandpass_gains = bandpass_data
             .as_deref()
             .and_then(|data| build_bandpass_gains(fft_point_half, data));
-        let phase_times: Vec<f64> = (0..rows)
+        let phase_times: Vec<f64> = (0..rows.min(physical_length.max(0) as usize))
             .map(|row_idx| {
                 row_idx as f64 * effective_integ_time as f64 + start_time_offset_sec as f64
             })
@@ -1525,9 +1589,7 @@ mod deep {
             search_params.delay_search_range,
         );
         let effective_cpu_count = determine_effective_cpu_count(cpu_count_arg);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(effective_cpu_count)
-            .build()?;
+        let pool = search_pool(effective_cpu_count)?;
 
         if !is_autocorrelation {
             for iteration in 0..search_params.max_iterations {
@@ -1795,34 +1857,51 @@ mod deep {
         };
         let rate_bounds = rate_search_bounds(context.effective_integ_time, &context.args.rrange);
 
-        // 並列探索実行
+        // For each rate, sum the time rows once into a channel-sized workspace.
+        // All delays then reuse it; no delay-rate plane is retained per worker.
         let final_result = pool.install(|| {
-            delay_points
+            rate_points
                 .par_iter()
-                .filter_map(|&delay| {
-                    if let Some((low, high)) = delay_bounds {
-                        if delay < low || delay > high {
+                .enumerate()
+                .map_init(
+                    || {
+                        vec![
+                            Complex::<f64>::new(0.0, 0.0);
+                            context.effective_fft_point as usize / 2
+                        ]
+                    },
+                    |spectrum, (rate_index, &rate)| {
+                        if rate < rate_bounds.0 || rate > rate_bounds.1 {
                             return None;
                         }
-                    }
-                    let best_for_delay = rate_points
-                        .iter()
-                        .filter_map(|&rate| {
-                            if rate < rate_bounds.0 || rate > rate_bounds.1 {
-                                return None;
-                            }
-                            Some((delay, rate, context.evaluate_candidate_snr(delay, rate)))
-                        })
-                        .max_by(|a, b| a.2.total_cmp(&b.2));
-                    best_for_delay
+                        context.coherent_spectrum_at_rate(rate, spectrum);
+                        delay_points
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(delay_index, &delay)| {
+                                if delay_bounds
+                                    .is_some_and(|(low, high)| delay < low || delay > high)
+                                {
+                                    return None;
+                                }
+                                Some((
+                                    delay_index,
+                                    rate_index,
+                                    delay,
+                                    rate,
+                                    context.evaluate_spectrum_snr(spectrum, delay, rate),
+                                ))
+                            })
+                            .max_by(|a, b| a.4.total_cmp(&b.4).then_with(|| b.0.cmp(&a.0)))
+                    },
+                )
+                .filter_map(|candidate| candidate)
+                .max_by(|a, b| {
+                    a.4.total_cmp(&b.4)
+                        .then_with(|| b.0.cmp(&a.0))
+                        .then_with(|| a.1.cmp(&b.1))
                 })
-                .reduce_with(|best, candidate| {
-                    if candidate.2 > best.2 {
-                        candidate
-                    } else {
-                        best
-                    }
-                })
+                .map(|(_, _, delay, rate, amplitude)| (delay, rate, amplitude))
                 .unwrap_or((center_delay, center_rate, 0.0f32))
         });
 
@@ -1890,6 +1969,9 @@ mod deep {
             None
         };
 
+        let mut spectrum =
+            vec![Complex::<f64>::new(0.0, 0.0); context.effective_fft_point as usize / 2];
+        context.coherent_spectrum_at_rate(best_rate_result.1, &mut spectrum);
         let best_delay_result = pool.install(|| {
             delay_points
                 .par_iter()
@@ -1902,7 +1984,7 @@ mod deep {
                     Some((
                         delay,
                         best_rate_result.1,
-                        context.evaluate_candidate_snr(delay, best_rate_result.1),
+                        context.evaluate_spectrum_snr(&spectrum, delay, best_rate_result.1),
                     ))
                 })
                 .reduce_with(|best, candidate| {

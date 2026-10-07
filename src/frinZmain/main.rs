@@ -47,7 +47,7 @@ Usage:
   frinZ --detail
 
 Basic:
-  --input FILE              input .cor visibility file to analyze
+  --input FILE              input .cor or yi-corr .mbcor visibility file to analyze
   --length N                integration window length in correlator sectors
   --skip SEC                skip this many seconds from the file start
   --loop N                  number of consecutive windows/scans to analyze
@@ -217,6 +217,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let command = Args::command_with_aliases();
+    let argument_ids: Vec<String> = command
+        .get_arguments()
+        .map(|arg| arg.get_id().as_str().to_owned())
+        .collect();
     let mut matches = match command.try_get_matches_from(env_args.clone()) {
         Ok(m) => m,
         Err(e) => {
@@ -227,6 +231,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
     };
+    let command_line_ids: Vec<String> = matches
+        .ids()
+        .filter(|id| {
+            argument_ids.iter().any(|arg| arg == id.as_str())
+                && matches.value_source(id.as_str()) == Some(ValueSource::CommandLine)
+        })
+        .map(|id| id.as_str().to_owned())
+        .collect();
     let iter_explicit = matches.value_source("iter") == Some(ValueSource::CommandLine);
     let rate_padding_explicit =
         matches.value_source("rate_padding") == Some(ValueSource::CommandLine);
@@ -242,6 +254,44 @@ fn run() -> Result<(), Box<dyn Error>> {
         const DETAIL_TEXT: &str = include_str!("command_detail.txt");
         print!("{}", DETAIL_TEXT);
         return Ok(());
+    }
+
+    if let Some(path) = &args.input {
+        if frinZ::mbcor::is_mbcor(path)? {
+            const SUPPORTED: &[&str] = &[
+                "input",
+                "length",
+                "skip",
+                "loop_",
+                "search",
+                "iter",
+                "rate_padding",
+                "cpu",
+                "plot",
+                "output",
+                "npz",
+                "spectrum",
+                "header",
+                "add_plot",
+                "drange",
+                "rrange",
+                "frange",
+                "rfi",
+                "delay_correct",
+                "rate_correct",
+            ];
+            for id in &command_line_ids {
+                if !SUPPORTED.contains(&id.as_str()) {
+                    return Err(format!(
+                        "--{} is not supported for MBCOR input; see docs/mbcor.md",
+                        id.replace('_', "-")
+                    )
+                    .into());
+                }
+            }
+            args.validate_runtime()?;
+            return frinZ::mbcor::run_mbcor(&args);
+        }
     }
 
     let npz_rfi_paths: Vec<&str> = args

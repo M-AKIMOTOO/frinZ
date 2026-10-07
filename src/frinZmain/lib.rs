@@ -25,6 +25,7 @@ pub mod stfft;
 
 pub mod earth_rotation_imaging;
 pub mod multisideband;
+pub mod mbcor;
 pub mod norm_acf;
 pub mod npy_output;
 pub mod output;

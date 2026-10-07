@@ -160,7 +160,7 @@ This program is licensed under the MIT License
 see https://opensource.org/license/mit"#
 )]
 pub struct Args {
-    /// Input .cor file.
+    /// Input .cor or yi-corr .mbcor file.
     #[arg(long)]
     pub input: Option<PathBuf>,
 

@@ -1,14 +1,18 @@
 # yi-corr multi-sideband input (frinZ 5.4.0)
 
-`frinZ --in joint.mbcor` reads yi-corr `YIMBCOR\0` version 1 directly. This
-format retains the native COR headers and spectra for both bands. No RAW data
-or temporary conversion files are needed. It also accepts `.mbcor.zst`.
+`frinZ --in ANT1_ANT2_YYYYDDDHHMMSS_mbcx.cor` reads yi-corr `YIMBCOR\0`
+version 1 directly. The header identifies the format, independently of the
+filename extension. Joint cross spectra use the `_mbcx.cor` suffix; joint
+auto spectra repeat the station name (`ANT1_ANT1_..._mbcx.cor` and
+`ANT2_ANT2_..._mbcx.cor`). This format retains the native COR headers and
+spectra for both bands. No RAW data or temporary conversion files are needed.
+Legacy `.mbcor` files and zstd-compressed joint files also remain readable.
 
 ```bash
-frinZ --in YAMAGU32_YAMAGU34_2026280081000_joint.mbcor
+frinZ --in YAMAGU32_YAMAGU34_2026280081000_mbcx.cor
 
 # Thirty consecutive ten-sector windows; 10 sectors = 10 s at 1 Hz output.
-frinZ --in YAMAGU32_YAMAGU34_2026280081000_joint.mbcor \
+frinZ --in YAMAGU32_YAMAGU34_2026280081000_mbcx.cor \
   --length 10 --loop 30 --search peak --add-plot --npz --cpu 6
 ```
 

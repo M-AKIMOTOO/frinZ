@@ -278,18 +278,30 @@ fn build_phase_factors(
     sampling_speed: u32,
     fft_point: u32,
 ) -> Option<(Vec<C64>, Vec<C64>, Vec<C32>)> {
+    let times_sec = (0..rows).map(|row_idx| {
+        row_idx as f64 * phase.effective_integration_length as f64
+            + phase.start_time_offset_sec as f64
+    });
+    build_phase_factors_at_times(phase, sampling_speed, fft_point, times_sec)
+}
+
+fn build_phase_factors_at_times(
+    phase: PhaseCorrection,
+    sampling_speed: u32,
+    fft_point: u32,
+    times_sec: impl ExactSizeIterator<Item = f64>,
+) -> Option<(Vec<C64>, Vec<C64>, Vec<C32>)> {
     if !phase.is_valid_for(sampling_speed, fft_point) {
         return None;
     }
 
+    let rows = times_sec.len();
     let freq_resolution_hz = sampling_speed as f64 / fft_point as f64;
     let delay_seconds = phase.delay_samples as f64 / sampling_speed as f64;
     let use_wideband_rate = phase.reference_frequency_hz.is_finite()
         && phase.reference_frequency_hz.abs() > f64::EPSILON;
-    let temporal_cycles: Vec<f64> = (0..rows)
-        .map(|row_idx| {
-            let time_sec = row_idx as f64 * phase.effective_integration_length as f64
-                + phase.start_time_offset_sec as f64;
+    let temporal_cycles: Vec<f64> = times_sec
+        .map(|time_sec| {
             phase.rate_hz as f64 * time_sec
                 + 0.5 * phase.acel_hz as f64 * time_sec.powi(2)
                 + (phase.jerk_hz_per_s2 as f64 / 6.0) * time_sec.powi(3)
@@ -481,6 +493,57 @@ pub fn apply_phase_correction_in_place_at_frequency(
         return;
     };
 
+    apply_phase_factors_in_place(data, fft_point_half, &channel_steps, &row_factors);
+}
+
+/// Apply the same wideband Taylor correction at explicitly recorded sector
+/// times. Unlike a uniform row grid, these offsets retain observation gaps.
+pub(crate) fn apply_phase_correction_in_place_at_times(
+    data: &mut [C32],
+    fft_point_half: usize,
+    rate_hz_for_correction: f32,
+    delay_samples_for_correction: f32,
+    acel_hz_for_correction: f32,
+    jerk_hz_per_s2_for_correction: f32,
+    snap_hz_per_s3_for_correction: f32,
+    sampling_speed: u32,
+    fft_point: u32,
+    times_sec: &[f64],
+    reference_frequency_hz: f64,
+) {
+    if data.is_empty()
+        || fft_point_half == 0
+        || !data.len().is_multiple_of(fft_point_half)
+        || data.len() / fft_point_half != times_sec.len()
+    {
+        return;
+    }
+
+    let phase = PhaseCorrection {
+        rate_hz: rate_hz_for_correction,
+        delay_samples: delay_samples_for_correction,
+        acel_hz: acel_hz_for_correction,
+        jerk_hz_per_s2: jerk_hz_per_s2_for_correction,
+        snap_hz_per_s3: snap_hz_per_s3_for_correction,
+        effective_integration_length: 1.0,
+        start_time_offset_sec: 0.0,
+        reference_frequency_hz,
+    };
+    let Some((channel_steps, _, row_factors)) =
+        build_phase_factors_at_times(phase, sampling_speed, fft_point, times_sec.iter().copied())
+    else {
+        return;
+    };
+
+    apply_phase_factors_in_place(data, fft_point_half, &channel_steps, &row_factors);
+}
+
+fn apply_phase_factors_in_place(
+    data: &mut [C32],
+    fft_point_half: usize,
+    channel_steps: &[C64],
+    row_factors: &[C32],
+) {
     for (row_idx, row) in data.chunks_mut(fft_point_half).enumerate() {
         let mut channel_factor = C64::new(1.0, 0.0);
         for sample in row.iter_mut() {

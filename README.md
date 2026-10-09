@@ -185,6 +185,31 @@ frinZ --input data.cor --inband 128
 frinZ --input data.cor --delay-correct 5.2 --rate-correct -0.03
 ```
 
+#### 補正済み `.cor` の保存 (`--mkcor`)
+
+```bash
+# Apply the correction to every sector and frequency channel
+frinZ --input data.cor --rate -0.002 --mkcor
+
+# Compare the numerical analysis results
+frinZ --input data.cor       --rate -0.002 --length 360 --loop 100000 --search
+frinZ --input data_mkcor.cor              --length 360 --loop 100000 --search
+```
+
+`--mkcor` は全セクター・全周波数チャンネルに補正を適用して、入力と同じディレクトリに `*_mkcor.cor` を保存します。既存の出力ファイルは上書きしません。256 byteのファイルヘッダーでは局2のクロック係数に適用済みの補正を反映し、各128 byteのセクターヘッダーと複素スペクトルの配置は保持します。
+
+補正時刻 `t` [s] は各セクターの開始時刻（秒・ナノ秒）とファイル先頭セクターの開始時刻との差です。結合した観測に空白がある場合も、その経過時間を含めます。通常解析の手動補正と `--mkcor` は、この時刻と同じ補正処理を使います。上記2つの解析では、ファイル名に由来するLabelを除く数値結果が一致します。解析時に `*_mkcor.cor` へ同じ手動補正を重ねて指定すると、補正が二重に適用されます。
+
+各チャンネルの補正には、rateから生じる時間依存の遅延も含めます。低周波端の観測周波数を `nu_ref` [Hz]、そこからのチャンネル周波数差を `f` [Hz]、定数遅延を `tau0 = delay_samples / sampling_speed` [s] とすると、複素可視量に次の位相因子を掛けます。
+
+```text
+P(t) = rate*t + acel*t^2/2 + jerk*t^3/6 + snap*t^4/24
+time_varying_delay(t) = P(t) / nu_ref
+correction(f,t) = exp(-i*2*pi*[f*tau0 + (1 + f/nu_ref)*P(t)])
+```
+
+`P(t)` は `nu_ref` での位相変化 [cycle] です。`f*P(t)/nu_ref` がチャンネルごとの位相傾斜を補正する項で、長い観測での遅延ドリフトも補正します。`--mkcor --search` を指定した場合は、手動補正後に求めた全帯域・全観測の残差delay/rateも加えて保存します。
+
 ### RFI Mitigation
 
 ```bash
@@ -224,6 +249,29 @@ frinZ --input data.cor --add-plot
 # Cumulative SNR plots
 frinZ --input data.cor --cumulate 10
 ```
+
+#### フリンジ位相の unwrap (`--add-plot`)
+
+`--add-plot` の `*_phase_unwrapped*.png` は、各解析区間の残差フリンジレートから隣接点間の位相変化を予測し、測定位相に360°の整数倍を補って描画します。入力は測定位相 `phi[i]` [deg]、経過時間 `t[i]` [s]、残差レート `r[i]` [Hz] です。通常の時系列では各区間の開始時刻を位相の基準とし、その開始時刻間の経過時間を使います。
+
+両端のレートの平均を使って予測位相差を求め、測定位相差に加える回転数を最も近い整数に丸めます。unwrap 後の位相 `Phi[i]` は次式で順に計算します。
+
+```text
+Phi[0] = phi[0]
+dt = t[i] - t[i-1]
+predicted_delta = 360 * (r[i-1] + r[i]) / 2 * dt
+observed_delta = phi[i] - phi[i-1]
+turns = round((predicted_delta - observed_delta) / 360)
+Phi[i] = Phi[i-1] + observed_delta + 360 * turns
+```
+
+この計算は、`observed_delta + 360 * turns` がレートによる予測に最も近くなるように回転数を選びます。例えば、30秒間隔でレートが一定の `0.1 Hz` なら予測位相差は `1080°`（3回転）です。測定位相が `10° → 10°` でも、unwrap 後は `10° → 1090°` になります。
+
+通常の隣接位相差だけを使う unwrap は、点間の位相変化が半回転以内という仮定に依存します。レートを使うことで、点間に半回転を超える変化や複数回転があっても回転数を推定でき、位相ドリフトや揺らぎを時系列として追いやすくなります。レートは360°の整数倍を選ぶために使い、測定位相の揺らぎは保持します。
+
+レートの推定誤差や急変、低SNRによる位相誤差で、予測と実際の位相変化が約180°以上ずれると回転数を誤る可能性があります。SNRによる重み付けや外れ値除外は行いません。また、最初の位相をそのまま起点にするため、絶対位相の360°の整数倍の不定性は残ります。位相・時刻・レートの配列長が一致しない場合は、隣接位相差が `+180°` を超えると `-360°`、`-180°` を下回ると `+360°` を累積補正する通常の unwrap に切り替わります。位相が2点未満ならそのまま返します。
+
+unwrap は描画用に計算します。通常の位相PNG、add-plot TSVの `Phase` 列、`--npz` で保存する `phase_deg` は元の測定位相です。実装は [utils.rs の `unwrap_phase_with_rate`](src/frinZmain/utils.rs) と [plot.rs の `add_plot`](src/frinZmain/plot.rs) を参照してください。
 
 ### Advanced Examples
 

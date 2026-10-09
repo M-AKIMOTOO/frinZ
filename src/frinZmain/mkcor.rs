@@ -9,10 +9,12 @@ use num_complex::Complex;
 
 use crate::args::Args;
 use crate::bandpass::read_bandpass_file;
-use crate::fft::apply_phase_correction_in_place_at_frequency;
+use crate::fft::apply_phase_correction_in_place_at_times;
 use crate::header::{parse_header, CorHeader};
 use crate::input_support::read_input_bytes;
-use crate::read::{read_visibility_data, FILE_HEADER_SIZE, SECTOR_HEADER_SIZE};
+use crate::read::{
+    read_sector_time_offsets, read_visibility_data, FILE_HEADER_SIZE, SECTOR_HEADER_SIZE,
+};
 use crate::rfi::parse_rfi_ranges;
 use crate::search;
 
@@ -121,7 +123,6 @@ fn apply_correction_to_cor_bytes(
     acel_hz_per_s: f32,
     jerk_hz_per_s2: f32,
     snap_hz_per_s3: f32,
-    effective_integ_time: f32,
 ) -> Result<(), Box<dyn Error>> {
     let rows = usize::try_from(header.number_of_sector.max(0))?;
     let width = (header.fft_point / 2) as usize;
@@ -137,8 +138,9 @@ fn apply_correction_to_cor_bytes(
         .into());
     }
 
+    let time_offsets = read_sector_time_offsets(bytes, header, 0, rows)?;
     let mut spectra = Vec::with_capacity(width);
-    for row in 0..rows {
+    for (row, &time_sec) in time_offsets.iter().enumerate() {
         let sector_start = FILE_HEADER_SIZE as usize + row * sector_size;
         let visibility_start = sector_start + SECTOR_HEADER_SIZE as usize;
         spectra.clear();
@@ -149,9 +151,10 @@ fn apply_correction_to_cor_bytes(
                 read_f32_le(bytes, offset + 4)?,
             ));
         }
-        // One row at a time preserves the full-file phase epoch.  In particular,
-        // rate/acel are not re-zeroed at individual sector boundaries.
-        apply_phase_correction_in_place_at_frequency(
+        // Use the recorded sector start, including gaps between merged scans.
+        // The wideband kernel also applies the rate-derived delay at every
+        // frequency channel, using the same file epoch as ordinary analysis.
+        apply_phase_correction_in_place_at_times(
             &mut spectra,
             width,
             rate_hz,
@@ -159,10 +162,9 @@ fn apply_correction_to_cor_bytes(
             acel_hz_per_s,
             jerk_hz_per_s2,
             snap_hz_per_s3,
-            effective_integ_time,
             header.sampling_speed as u32,
             header.fft_point as u32,
-            row as f32 * effective_integ_time,
+            &[time_sec],
             header.observing_frequency,
         );
         for (channel, value) in spectra.iter().enumerate() {
@@ -266,7 +268,8 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
         || args.jerk_correct != 0.0
         || args.snap_correct != 0.0
     {
-        apply_phase_correction_in_place_at_frequency(
+        let time_offsets = read_sector_time_offsets(&bytes, &header, 0, physical_rows as usize)?;
+        apply_phase_correction_in_place_at_times(
             &mut search_data,
             width,
             args.rate_correct,
@@ -274,10 +277,9 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
             args.acel_correct,
             args.jerk_correct,
             args.snap_correct,
-            effective_integ_time,
             header.sampling_speed as u32,
             header.fft_point as u32,
-            0.0,
+            &time_offsets,
             header.observing_frequency,
         );
     }
@@ -364,7 +366,6 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
         total_acel,
         args.jerk_correct,
         args.snap_correct,
-        effective_integ_time,
     )?;
     update_station2_clock_header(
         &mut bytes,
@@ -395,8 +396,49 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::mkcor_output_path;
+    use super::*;
+    use crate::processing::process_cor_file;
     use std::path::Path;
+
+    fn sample_cor(times_sec: &[f64]) -> Vec<u8> {
+        let fft_point = 32usize;
+        let sector_size = SECTOR_HEADER_SIZE as usize + fft_point * 4;
+        let mut bytes = vec![0u8; FILE_HEADER_SIZE as usize + times_sec.len() * sector_size];
+        bytes[..4].copy_from_slice(&[0x83, 0xf9, 0xa2, 0x3e]);
+        bytes[12..16].copy_from_slice(&1_024_000_000i32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&6_600_000_000f64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&(fft_point as i32).to_le_bytes());
+        bytes[28..32].copy_from_slice(&(times_sec.len() as i32).to_le_bytes());
+        bytes[32..40].copy_from_slice(b"YAMAGU34");
+        bytes[80..88].copy_from_slice(b"HITACH32");
+        bytes[128..135].copy_from_slice(b"TESTSRC");
+        for (offset, value) in [
+            (48, -3_502_567.576),
+            (56, 3_950_885.734),
+            (64, 3_566_449.115),
+            (96, -3_961_788.974),
+            (104, 3_243_597.492),
+            (112, 3_790_597.692),
+        ] {
+            write_f64_le(&mut bytes, offset, value).unwrap();
+        }
+        for (row, &time) in times_sec.iter().enumerate() {
+            let start = FILE_HEADER_SIZE as usize + row * sector_size;
+            let seconds = 1_769_674_860i32 + time.floor() as i32;
+            let nanoseconds = (time.fract() * 1_000_000_000.0).round() as u32;
+            bytes[start..start + 4].copy_from_slice(&seconds.to_le_bytes());
+            bytes[start + 4..start + 8].copy_from_slice(&nanoseconds.to_le_bytes());
+            bytes[start + 8..start + 12].copy_from_slice(&(seconds + 1).to_le_bytes());
+            bytes[start + 12..start + 16].copy_from_slice(&nanoseconds.to_le_bytes());
+            write_f32_le(&mut bytes, start + 112, 1.0).unwrap();
+            for channel in 0..fft_point / 2 {
+                let offset = start + SECTOR_HEADER_SIZE as usize + channel * 8;
+                write_f32_le(&mut bytes, offset, 0.75 + (row + channel) as f32 * 0.01).unwrap();
+                write_f32_le(&mut bytes, offset + 4, (row as f32 - channel as f32) * 0.02).unwrap();
+            }
+        }
+        bytes
+    }
 
     #[test]
     fn output_name_inserts_mkcor_before_cor_extension() {
@@ -406,5 +448,104 @@ mod tests {
                 .to_string_lossy(),
             "cor/YAMAGU34_HITACH32_x_mkcor.cor"
         );
+    }
+
+    #[test]
+    fn correction_uses_recorded_time_and_delay_at_every_channel() {
+        let times = [0.125, 1.375, 362.625];
+        let original = sample_cor(&times);
+        let header = parse_header(&mut Cursor::new(original.as_slice())).unwrap();
+        let mut corrected = original.clone();
+        let delay = 1.25f32;
+        let rate = -0.002f32;
+        apply_correction_to_cor_bytes(&mut corrected, &header, delay, rate, 0.0, 0.0, 0.0).unwrap();
+
+        assert_eq!(&corrected[..256], &original[..256]);
+        let stride = sector_size(&header).unwrap();
+        for (row, &time) in times.iter().enumerate() {
+            let start = FILE_HEADER_SIZE as usize + row * stride;
+            assert_eq!(
+                &corrected[start..start + 128],
+                &original[start..start + 128]
+            );
+            let cycles = rate as f64 * (time - times[0]);
+            for channel in 0..header.fft_point as usize / 2 {
+                let frequency =
+                    channel as f64 * header.sampling_speed as f64 / header.fft_point as f64;
+                let phase = -2.0
+                    * std::f64::consts::PI
+                    * (frequency * delay as f64 / header.sampling_speed as f64
+                        + (1.0 + frequency / header.observing_frequency) * cycles);
+                let offset = start + SECTOR_HEADER_SIZE as usize + channel * 8;
+                let input = C32::new(
+                    read_f32_le(&original, offset).unwrap(),
+                    read_f32_le(&original, offset + 4).unwrap(),
+                );
+                let actual = C32::new(
+                    read_f32_le(&corrected, offset).unwrap(),
+                    read_f32_le(&corrected, offset + 4).unwrap(),
+                );
+                let expected = input * C32::new(phase.cos() as f32, phase.sin() as f32);
+                assert!(
+                    (actual - expected).norm() < 1.0e-6,
+                    "row={row}, channel={channel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mkcor_matches_manual_analysis_across_scan_gaps_and_window_sizes() {
+        let times = [
+            0.125, 1.375, 2.625, 3.875, 364.125, 365.375, 366.625, 367.875, 728.125, 729.375,
+            730.625, 731.875, 732.125, 733.375, 734.625, 735.875,
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("YAMAGU34_HITACH32_2026029082100_test.cor");
+        fs::write(&input, sample_cor(&times)).unwrap();
+        let manual_args = Args {
+            input: Some(input.clone()),
+            delay_correct: 0.75,
+            rate_correct: -0.002,
+            acel_correct: 1.0e-7,
+            jerk_correct: 1.0e-10,
+            snap_correct: 1.0e-13,
+            ..Args::default()
+        };
+        run_mkcor(&manual_args).unwrap();
+        let corrected = mkcor_output_path(&input).unwrap();
+
+        for length in [1, 4, 8, 16] {
+            for skip in [0, 2] {
+                let original_args = Args {
+                    length,
+                    skip,
+                    loop_: 100_000,
+                    search: vec!["peak".to_string()],
+                    add_plot: true,
+                    cpu: 1,
+                    ..manual_args.clone()
+                };
+                let corrected_args = Args {
+                    input: Some(corrected.clone()),
+                    delay_correct: 0.0,
+                    rate_correct: 0.0,
+                    acel_correct: 0.0,
+                    jerk_correct: 0.0,
+                    snap_correct: 0.0,
+                    ..original_args.clone()
+                };
+                let expected = process_cor_file(&input, &original_args, &[], &[], true).unwrap();
+                let actual = process_cor_file(&corrected, &corrected_args, &[], &[], true).unwrap();
+                assert!(!expected.add_plot_phase.is_empty());
+                assert_eq!(actual.add_plot_times, expected.add_plot_times);
+                assert_eq!(actual.add_plot_amp, expected.add_plot_amp);
+                assert_eq!(actual.add_plot_snr, expected.add_plot_snr);
+                assert_eq!(actual.add_plot_phase, expected.add_plot_phase);
+                assert_eq!(actual.add_plot_noise, expected.add_plot_noise);
+                assert_eq!(actual.add_plot_res_delay, expected.add_plot_res_delay);
+                assert_eq!(actual.add_plot_res_rate, expected.add_plot_res_rate);
+            }
+        }
     }
 }

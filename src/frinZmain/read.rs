@@ -164,6 +164,43 @@ pub fn read_sector_metadata(
     Ok((time, normalize_effective_integration_time(integration)))
 }
 
+/// Read each sector's start time relative to the first sector of the file.
+/// Keep the seconds and nanoseconds separate until subtracting the epoch so
+/// sub-second precision is not lost when converting Unix timestamps to f64.
+pub(crate) fn read_sector_time_offsets(
+    bytes: &[u8],
+    header: &CorHeader,
+    first_sector: usize,
+    sectors: usize,
+) -> io::Result<Vec<f64>> {
+    let available = available_cor_sectors(header, bytes.len())? as usize;
+    let end_sector = first_sector
+        .checked_add(sectors)
+        .filter(|&end| end <= available)
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "sector is unavailable"))?;
+    if sectors == 0 {
+        return Ok(Vec::new());
+    }
+
+    let sector_size = SECTOR_HEADER_SIZE as usize + header.fft_point as usize * 4;
+    let mut cursor = Cursor::new(bytes);
+    cursor.set_position(FILE_HEADER_SIZE);
+    let epoch_seconds = cursor.read_i32::<byteorder::LittleEndian>()? as i64;
+    let epoch_nanoseconds = cursor.read_u32::<byteorder::LittleEndian>()? as i64;
+
+    let mut offsets = Vec::with_capacity(sectors);
+    for sector in first_sector..end_sector {
+        cursor.set_position(FILE_HEADER_SIZE + (sector * sector_size) as u64);
+        let seconds = cursor.read_i32::<byteorder::LittleEndian>()? as i64;
+        let nanoseconds = cursor.read_u32::<byteorder::LittleEndian>()? as i64;
+        offsets.push(
+            (seconds - epoch_seconds) as f64
+                + (nanoseconds - epoch_nanoseconds) as f64 / 1_000_000_000.0,
+        );
+    }
+    Ok(offsets)
+}
+
 pub fn read_visibility_data(
     cursor: &mut Cursor<&[u8]>,
     header: &CorHeader,

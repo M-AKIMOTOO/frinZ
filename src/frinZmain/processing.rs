@@ -23,8 +23,8 @@ use crate::contamination::{
     apply_contamination_subtract, write_contamination_handoff, ContaminationPhaseCorrectionInput,
 };
 use crate::fft::{
-    apply_phase_correction_in_place_at_frequency, cached_fft_plan, process_fft,
-    process_fft_with_phase_correction_at_frequency, process_ifft,
+    apply_phase_correction_in_place_at_frequency, apply_phase_correction_in_place_at_times,
+    cached_fft_plan, process_fft, process_fft_with_phase_correction_at_frequency, process_ifft,
 };
 use crate::fits_output::{write_fits_image, FitsAxis, FitsMetadata};
 use crate::header::{available_cor_sectors, parse_header, CorHeader};
@@ -39,7 +39,7 @@ use crate::output::{
 use crate::plot::{
     delay_plane, frequency_plane, plot_dynamic_spectrum_freq, plot_dynamic_spectrum_lag,
 };
-use crate::read::read_visibility_data;
+use crate::read::{calculate_sector_range, read_sector_time_offsets, read_visibility_data};
 use crate::rfi::{detect_histogram_rfi, has_histogram_mode, parse_rfi_ranges, HistogramRfiResult};
 use crate::search;
 use crate::spike34m::{
@@ -702,13 +702,27 @@ pub fn process_cor_file(
         );
         let manual_acel_correct = args.acel_correct;
 
-        if manual_delay_correct != 0.0 || manual_rate_correct != 0.0 || manual_acel_correct != 0.0 {
-            let start_time_offset_sec = current_obs_time
-                .signed_duration_since(file_start_time)
-                .num_milliseconds() as f32
-                / 1000.0;
+        if manual_delay_correct != 0.0
+            || manual_rate_correct != 0.0
+            || manual_acel_correct != 0.0
+            || args.jerk_correct != 0.0
+            || args.snap_correct != 0.0
+        {
+            let (first_sector, _) = calculate_sector_range(
+                &header,
+                requested_length,
+                read_skip,
+                read_loop_index,
+                args.cumulate != 0,
+            );
+            let time_offsets = read_sector_time_offsets(
+                input_data.as_slice(),
+                &header,
+                first_sector as usize,
+                actual_length as usize,
+            )?;
 
-            apply_phase_correction_in_place_at_frequency(
+            apply_phase_correction_in_place_at_times(
                 &mut complex_vec,
                 fft_point_half_used,
                 manual_rate_correct,
@@ -716,10 +730,9 @@ pub fn process_cor_file(
                 manual_acel_correct,
                 args.jerk_correct,
                 args.snap_correct,
-                effective_integ_time,
                 header.sampling_speed as u32,
                 effective_fft_point as u32,
-                start_time_offset_sec,
+                &time_offsets,
                 processing_header.observing_frequency,
             );
         }
@@ -819,6 +832,8 @@ pub fn process_cor_file(
         loop_args.delay_correct = 0.0;
         loop_args.rate_correct = 0.0;
         loop_args.acel_correct = 0.0;
+        loop_args.jerk_correct = 0.0;
+        loop_args.snap_correct = 0.0;
 
         let primary_search_mode = args.primary_search_mode();
 

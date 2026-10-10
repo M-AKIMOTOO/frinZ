@@ -33,8 +33,8 @@ use crate::norm_acf::NormAcfContext;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::{
     format_delay_output, format_delay_tsv_header, format_delay_tsv_row, format_freq_output,
-    format_freq_tsv_header, format_freq_tsv_row, format_result_stdout_header,
-    generate_output_names, insert_product_before_processing_suffixes, output_header_info,
+    format_freq_tsv_header, format_freq_tsv_row, generate_output_names,
+    insert_product_before_processing_suffixes, output_header_info,
 };
 use crate::plot::{
     delay_plane, frequency_plane, plot_dynamic_spectrum_freq, plot_dynamic_spectrum_lag,
@@ -1350,11 +1350,18 @@ pub fn process_cor_file(
                 obsfreq_mhz,
             );
             if l1 == 0 {
-                let header_str = format_result_stdout_header(
-                    &header.station1_name,
-                    &header.station2_name,
-                    false,
-                );
+                let station1_label = format!("{}-azel", header.station1_name.trim());
+                let station2_label = format!("{}-azel", header.station2_name.trim());
+                let header_str = format!(
+                        concat!(
+                            "#*************************************************************************************************************************************************************************************************************************\n",
+                            "#      Epoch        Label    Source     Length       Amp         SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF  obsfreq\n",
+                            "#                                        [s]         [%]                  [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F] [MHz]\n",
+                            "#*************************************************************************************************************************************************************************************************************************"
+                        ),
+                        station1_label,
+                        station2_label
+                    );
                 if !suppress_output {
                     println!("{}", header_str);
                 }
@@ -1443,8 +1450,18 @@ pub fn process_cor_file(
                 obsfreq_mhz,
             );
             if l1 == 0 {
-                let header_str =
-                    format_result_stdout_header(&header.station1_name, &header.station2_name, true);
+                let station1_label = format!("{}-azel", header.station1_name.trim());
+                let station2_label = format!("{}-azel", header.station2_name.trim());
+                let header_str = format!(
+                    concat!(
+                        "#*******************************************************************************************************************************************************************************************************************\n",
+                        "#      Epoch        Label    Source     Length       Amp         SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF  obsfreq\n",
+                        "#                                        [s]         [%]                 [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F] [MHz]\n",
+                        "#*******************************************************************************************************************************************************************************************************************"
+                    ),
+                    station1_label,
+                    station2_label
+                );
                 if !suppress_output {
                     println!("{}", header_str);
                 }
@@ -1908,7 +1925,7 @@ pub fn process_cor_file(
                         analysis_results.source_name.to_string(),
                         length_val,
                         freq_val,
-                        crate::output::format_f32(analysis_results.delay_max_amp * 100.0),
+                        format!("{:.8e}", analysis_results.delay_max_amp * 100.0),
                         format!("{:+.5}", analysis_results.delay_phase),
                         format!(
                             "{:.3} ({:.6})",
@@ -2075,7 +2092,7 @@ pub fn process_cor_file(
                         analysis_results.source_name.to_string(),
                         length_val,
                         freq_val,
-                        crate::output::format_f32(analysis_results.freq_max_amp * 100.0),
+                        format!("{:.8e}", analysis_results.freq_max_amp * 100.0),
                         format!("{:+.5}", analysis_results.freq_phase),
                         format!("{:+.6}", analysis_results.freq_max_freq),
                         format!(

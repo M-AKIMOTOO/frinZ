@@ -238,29 +238,22 @@ frinZ --input data.cor --output
 frinZ --input data.cor --header
 ```
 
-標準出力と `--output` の解析結果TSV、`--add-plot` の時系列TSVは、保存した数値を元の型で読み戻すと同じビット列になる精度で出力します。
+Amp [%] は標準出力、解析結果TSV、add-plot TSV、および図中のPeak Amp注記で、仮数の小数点以下8桁の指数表記（`%.8e` 相当、有効数字9桁）を使います。フラックス較正などの後処理で、テキストから [%] に換算済みのfloat32の振幅をビット単位で復元できます。この保証はAmp列の有限値をfloat32として読み戻す場合に適用します。
 
-| 内部の型 | 数値列 | 出力書式 | 有効数字 |
-|---|---|---|---|
-| float32 | Length、Amp、SNR、Phase、Frequency、Noise-level、Res-Delay、Res-Rate、各局のaz/el/hgt、add-plotのTime | `%.8e` 相当 | 9桁 |
-| float64 | MJD | `%.16e` 相当 | 17桁 |
-
-この保証は有限値を元の浮動小数点型で読み戻す場合に適用します。Amp と Noise-level は [%] に換算した float32 の値です。図中のPeak Amp注記も有効数字9桁で表示します。Epoch は存在する秒未満の時刻も保存します。
-
-Python で通常の解析結果TSVを読み込む例（列番号は0始まり）:
+Python でAmpを読み込む例（列番号は0始まり）:
 
 ```python
 import numpy as np
 
-# Lengthから各局のaz/el/hgtまでを、元のfloat32で読み込む。
-values = np.loadtxt("result.tsv", delimiter="\t", usecols=range(3, 16),
-                    dtype=np.float32, ndmin=2)
-# MJDはfloat64として読み込む。
-mjd = np.loadtxt("result.tsv", delimiter="\t", usecols=16,
-                 dtype=np.float64, ndmin=1)
+# 通常の解析結果TSV: Ampは5列目。
+amp_percent = np.loadtxt("result.tsv", delimiter="\t", usecols=4,
+                         dtype=np.float32, ndmin=1)
+# add-plot TSV: Ampは2列目。
+amp_series_percent = np.loadtxt("add_plot.tsv", delimiter="\t", usecols=1,
+                                dtype=np.float32, ndmin=1)
 ```
 
-Python標準の `float` は64 bitです。float32の列は `np.float32` を指定して読み込んでください。元の数値を復元した後の計算結果の一致には、計算で使う型・式・演算順序も揃える必要があります。
+Python標準の `float` は64 bitです。Ampは `np.float32` を指定して読み込んでください。復元した値を使う計算結果の一致には、計算で使う型・式・演算順序も揃える必要があります。
 
 #### Plotting
 ```bash

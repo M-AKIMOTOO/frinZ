@@ -222,7 +222,7 @@ pub fn format_delay_output(
     let noise_level = format_noise_level_percent(results.delay_noise);
     let label_segment = label.get(3).copied().unwrap_or("");
     format!(
-        " {}   {:<5}  {:<10} {:<8} {:<3.6} {:>7.1} {:>+10.3}  {:>10}  {:>+9.8}   {:>+4.8}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
+        " {}   {:<5}  {:<10} {:<8} {:>12.6e} {:>7.1} {:>+10.3}  {:>10}  {:>+9.8}   {:>+4.8}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
         results.yyyydddhhmmss1,
         label_segment,
         results.source_name,
@@ -260,7 +260,7 @@ pub fn format_freq_output(
     let noise_level = format_noise_level_percent(results.freq_noise);
     let label_segment = label.get(3).copied().unwrap_or("");
     format!(
-        " {}   {:<5}  {:<10} {:<8} {:<8.6}  {:>7.1}   {:>+10.3} {:>+12.7} {:>10} {:>+10.6} {:>7.3} {:>7.3} {:>7.3}  {:>7.3} {:>7.3} {:>7.3} {:>12.5}   {:<15} {:<5} {:<5}",
+        " {}   {:<5}  {:<10} {:<8} {:>12.6e}  {:>7.1}   {:>+10.3} {:>+12.7} {:>10} {:>+10.6} {:>7.3} {:>7.3} {:>7.3}  {:>7.3} {:>7.3} {:>7.3} {:>12.5}   {:<15} {:<5} {:<5}",
         results.yyyydddhhmmss1,
         label_segment,
         results.source_name,
@@ -368,7 +368,7 @@ pub fn format_delay_tsv_row(
         sanitize_tsv_field(label_segment),
         sanitize_tsv_field(&results.source_name),
         format_output_length(results.length_f32),
-        format!("{:.6}", results.delay_max_amp * 100.0),
+        format!("{:.6e}", results.delay_max_amp * 100.0),
         format!("{:.1}", results.delay_snr),
         format!("{:.3}", results.delay_phase),
         format_noise_level_percent(results.delay_noise),
@@ -403,7 +403,7 @@ pub fn format_freq_tsv_row(
         sanitize_tsv_field(label_segment),
         sanitize_tsv_field(&results.source_name),
         format_output_length(results.length_f32),
-        format!("{:.6}", results.freq_max_amp * 100.0),
+        format!("{:.6e}", results.freq_max_amp * 100.0),
         format!("{:.1}", results.freq_snr),
         format!("{:.3}", results.freq_phase),
         format!("{:.7}", results.freq_freq),

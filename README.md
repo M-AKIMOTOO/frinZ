@@ -238,6 +238,8 @@ frinZ --input data.cor --output
 frinZ --input data.cor --header
 ```
 
+Amp [%] は標準出力、解析結果TSV、add-plot TSV、および図中のPeak Amp注記で、仮数の小数点以下6桁の指数表記（`%.6e` 相当）を使います。振幅が小さい天体でも、有効数字7桁を表示できます。
+
 #### Plotting
 ```bash
 # Generate fringe plots

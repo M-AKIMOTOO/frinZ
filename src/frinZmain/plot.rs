@@ -1560,7 +1560,7 @@ fn write_add_plot_tsv(
         };
         writeln!(
             file,
-            "{:.5}\t{:.6}\t{:.1}\t{:.3}\t{}\t{:.5e}\t{:.8}\t{:.8}",
+            "{:.5}\t{:.6e}\t{:.1}\t{:.3}\t{}\t{:.5e}\t{:.8}\t{:.8}",
             length[idx],
             amp[idx],
             snr[idx],

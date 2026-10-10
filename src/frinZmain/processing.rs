@@ -1355,8 +1355,8 @@ pub fn process_cor_file(
                 let header_str = format!(
                         concat!(
                             "#*************************************************************************************************************************************************************************************************************************\n",
-                            "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF  obsfreq\n",
-                            "#                                        [s]      [%]               [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F] [MHz]\n",
+                            "#      Epoch        Label    Source     Length      Amp        SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF  obsfreq\n",
+                            "#                                        [s]        [%]                 [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F] [MHz]\n",
                             "#*************************************************************************************************************************************************************************************************************************"
                         ),
                         station1_label,
@@ -1455,8 +1455,8 @@ pub fn process_cor_file(
                 let header_str = format!(
                     concat!(
                         "#*******************************************************************************************************************************************************************************************************************\n",
-                        "#      Epoch        Label    Source     Length    Amp      SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF  obsfreq\n",
-                        "#                                        [s]      [%]              [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F] [MHz]\n",
+                        "#      Epoch        Label    Source     Length      Amp        SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF  obsfreq\n",
+                        "#                                        [s]        [%]                [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F] [MHz]\n",
                         "#*******************************************************************************************************************************************************************************************************************"
                     ),
                     station1_label,
@@ -1925,7 +1925,7 @@ pub fn process_cor_file(
                         analysis_results.source_name.to_string(),
                         length_val,
                         freq_val,
-                        format!("{:.6}", analysis_results.delay_max_amp * 100.0),
+                        format!("{:.6e}", analysis_results.delay_max_amp * 100.0),
                         format!("{:+.5}", analysis_results.delay_phase),
                         format!(
                             "{:.3} ({:.6})",
@@ -2092,7 +2092,7 @@ pub fn process_cor_file(
                         analysis_results.source_name.to_string(),
                         length_val,
                         freq_val,
-                        format!("{:.6}", analysis_results.freq_max_amp * 100.0),
+                        format!("{:.6e}", analysis_results.freq_max_amp * 100.0),
                         format!("{:+.5}", analysis_results.freq_phase),
                         format!("{:+.6}", analysis_results.freq_max_freq),
                         format!(

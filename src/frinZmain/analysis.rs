@@ -714,7 +714,7 @@ pub fn analyze_results(
     );
 
     AnalysisResults {
-        yyyydddhhmmss1: obs_time.format("%Y/%j %H:%M:%S").to_string(),
+        yyyydddhhmmss1: obs_time.format("%Y/%j %H:%M:%S%.f").to_string(),
         source_name: header.source_name.clone(),
         length_f32,
         ant1_az,

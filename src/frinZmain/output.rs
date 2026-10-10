@@ -218,34 +218,15 @@ pub fn format_delay_output(
     bandpass_applied: bool,
     norm_acf_applied: bool,
 ) -> String {
-    let display_length = format_output_length(results.length_f32);
-    let noise_level = format_noise_level_percent(results.delay_noise);
-    let label_segment = label.get(3).copied().unwrap_or("");
-    format!(
-        " {}   {:<5}  {:<10} {:<8} {:>12.6e} {:>7.1} {:>+10.3}  {:>10}  {:>+9.8}   {:>+4.8}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
-        results.yyyydddhhmmss1,
-        label_segment,
-        results.source_name,
-        display_length,
-        results.delay_max_amp * 100.0,
-        results.delay_snr,
-        results.delay_phase,
-        noise_level,
-        results.residual_delay,
-        results.residual_rate,
-        results.ant1_az,
-        results.ant1_el,
-        results.ant1_hgt,
-        results.ant2_az,
-        results.ant2_el,
-        results.ant2_hgt,
-        results.mjd,
+    let columns = result_columns(
+        results,
+        label,
         rfi_display,
-        if bandpass_applied { "True" } else { "False" },
-        if norm_acf_applied { "True" } else { "False" },
-        //results.l_coord,
-        //results.m_coord
-    )
+        bandpass_applied,
+        norm_acf_applied,
+        false,
+    );
+    format!("  {}", format_stdout_columns(&columns))
 }
 
 pub fn format_freq_output(
@@ -256,46 +237,100 @@ pub fn format_freq_output(
     bandpass_applied: bool,
     norm_acf_applied: bool,
 ) -> String {
-    let display_length = format_output_length(results.length_f32);
-    let noise_level = format_noise_level_percent(results.freq_noise);
-    let label_segment = label.get(3).copied().unwrap_or("");
-    format!(
-        " {}   {:<5}  {:<10} {:<8} {:>12.6e}  {:>7.1}   {:>+10.3} {:>+12.7} {:>10} {:>+10.6} {:>7.3} {:>7.3} {:>7.3}  {:>7.3} {:>7.3} {:>7.3} {:>12.5}   {:<15} {:<5} {:<5}",
-        results.yyyydddhhmmss1,
-        label_segment,
-        results.source_name,
-        display_length,
-        results.freq_max_amp * 100.0,
-        results.freq_snr,
-        results.freq_phase,
-        results.freq_freq,
-        noise_level,
-        results.residual_rate,
-        results.ant1_az,
-        results.ant1_el,
-        results.ant1_hgt,
-        results.ant2_az,
-        results.ant2_el,
-        results.ant2_hgt,
-        results.mjd,
+    let columns = result_columns(
+        results,
+        label,
         rfi_display,
-        if bandpass_applied { "True" } else { "False" },
-        if norm_acf_applied { "True" } else { "False" },
-        //results.l_coord,
-        //results.m_coord
-    )
+        bandpass_applied,
+        norm_acf_applied,
+        true,
+    );
+    format!("  {}", format_stdout_columns(&columns))
 }
 
-fn format_output_length(length: f32) -> String {
-    if length < 1.0 {
-        format!("{length:.5e}")
-    } else {
-        format!("{length:.1}")
-    }
+/// Nine significant decimal digits preserve every finite f32 on parsing as f32.
+pub(crate) fn format_f32(value: f32) -> String {
+    format!("{value:.8e}")
+}
+
+/// Seventeen significant decimal digits preserve every finite f64 on parsing as f64.
+pub(crate) fn format_f64(value: f64) -> String {
+    format!("{value:.16e}")
 }
 
 fn format_noise_level_percent(noise: f32) -> String {
-    format!("{:.5e}", noise * 100.0)
+    format_f32(noise * 100.0)
+}
+
+fn result_columns(
+    results: &AnalysisResults,
+    label: &[&str],
+    rfi_display: &str,
+    bandpass_applied: bool,
+    norm_acf_applied: bool,
+    frequency_mode: bool,
+) -> Vec<String> {
+    let mut columns = vec![
+        results.yyyydddhhmmss1.clone(),
+        sanitize_tsv_field(label.get(3).copied().unwrap_or("")),
+        sanitize_tsv_field(&results.source_name),
+        format_f32(results.length_f32),
+    ];
+    if frequency_mode {
+        columns.extend([
+            format_f32(results.freq_max_amp * 100.0),
+            format_f32(results.freq_snr),
+            format_f32(results.freq_phase),
+            format_f32(results.freq_freq),
+            format_noise_level_percent(results.freq_noise),
+            format_f32(results.residual_rate),
+        ]);
+    } else {
+        columns.extend([
+            format_f32(results.delay_max_amp * 100.0),
+            format_f32(results.delay_snr),
+            format_f32(results.delay_phase),
+            format_noise_level_percent(results.delay_noise),
+            format_f32(results.residual_delay),
+            format_f32(results.residual_rate),
+        ]);
+    }
+    columns.extend([
+        format_f32(results.ant1_az),
+        format_f32(results.ant1_el),
+        format_f32(results.ant1_hgt),
+        format_f32(results.ant2_az),
+        format_f32(results.ant2_el),
+        format_f32(results.ant2_hgt),
+        format_f64(results.mjd),
+        sanitize_tsv_field(rfi_display),
+        if bandpass_applied { "True" } else { "False" }.to_string(),
+        if norm_acf_applied { "True" } else { "False" }.to_string(),
+    ]);
+    columns
+}
+
+fn format_stdout_columns(columns: &[String]) -> String {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let width = match index {
+                0 => 19,
+                1 | 18 | 19 => 5,
+                2 => 10,
+                16 => 24,
+                20 => 6,
+                _ => 15,
+            };
+            if matches!(index, 0..=2 | 17..=19) {
+                format!("{value:<width$}")
+            } else {
+                format!("{value:>width$}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn format_tsv_epoch(value: &str) -> String {
@@ -354,6 +389,30 @@ pub fn format_freq_tsv_header(station1_name: &str, station2_name: &str) -> Strin
     format_tsv_header(station1_name, station2_name, true)
 }
 
+pub fn format_result_stdout_header(
+    station1_name: &str,
+    station2_name: &str,
+    frequency_mode: bool,
+) -> String {
+    let header = format_tsv_header(station1_name, station2_name, frequency_mode);
+    let lines: Vec<String> = header
+        .lines()
+        .map(|line| {
+            let columns: Vec<String> = line
+                .trim_start_matches("# ")
+                .split('\t')
+                .map(str::to_string)
+                .collect();
+            format!("# {}", format_stdout_columns(&columns))
+        })
+        .collect();
+    let border = format!(
+        "#{}",
+        "*".repeat(lines.iter().map(String::len).max().unwrap_or(1) - 1)
+    );
+    format!("{border}\n{}\n{border}", lines.join("\n"))
+}
+
 pub fn format_delay_tsv_row(
     results: &AnalysisResults,
     label: &[&str],
@@ -362,31 +421,17 @@ pub fn format_delay_tsv_row(
     norm_acf_applied: bool,
     obsfreq_mhz: i64,
 ) -> String {
-    let label_segment = label.get(3).copied().unwrap_or("");
-    vec![
-        format_tsv_epoch(&results.yyyydddhhmmss1),
-        sanitize_tsv_field(label_segment),
-        sanitize_tsv_field(&results.source_name),
-        format_output_length(results.length_f32),
-        format!("{:.6e}", results.delay_max_amp * 100.0),
-        format!("{:.1}", results.delay_snr),
-        format!("{:.3}", results.delay_phase),
-        format_noise_level_percent(results.delay_noise),
-        format!("{:.8}", results.residual_delay),
-        format!("{:.8}", results.residual_rate),
-        format!("{:.3}", results.ant1_az),
-        format!("{:.3}", results.ant1_el),
-        format!("{:.3}", results.ant1_hgt),
-        format!("{:.3}", results.ant2_az),
-        format!("{:.3}", results.ant2_el),
-        format!("{:.3}", results.ant2_hgt),
-        format!("{:.5}", results.mjd),
-        sanitize_tsv_field(rfi_display),
-        if bandpass_applied { "True" } else { "False" }.to_string(),
-        if norm_acf_applied { "True" } else { "False" }.to_string(),
-        obsfreq_mhz.to_string(),
-    ]
-    .join("\t")
+    let mut columns = result_columns(
+        results,
+        label,
+        rfi_display,
+        bandpass_applied,
+        norm_acf_applied,
+        false,
+    );
+    columns[0] = format_tsv_epoch(&columns[0]);
+    columns.push(obsfreq_mhz.to_string());
+    columns.join("\t")
 }
 
 pub fn format_freq_tsv_row(
@@ -397,31 +442,17 @@ pub fn format_freq_tsv_row(
     norm_acf_applied: bool,
     obsfreq_mhz: i64,
 ) -> String {
-    let label_segment = label.get(3).copied().unwrap_or("");
-    vec![
-        format_tsv_epoch(&results.yyyydddhhmmss1),
-        sanitize_tsv_field(label_segment),
-        sanitize_tsv_field(&results.source_name),
-        format_output_length(results.length_f32),
-        format!("{:.6e}", results.freq_max_amp * 100.0),
-        format!("{:.1}", results.freq_snr),
-        format!("{:.3}", results.freq_phase),
-        format!("{:.7}", results.freq_freq),
-        format_noise_level_percent(results.freq_noise),
-        format!("{:.6}", results.residual_rate),
-        format!("{:.3}", results.ant1_az),
-        format!("{:.3}", results.ant1_el),
-        format!("{:.3}", results.ant1_hgt),
-        format!("{:.3}", results.ant2_az),
-        format!("{:.3}", results.ant2_el),
-        format!("{:.3}", results.ant2_hgt),
-        format!("{:.5}", results.mjd),
-        sanitize_tsv_field(rfi_display),
-        if bandpass_applied { "True" } else { "False" }.to_string(),
-        if norm_acf_applied { "True" } else { "False" }.to_string(),
-        obsfreq_mhz.to_string(),
-    ]
-    .join("\t")
+    let mut columns = result_columns(
+        results,
+        label,
+        rfi_display,
+        bandpass_applied,
+        norm_acf_applied,
+        true,
+    );
+    columns[0] = format_tsv_epoch(&columns[0]);
+    columns.push(obsfreq_mhz.to_string());
+    columns.join("\t")
 }
 
 pub fn write_phase_corrected_spectrum_binary(
@@ -453,9 +484,11 @@ pub fn write_phase_corrected_spectrum_binary(
 #[cfg(test)]
 mod filename_tests {
     use super::{
-        format_delay_tsv_header, format_freq_tsv_header, format_noise_level_percent,
-        format_output_length, format_tsv_epoch, insert_product_before_processing_suffixes,
+        format_delay_output, format_delay_tsv_header, format_delay_tsv_row, format_f32, format_f64,
+        format_freq_output, format_freq_tsv_header, format_freq_tsv_row, format_tsv_epoch,
+        insert_product_before_processing_suffixes, AnalysisResults, C32,
     };
+    use ndarray::Array1;
 
     #[test]
     fn product_precedes_bandpass_suffix() {
@@ -527,10 +560,153 @@ mod filename_tests {
     }
 
     #[test]
-    fn result_numeric_formats_cover_subsecond_lengths() {
-        assert_eq!(format_output_length(0.125), "1.25000e-1");
-        assert_eq!(format_output_length(1.0), "1.0");
-        assert_eq!(format_output_length(10.25), "10.2");
-        assert_eq!(format_noise_level_percent(0.000_012_345_6), "1.23456e-3");
+    fn finite_float_values_survive_text_round_trip() {
+        // Include both signs of zero, subnormals, normal boundaries, adjacent
+        // values around one, and maximum finite values.
+        for bits in [
+            0,
+            0x8000_0000,
+            1,
+            0x8000_0001,
+            0x007f_ffff,
+            0x0080_0000,
+            0x3f80_0001,
+            0x3f80_0002,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+        ] {
+            let value = f32::from_bits(bits);
+            assert_eq!(format_f32(value).parse::<f32>().unwrap().to_bits(), bits);
+        }
+        for bits in [
+            0,
+            0x8000_0000_0000_0000,
+            1,
+            0x8000_0000_0000_0001,
+            0x000f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x3ff0_0000_0000_0001,
+            0x7fef_ffff_ffff_ffff,
+            0xffef_ffff_ffff_ffff,
+        ] {
+            let value = f64::from_bits(bits);
+            assert_eq!(format_f64(value).parse::<f64>().unwrap().to_bits(), bits);
+        }
+        // Deterministically sample mantissas and exponents across both types.
+        let mut bits = 0x1234_5678_9abc_def0u64;
+        for _ in 0..10_000 {
+            bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let value = f32::from_bits(bits as u32);
+            if value.is_finite() {
+                assert_eq!(
+                    format_f32(value).parse::<f32>().unwrap().to_bits(),
+                    value.to_bits()
+                );
+            }
+            let value = f64::from_bits(bits);
+            if value.is_finite() {
+                assert_eq!(format_f64(value).parse::<f64>().unwrap().to_bits(), bits);
+            }
+        }
+    }
+
+    #[test]
+    fn stdout_and_tsv_preserve_every_reported_numeric_column() {
+        let results = AnalysisResults {
+            yyyydddhhmmss1: "2021/156 18:35:00.123456789".to_string(),
+            source_name: "AEAqr".to_string(),
+            length_f32: 10.251234,
+            ant1_az: 170.79321,
+            ant1_el: 54.559128,
+            ant1_hgt: 165.70813,
+            ant2_az: 170.79413,
+            ant2_el: 54.559227,
+            ant2_hgt: 166.61014,
+            mjd: 59370.774306984516,
+            delay_range: Array1::zeros(0),
+            visibility: Array1::zeros(0),
+            delay_rate: Array1::zeros(0),
+            delay_peak_complex: C32::new(0.0, 0.0),
+            delay_max_amp: 0.00001613935,
+            delay_phase: 52.323128,
+            delay_snr: 7.929819,
+            delay_noise: 0.00000203538,
+            residual_delay: 1.2345678,
+            corrected_delay: 0.0,
+            delay_offset: 0.0,
+            freq_max_amp: 0.000019723456,
+            freq_phase: -27.765129,
+            freq_freq: 123.45678,
+            freq_snr: 8.712345,
+            freq_noise: 0.000002345678,
+            freq_rate: Array1::zeros(0),
+            freq_rate_spectrum: Array1::zeros(0),
+            freq_range: Array1::zeros(0),
+            freq_max_freq: 123.45678,
+            residual_rate: -0.0,
+            corrected_rate: 0.0,
+            rate_offset: 0.0,
+            corrected_acel: 0.0,
+            corrected_jerk: 0.0,
+            corrected_snap: 0.0,
+            rate_range: Vec::new(),
+            l_coord: 0.0,
+            m_coord: 0.0,
+        };
+        let label = ["", "", "", "all"];
+        for frequency in [false, true] {
+            let (tsv, stdout, mode_values) = if frequency {
+                (
+                    format_freq_tsv_row(&results, &label, "-", false, false, 8192),
+                    format_freq_output(&results, &label, 10, "-", false, false),
+                    [
+                        results.freq_max_amp * 100.0,
+                        results.freq_snr,
+                        results.freq_phase,
+                        results.freq_freq,
+                        results.freq_noise * 100.0,
+                        results.residual_rate,
+                    ],
+                )
+            } else {
+                (
+                    format_delay_tsv_row(&results, &label, "-", false, false, 8192),
+                    format_delay_output(&results, &label, 10, "-", false, false),
+                    [
+                        results.delay_max_amp * 100.0,
+                        results.delay_snr,
+                        results.delay_phase,
+                        results.delay_noise * 100.0,
+                        results.residual_delay,
+                        results.residual_rate,
+                    ],
+                )
+            };
+            let fields: Vec<&str> = tsv.split('\t').collect();
+            assert_eq!(fields.len(), 21);
+            assert_eq!(fields[0], "2021/156T18:35:00.123456789");
+            let expected: Vec<f32> = [results.length_f32]
+                .into_iter()
+                .chain(mode_values)
+                .chain([
+                    results.ant1_az,
+                    results.ant1_el,
+                    results.ant1_hgt,
+                    results.ant2_az,
+                    results.ant2_el,
+                    results.ant2_hgt,
+                ])
+                .collect();
+            for (text, original) in fields[3..16].iter().zip(expected) {
+                assert_eq!(text.parse::<f32>().unwrap().to_bits(), original.to_bits());
+            }
+            assert_eq!(
+                fields[16].parse::<f64>().unwrap().to_bits(),
+                results.mjd.to_bits()
+            );
+            assert_eq!(fields[20], "8192");
+            let stdout_fields: Vec<&str> = stdout.split_whitespace().collect();
+            assert_eq!(&stdout_fields[4..18], &fields[3..17]);
+        }
     }
 }

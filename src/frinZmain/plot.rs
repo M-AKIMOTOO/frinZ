@@ -7,7 +7,7 @@
 // - multi-sideband summary plot (merged from former plot_msb.rs)
 use crate::args::Args;
 use crate::npy_output::{npz_sidecar_path, write_named_real_1d_npz, NamedNpz, NpyMeta};
-use crate::output::{generate_output_names, insert_product_before_processing_suffixes};
+use crate::output::{format_f32, generate_output_names, insert_product_before_processing_suffixes};
 use crate::png_compress::{compress_png, compress_png_with_mode, CompressQuality};
 use crate::processing::ProcessResult;
 use crate::utils::safe_arg;
@@ -1554,24 +1554,70 @@ fn write_add_plot_tsv(
     )?;
     for idx in 0..rows {
         let frequency = if freq.len() == rows {
-            format!("{:.7}", freq[idx])
+            format_f32(freq[idx])
         } else {
             "-".to_string()
         };
         writeln!(
             file,
-            "{:.5}\t{:.6e}\t{:.1}\t{:.3}\t{}\t{:.5e}\t{:.8}\t{:.8}",
-            length[idx],
-            amp[idx],
-            snr[idx],
-            phase[idx],
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            format_f32(length[idx]),
+            format_f32(amp[idx]),
+            format_f32(snr[idx]),
+            format_f32(phase[idx]),
             frequency,
-            noise[idx],
-            res_delay[idx],
-            res_rate[idx]
+            format_f32(noise[idx]),
+            format_f32(res_delay[idx]),
+            format_f32(res_rate[idx])
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod text_precision_tests {
+    use super::write_add_plot_tsv;
+
+    #[test]
+    fn add_plot_tsv_preserves_all_f32_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let values = [
+            120.12345f32,
+            0.001613935,
+            7.912345,
+            52.323128,
+            129.12345,
+            0.000203538,
+            1.2345678,
+            -0.00000000012345678,
+        ];
+        for frequency_mode in [false, true] {
+            let path = directory.path().join(format!("{frequency_mode}.tsv"));
+            write_add_plot_tsv(
+                &path,
+                &values[0..1],
+                &values[1..2],
+                &values[2..3],
+                &values[3..4],
+                if frequency_mode { &values[4..5] } else { &[] },
+                &values[5..6],
+                &values[6..7],
+                &values[7..8],
+            )
+            .unwrap();
+            let text = std::fs::read_to_string(path).unwrap();
+            let row = text.lines().find(|line| !line.starts_with('#')).unwrap();
+            let fields: Vec<&str> = row.split('\t').collect();
+            assert_eq!(fields.len(), values.len());
+            for (index, (&field, value)) in fields.iter().zip(values).enumerate() {
+                if index == 4 && !frequency_mode {
+                    assert_eq!(field, "-");
+                } else {
+                    assert_eq!(field.parse::<f32>().unwrap().to_bits(), value.to_bits());
+                }
+            }
+        }
+    }
 }
 
 pub fn add_plot(

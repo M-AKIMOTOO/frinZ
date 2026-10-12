@@ -51,7 +51,7 @@ cargo build --workspace --release
 
 This repository is split into:
 
-- `frinZ`: publishable crate and main binary
+- `frinZ`: publishable crate with the `frinZ` and `frinZtable` binaries
 - `frinZ-tools`: local-only package for `gfrinZ`, `pulsar_gating`, `cormerge`, and `bandscythe`
 
 ```bash
@@ -78,6 +78,61 @@ cargo run -p frinZ-tools --bin bandscythe --release -- --help
 ```
 
 **Note:** crates.io publish target is `frinZ` only. On Windows, antivirus software may flag the compiled binary.
+
+### frinZtable: 解析結果の表・統計・グラフGUI
+
+`src/frinZtable/` は frinZ の TSV 出力を表計算形式で扱うネイティブGUIです。ルートの `frinZ` パッケージに登録し、`table-gui` 機能を既定で有効にしています。通常のインストールでは機能フラグの指定は不要です。
+
+```bash
+cargo build -p frinZ --bin frinZtable
+./target/debug/frinZtable '/home/akimoto/collaboration_共同研究/XRISM/4U1755-338/YI/I26283X/i26283x_frinZ_len0s_c_time.tsv'
+
+# インストールする場合
+cargo install --bin frinZtable --path .
+# Linuxのアプリ一覧・TSVの「別のアプリケーションで開く」に登録
+frinZtable --install-desktop
+
+# GUI依存関係を含めず、解析CLIだけをビルドする場合
+cargo build -p frinZ --no-default-features --bin frinZ
+```
+
+- `#` 行はデータに含めません。コメント形式の列名・単位はメタデータとして読み取り、その他のコメントは保存・再出力します。ヘッダーのない21列TSVでは `frinZmain/output.rs` のヘッダー生成関数から列名・単位を取得します。AmpとNoise-levelはすでに%であり、さらに100倍しません。周波数モードはヘッダーまたは `_freq` を含むファイル名で判別し、それ以外のヘッダーなしファイルには `--frequency` を指定できます。
+- 列見出しをクリックすると数値・日時・文字列を昇順／降順にソートします。天体別のソート、天体フィルター、全セル検索、数値範囲フィルターにも対応します。
+- 背景は黒、文字・軸・プロットは白です。`Source` のチェックボックスで複数天体を同時に選択できます。天体の区別にはマーカー形状を使い、ヒストグラムでは線種も変えます。
+- セルを選択して上部の入力欄で編集し、`Apply` または Enter で確定します。ダブルクリック／F2で入力欄に移動し、Shiftクリックで矩形範囲を選択、Ctrl+C／Ctrl+VでTSV形式のコピー・貼り付け、Ctrl+Z／Ctrl+Yで最大50操作の取り消し・やり直しができます。計算列は読み取り専用です。
+- 表示中の行または選択した行について、列ごとの件数・欠損数・合計・平均・中央値・標本標準偏差・標準誤差・最小値・最大値・RMSを計算します。非数値・NaN・無限大は除外します。標準偏差はn−1で計算し、1件では標準偏差・標準誤差を未定義として表示します。Phaseの統計は通常の算術統計であり、±180°の折り返しを補正しません。
+- 天体ごとのパラメーター集計は各見出しでソートでき、天体名をクリックするとその天体だけを表示します。Ctrlクリックでは天体の選択を追加・解除します。複数天体を選択した場合は全体統計と各天体の統計を同時に表示します。
+- 数値列の選択・編集・フィルター変更に合わせて、天体別の時系列／散布図、ヒストグラム、天体別平均±標準誤差のグラフを更新します。時系列の表示形式は `Scatter`（点のみ）、`Linear`（直線のみ）、`Scatter + dotted line`（点と点線）から選べます。時系列は最初の観測日の整数MJDを基準にして、横軸を `MJD − 61323 (days)` のような小さな値で表示します。`Reference MJD` を直接編集でき、`First day` で初期値へ戻し、`Absolute MJD` で基準差し引きを解除できます。Y₁・Y₂それぞれの天体を選択できます。別パラメーターを同じ天体で比較する場合は同じ天体を両方に指定し、同じパラメーターを2天体で比較する場合はY₁とY₂に別々の天体を指定します。複数天体の同時表示、AmpのNoise-level誤差棒、log10表示、拡大・移動にも対応します。log10では正の値だけを描画します。
+- 各行の `Plot` チェックボックスで描画する／しないを切り替えます。表示中の行・選択範囲を一括で切り替えるボタンもあります。描画対象は天体・検索・数値フィルターと行チェックをすべて満たす行です。列統計の対象は引き続き `Visible rows`／`Selected rows` で指定し、`Plot` を外した行もその統計対象には含まれます。`Source means` グラフの平均・標準誤差は描画対象行から計算します。行チェックはUndo/Redo、ソート、保存・再読込に対応し、保存時には `# frinZtable plot-excluded:` コメントへ対象行番号を記録します。
+- GUIグラフはパネルの横幅・高さ全体を使って表示します。下部パネルの境界をドラッグして高さを調整でき、`Expand graph` では表・統計パネルを隠してウィンドウ全体にグラフを広げます。`Back to table` で表に戻ります。`9:6 preview` を選ぶと書き出しと同じ横:縦=9:6のプレビューになります。`Export PNG/PDF/EPS…` を押すと、保存ダイアログは読み込んだTSVと同じディレクトリで開きます。時系列の `name.png` を保存名に指定すると、MJD軸の1800×1200 PNG・PDF・EPS、`name_hour` のhour軸PNG・PDF・EPS、および同名のPythonスクリプト1本を作成します。hour軸は参照MJDからの経過時間で、参照MJDが未指定なら最初の観測日の整数MJDを基準にします。ヒストグラムなど時間軸を持たないグラフは1組だけ作成します。CLIで相対パスの保存名を指定した場合もTSVの隣に保存します。既存のファイルがあれば上書きせず、新しい名前を指定します。
+- 生成したスクリプトはMatplotlibが入ったPython環境で実行でき、配色・背景はMatplotlib標準です。行データと軸・モード・天体・誤差棒・log10・ビン数・参照MJDなどの設定はスクリプト内に埋め込まれるため、再プロット用に管理するファイルは `.py` だけです。スクリプトを別の場所へ移動しても単独で実行できます。先頭の `FIGSIZE = (9, 6)`、DPIや描画コードを直接調整し、例えば `python3 name.py --style scatter-dotted --output revised.eps` で再生成します。時系列グラフは毎回 `revised.eps` と `revised_hour.eps` の両方を作成します。軸を片方だけにするオプションはありません。出力先を指定しなければ、スクリプトと同じディレクトリに `_replot.png` と `_replot_hour.png` を作成します。`--output` の拡張子に `.png`、`.pdf`、`.eps`、`.svg` を指定できます。余白を自動で切り詰めず、図全体の9:6を保持します。
+- `Help / ヘルプ (F1)` はまずfrinZmainで実行可能な処理の一覧を表示します。処理名・オプションで検索し、希望する項目をクリックすると用途、実行例、現在のCLI定義・別名・既定値、関連仕様を表示します。`処理一覧に戻る` と `詳細をコピー` に対応します。`全仕様書・全オプション（全文）` には `--detail` ガイド、全CLI定義、README、`.mbcor`仕様を省略せず収録しています。
+- Linuxでは `frinZtable --install-desktop` で現在の実行ファイルをアプリ登録します。アプリ一覧で `frinZtable` を検索して起動でき、TSVの「別のアプリケーションで開く」にも表示します。アイコンと `frinZtable.desktop` は `$XDG_DATA_HOME`（未指定時は `~/.local/share`）へ保存します。ランチャーの追加アクションからヘルプを直接開けます。ファイルを渡さずに起動した場合は `Open TSV…` またはドラッグ＆ドロップで読み込みます。バイナリの設置場所を変えた場合はその場所のバイナリで再登録します。
+- `+ Calculated column` で `Amp / [Noise-level]` や `sqrt(E^2)` のような行ごとの計算列を追加できます。入力セルの変更に合わせて再計算します。演算子は `+ - * / ^`、関数は `abs, sqrt, ln, log10, exp, sin, cos` です。三角関数の入力はラジアンです。無効な計算結果は空欄になります。
+- `Save table as…` は全行を元の順序で保存し、`Export view…` はフィルターとソートを反映した行を出力します。`Export statistics…` は列全体と天体別の統計をTSVに保存します。計算列は数値として出力し、式そのものは再読込されません。未保存の変更がある場合はファイル切替・終了時に確認します。
+
+GUIを開かずに統計を確認することもできます。
+
+```bash
+./target/debug/frinZtable result.tsv --summary
+./target/debug/frinZtable result.tsv --source 4U1755-3 --summary
+# 複数天体を選び、GUIなしで9:6画像と再生成ファイルを保存
+./target/debug/frinZtable result.tsv --source NRAO530,4U1755-3 --export-plot amp.png
+./target/debug/frinZtable result.tsv --y Amp --y2 Noise-level --reference-mjd 61323 --export-plot amp.png
+./target/debug/frinZtable result.tsv --source A,B --y Amp --y-source A --y2 Amp --y2-source B --export-plot compare.png
+./target/debug/frinZtable result.tsv --y Amp --y-source A --y2 Phase --y2-source A --export-plot amp_phase.png
+./target/debug/frinZtable result.tsv --plot-style scatter-dotted --export-plot amp_dotted.png
+./target/debug/frinZtable result.tsv --plot-mode sources --y Phase --export-plot phase.png
+# 生成されたスクリプトで軸・タイトル・天体・出力形式を調整
+python3 amp.py --sources NRAO530 4U1755-3 --title 'Two sources' --output amp_revised.pdf
+python3 amp.py --xlim 0.20 0.35 --ylim 0 0.6
+# デスクトップ環境で画面をPNGに保存して終了
+./target/debug/frinZtable result.tsv --screenshot /tmp/frinZtable.png
+# 起動時から処理一覧を表示
+./target/debug/frinZtable result.tsv --manual
+# 大きなグラフ表示で起動
+./target/debug/frinZtable result.tsv --expand-graph
+```
 
 ## Library API
 

@@ -8,7 +8,7 @@ description = "fringe search for Yamaguchi Interferometer and Japanese VLBI Netw
 repository = "https://github.com/M-AKIMOTOO/frinZrs"
 documentation = "https://docs.rs/frinZ"
 readme = "README.md"    
-include = ["src/frinZmain/", "!src/frinZmain/*.orig", "README.md", "docs/mbcor.md", "LICENSE", "LICENSE-3RD-PARTY-WWZ"]
+include = ["src/frinZmain/", "src/frinZtable/", "!src/frinZmain/*.orig", "README.md", "docs/mbcor.md", "LICENSE", "LICENSE-3RD-PARTY-WWZ"]
 
 [workspace]
 members = ["tools", "xtask"]
@@ -21,8 +21,14 @@ path = "src/frinZmain/lib.rs"
 name = "frinZ"
 path = "src/frinZmain/main.rs"
 
+[[bin]]
+name = "frinZtable"
+path = "src/frinZtable/main.rs"
+required-features = ["table-gui"]
+
 [features]
-default = []
+default = ["table-gui"]
+table-gui = ["dep:eframe", "dep:egui_plot", "dep:rfd"]
 
 [profile.release]
 opt-level = 3
@@ -43,6 +49,9 @@ incremental = false
 overflow-checks = false
 
 [dependencies]
+eframe = { version = "=0.32.3", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_plot = { version = "=0.33.0", optional = true }
+rfd = { version = "0.15.4", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }

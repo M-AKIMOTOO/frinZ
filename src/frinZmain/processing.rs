@@ -907,10 +907,6 @@ pub fn process_cor_file(
                 };
                 search_result.analysis_results.residual_delay -= loop_args.delay_correct;
                 search_result.analysis_results.residual_rate -= loop_args.rate_correct;
-                // corrected_* should represent user-provided/static correction values
-                // (e.g. --delay/--rate or scan-correct), not search-updated totals.
-                search_result.analysis_results.corrected_delay = manual_delay_correct;
-                search_result.analysis_results.corrected_rate = manual_rate_correct;
                 let result_tuple = (
                     search_result.analysis_results,
                     search_result.freq_rate_array,
@@ -962,6 +958,11 @@ pub fn process_cor_file(
                 )
             }
         };
+
+        // The data already received the manual correction before entering the
+        // analysis/search pipeline. Keep its values for reporting in every mode.
+        analysis_results.corrected_delay = manual_delay_correct;
+        analysis_results.corrected_rate = manual_rate_correct;
 
         let mut histogram_result: Option<HistogramRfiResult> = None;
         if has_rfi_histogram {

@@ -286,6 +286,9 @@ frinZ --input data.cor --bandpass /path/to/bandpass_table.npz
 ### Output Options
 
 #### Text Output
+
+標準出力と解析結果TSVの `Res-Delay / Res-Rate` は、入力corに対する補正量（手動補正値＋検索で求めた追加残差）を表示します。`--search` のみでは推定値、`--delay/--rate` のみでは指定した補正値、併用時は両者の合計です。時間領域の図では、既存の residual 欄に追加残差、corrected 欄に手動補正値を表示します。
+
 ```bash
 # Save analysis results to text files
 frinZ --input data.cor --output

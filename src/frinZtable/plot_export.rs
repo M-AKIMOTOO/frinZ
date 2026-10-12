@@ -18,6 +18,46 @@ use std::{
 pub const IMAGE_SIZE: (u32, u32) = (1800, 1200);
 const SCRIPT: &str = include_str!("plot_template.py");
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ExportFormat {
+    #[default]
+    Png,
+    Pdf,
+    Eps,
+}
+
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Pdf => "pdf",
+            Self::Eps => "eps",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::Pdf => "PDF",
+            Self::Eps => "EPS",
+        }
+    }
+
+    fn from_path(path: &Path) -> Result<Self> {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => Ok(Self::Png),
+            Some("pdf") => Ok(Self::Pdf),
+            Some("eps") => Ok(Self::Eps),
+            _ => anyhow::bail!("Choose one graph format: .png, .pdf, or .eps"),
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct Settings {
     mode: PlotMode,
@@ -55,22 +95,8 @@ struct Layer {
     bars: Vec<(f64, f64, f64)>,
 }
 
-pub fn bundle_paths(path: &Path) -> Result<[PathBuf; 4]> {
-    ensure!(
-        path.extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("png")),
-        "Choose a .png filename for the 9:6 graph"
-    );
-    path.file_stem().context("A graph filename is required")?;
-    Ok([
-        path.to_path_buf(),
-        path.with_extension("py"),
-        path.with_extension("pdf"),
-        path.with_extension("eps"),
-    ])
-}
-
 pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions) -> Result<()> {
+    let format = ExportFormat::from_path(path)?;
     ensure!(options.y < table.columns.len(), "Select a numeric Y column");
     ensure!(
         options.x.is_none_or(|c| c < table.columns.len()),
@@ -103,7 +129,7 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
         !rows.is_empty(),
         "No rows are enabled for plotting in this view"
     );
-    let mut paths = bundle_paths(path)?.to_vec();
+    path.file_stem().context("A graph filename is required")?;
     let is_time_series = options.mode == PlotMode::Series
         && options.x.map_or_else(
             || table.column("Epoch").is_some() || table.column("MJD").is_some(),
@@ -112,16 +138,20 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
     let hour_reference_mjd = is_time_series
         .then(|| options.reference_mjd.or_else(|| first_mjd_reference(table)))
         .flatten();
-    if hour_reference_mjd.is_some() {
-        let hour_png = path.with_file_name(format!(
-            "{}_hour.png",
-            path.file_stem().unwrap().to_string_lossy()
-        ));
-        paths.extend([
-            hour_png.clone(),
-            hour_png.with_extension("pdf"),
-            hour_png.with_extension("eps"),
-        ]);
+    let script_path = path.with_extension("py");
+    let hour_path = hour_reference_mjd.map(|_| {
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy())
+            .unwrap_or_default();
+        path.with_file_name(format!(
+            "{}_hour.{extension}",
+            path.file_stem().unwrap().to_string_lossy(),
+        ))
+    });
+    let mut paths = vec![path.to_path_buf(), script_path];
+    if let Some(hour_path) = &hour_path {
+        paths.push(hour_path.clone());
     }
     for file in &paths {
         ensure!(!file.exists(), "{} already exists. Choose a new graph name to preserve your previous script and settings.", file.display());
@@ -226,43 +256,55 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
         .iter()
         .map(|p| stage.path().join(p.file_name().unwrap()))
         .collect();
-    render(&staged[0], &settings, &layers)?;
-    if let Some(reference) = settings.hour_reference_mjd {
-        let hour_settings = hour_settings(&settings);
-        let hour_layers = layers_in_hours(&layers, settings.reference_mjd, reference);
-        render(&staged[4], &hour_settings, &hour_layers)?;
-    }
     fs::write(&staged[1], python_script)?;
-    // Matplotlib produces vector PDF and EPS while the native renderer creates
-    // the matching PNG. The script carries all settings and data internally.
-    let python = std::env::var_os("FRINZTABLE_PYTHON").unwrap_or_else(|| "python3".into());
-    for image in [&staged[2], &staged[3]] {
-        let output = Command::new(&python)
-            .arg(&staged[1])
-            .arg("--output")
-            .arg(image)
-            .output()
-            .with_context(|| {
-                format!(
-                    "Could not start {} to create PDF/EPS output",
-                    PathBuf::from(&python).display()
-                )
-            })?;
-        ensure!(
-            output.status.success(),
-            "Could not create {} with Matplotlib: {}{}",
-            image
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_uppercase(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-            if output.stderr.is_empty() {
-                "Install Matplotlib or set FRINZTABLE_PYTHON to a Python executable that has it installed.".to_string()
-            } else {
-                String::new()
+    match format {
+        ExportFormat::Png => {
+            render(&staged[0], &settings, &layers)?;
+            if let Some(reference) = settings.hour_reference_mjd {
+                let hour_settings = hour_settings(&settings);
+                let hour_layers = layers_in_hours(&layers, settings.reference_mjd, reference);
+                render(
+                    staged.get(2).context("Hour-axis PNG path is missing")?,
+                    &hour_settings,
+                    &hour_layers,
+                )?;
             }
-        );
+        }
+        ExportFormat::Pdf | ExportFormat::Eps => {
+            // The editable script creates the selected vector format and its
+            // hour-axis companion in one run. No other graph format is emitted.
+            let python = std::env::var_os("FRINZTABLE_PYTHON").unwrap_or_else(|| "python3".into());
+            let output = Command::new(&python)
+                .arg(&staged[1])
+                .arg("--output")
+                .arg(&staged[0])
+                .output()
+                .with_context(|| {
+                    format!(
+                        "Could not start {} to create {} output",
+                        PathBuf::from(&python).display(),
+                        format.label()
+                    )
+                })?;
+            ensure!(
+                output.status.success(),
+                "Could not create {} with Matplotlib: {}{}",
+                format.label(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+                if output.stderr.is_empty() {
+                    "Install Matplotlib or set FRINZTABLE_PYTHON to a Python executable that has it installed.".to_string()
+                } else {
+                    String::new()
+                }
+            );
+            for image in std::iter::once(&staged[0]).chain(staged.get(2)) {
+                ensure!(
+                    image.exists(),
+                    "Matplotlib did not create {}",
+                    image.display()
+                );
+            }
+        }
     }
 
     for (staged, final_path) in staged.iter().zip(&paths) {
@@ -708,7 +750,7 @@ fn render(path: &Path, settings: &Settings, layers: &[Layer]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn exported_bundle_has_three_formats_and_embeds_only_enabled_rows() {
+    fn png_export_writes_only_png_and_script_and_embeds_enabled_rows() {
         let mut table =
             Table::parse("Source\tAmp\tNoise-level\nA\t4\t2\nB\t6\t3\nA\t8\t2", false).unwrap();
         table.plot_enabled[1] = false;
@@ -723,10 +765,11 @@ mod tests {
             export(&path, &table, &table.plotted_rows(&[0, 1, 2]), &options).unwrap();
             let image = image::image_dimensions(&path).unwrap();
             assert_eq!(image, IMAGE_SIZE);
-            let paths = bundle_paths(&path).unwrap();
-            assert!(paths[2].exists());
-            assert!(paths[3].exists());
-            let script = fs::read_to_string(&paths[1]).unwrap();
+            let script_path = path.with_extension("py");
+            assert!(script_path.exists());
+            assert!(!path.with_extension("pdf").exists());
+            assert!(!path.with_extension("eps").exists());
+            let script = fs::read_to_string(&script_path).unwrap();
             assert!(script.contains("FIGSIZE = (9, 6)"));
             assert!(script.contains("EMBEDDED = json.loads("));
             assert!(script.contains(r"1\\tA\\t1\\t4\\t\\t2"));
@@ -736,29 +779,43 @@ mod tests {
     }
 
     #[test]
-    fn time_series_export_adds_hour_axis_bundle() {
+    fn time_series_export_writes_only_the_selected_format_and_hour_companion() {
         let table = Table::parse("Source\tMJD\tAmp\nA\t60000.25\t4\nA\t60001\t8", false).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("time.png");
         let options = PlotOptions {
             y: 2,
             reference_mjd: Some(60000.25),
             ..Default::default()
         };
 
-        export(&path, &table, &[0, 1], &options).unwrap();
-
         for extension in ["png", "pdf", "eps"] {
-            let hour_path = directory.path().join(format!("time_hour.{extension}"));
+            let path = directory
+                .path()
+                .join(format!("time_{extension}.{extension}"));
+            export(&path, &table, &[0, 1], &options).unwrap();
+            let hour_path = directory
+                .path()
+                .join(format!("time_{extension}_hour.{extension}"));
+            assert!(path.exists(), "missing {}", path.display());
             assert!(hour_path.exists(), "missing {}", hour_path.display());
+            assert!(path.with_extension("py").exists());
+            if extension == "png" {
+                assert_eq!(image::image_dimensions(&hour_path).unwrap(), IMAGE_SIZE);
+            }
+            for unselected in ["png", "pdf", "eps"]
+                .into_iter()
+                .filter(|candidate| *candidate != extension)
+            {
+                assert!(!path.with_extension(unselected).exists());
+                assert!(!directory
+                    .path()
+                    .join(format!("time_{extension}_hour.{unselected}"))
+                    .exists());
+            }
+            let script = fs::read_to_string(path.with_extension("py")).unwrap();
+            assert!(script.contains("time_axis"));
+            assert!(script.contains("hour_reference_mjd"));
+            assert!(!script.contains("--time-axis"));
         }
-        assert_eq!(
-            image::image_dimensions(directory.path().join("time_hour.png")).unwrap(),
-            IMAGE_SIZE
-        );
-        let script = fs::read_to_string(directory.path().join("time.py")).unwrap();
-        assert!(script.contains("time_axis"));
-        assert!(script.contains("hour_reference_mjd"));
-        assert!(!script.contains("--time-axis"));
     }
 }

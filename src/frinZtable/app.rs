@@ -1,7 +1,7 @@
 use super::{
     data::{column_letter, number, ColumnSummary, Filter, Sort, SourceSummary, Table},
     help::HelpBrowser,
-    plot_export,
+    plot_export::{self, ExportFormat},
     plots::{self, PlotMode, PlotOptions, SeriesStyle},
     stats::{display, Statistics},
 };
@@ -43,6 +43,7 @@ pub struct TableApp {
     group_sort: usize,
     group_descending: bool,
     plot: PlotOptions,
+    export_format: ExportFormat,
     graph_expanded: bool,
     undo: Vec<Table>,
     redo: Vec<Table>,
@@ -100,7 +101,7 @@ impl TableApp {
             min_text: String::new(), max_text: String::new(), sort: None, view: Vec::new(), numeric: Vec::new(),
             summaries: Vec::new(), groups: Vec::new(), selected: None, anchor: None,
             edit: String::new(), edit_focus: false, statistics_selected: false, all_statistics: false,
-            group_sort: 0, group_descending: false, plot: PlotOptions::default(), graph_expanded: false, undo: Vec::new(), redo: Vec::new(),
+            group_sort: 0, group_descending: false, plot: PlotOptions::default(), export_format: ExportFormat::default(), graph_expanded: false, undo: Vec::new(), redo: Vec::new(),
             dirty: false, message: "Click a cell to inspect it; double-click or F2 to edit. Shift-click selects a range.".into(),
             formula_window: false, formula_name: "AmpToNoise".into(), formula_unit: String::new(),
             formula: "Amp / [Noise-level]".into(), pending: None, allow_close: false,
@@ -158,10 +159,15 @@ impl TableApp {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "frinZ".into());
+        let extension = self.export_format.extension();
+        let filter = format!(
+            "{} graph + editable Python script",
+            self.export_format.label()
+        );
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("PNG + PDF + EPS (MJD + hour) + editable script", &["png"])
+            .add_filter(&filter, &[extension])
             .set_file_name(format!(
-                "{stem}_{}_plot.png",
+                "{stem}_{}_plot.{extension}",
                 self.table.columns[self.plot.y].name
             ));
         if let Some(directory) = self
@@ -175,12 +181,14 @@ impl TableApp {
         let Some(path) = dialog.save_file() else {
             return;
         };
+        let path = path.with_extension(extension);
         match plot_export::export(&path, &self.table, &rows, &self.plot) {
             Ok(()) => {
                 self.message = format!(
-                "Saved 9:6 MJD/hour PNG, PDF, EPS and self-contained editable Python script: {}",
-                path.display()
-            )
+                    "Saved {} graph output and editable Python script: {}",
+                    self.export_format.label(),
+                    path.display()
+                )
             }
             Err(err) => self.message = format!("Graph export failed: {err}"),
         }
@@ -1037,10 +1045,19 @@ impl TableApp {
             if ui.button("Fit plot").clicked() {
                 self.plot.reset = true;
             }
+            ui.separator();
+            ui.label("Export format");
+            for format in [ExportFormat::Png, ExportFormat::Pdf, ExportFormat::Eps] {
+                ui.selectable_value(
+                    &mut self.export_format,
+                    format,
+                    format.label(),
+                );
+            }
             if ui
                 .add_enabled(
                     !self.table.columns.is_empty(),
-                    egui::Button::new("Export PNG/PDF/EPS…"),
+                    egui::Button::new(format!("Export {}…", self.export_format.label())),
                 )
                 .clicked()
             {

@@ -32,7 +32,7 @@ struct Arguments {
     /// Filter by source names; repeat the option or separate names with commas.
     #[arg(long, value_delimiter = ',')]
     source: Vec<String>,
-    /// Write 9:6 PNG, PDF and EPS plus a self-contained Python script; time series include MJD and hour axes.
+    /// Choose .png, .pdf, or .eps in the output path; writes only that format plus an editable script and MJD/hour pair.
     #[arg(long, conflicts_with_all = ["summary", "screenshot"])]
     export_plot: Option<PathBuf>,
     /// Plot X column name; default is Epoch/MJD.

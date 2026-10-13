@@ -221,8 +221,10 @@ pub fn format_delay_output(
     let display_length = format_output_length(results.length_f32);
     let noise_level = format_noise_level_percent(results.delay_noise);
     let label_segment = label.get(3).copied().unwrap_or("");
+    // Nine significant digits let the printed f32 correction round-trip when
+    // copied back into --delay/--rate.
     format!(
-        " {}   {:<5}  {:<10} {:<8} {:>14.8e} {:>7.1} {:>+10.3}  {:>10}  {:>+9.8}   {:>+4.8}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
+        " {}   {:<5}  {:<10} {:<8} {:>14.8e} {:>7.1} {:>+10.3}  {:>10}  {:>+15.8e}   {:>+15.8e}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
         results.yyyydddhhmmss1,
         label_segment,
         results.source_name,
@@ -260,7 +262,7 @@ pub fn format_freq_output(
     let noise_level = format_noise_level_percent(results.freq_noise);
     let label_segment = label.get(3).copied().unwrap_or("");
     format!(
-        " {}   {:<5}  {:<10} {:<8} {:>14.8e}  {:>7.1}   {:>+10.3} {:>+12.7} {:>10} {:>+10.6} {:>7.3} {:>7.3} {:>7.3}  {:>7.3} {:>7.3} {:>7.3} {:>12.5}   {:<15} {:<5} {:<5}",
+        " {}   {:<5}  {:<10} {:<8} {:>14.8e}  {:>7.1}   {:>+10.3} {:>+12.7} {:>10} {:>+15.8e} {:>7.3} {:>7.3} {:>7.3}  {:>7.3} {:>7.3} {:>7.3} {:>12.5}   {:<15} {:<5} {:<5}",
         results.yyyydddhhmmss1,
         label_segment,
         results.source_name,
@@ -372,8 +374,8 @@ pub fn format_delay_tsv_row(
         format!("{:.1}", results.delay_snr),
         format!("{:.3}", results.delay_phase),
         format_noise_level_percent(results.delay_noise),
-        format!("{:.8}", results.corrected_delay + results.residual_delay),
-        format!("{:.8}", results.corrected_rate + results.residual_rate),
+        format!("{:+.8e}", results.corrected_delay + results.residual_delay),
+        format!("{:+.8e}", results.corrected_rate + results.residual_rate),
         format!("{:.3}", results.ant1_az),
         format!("{:.3}", results.ant1_el),
         format!("{:.3}", results.ant1_hgt),
@@ -408,7 +410,7 @@ pub fn format_freq_tsv_row(
         format!("{:.3}", results.freq_phase),
         format!("{:.7}", results.freq_freq),
         format_noise_level_percent(results.freq_noise),
-        format!("{:.6}", results.corrected_rate + results.residual_rate),
+        format!("{:+.8e}", results.corrected_rate + results.residual_rate),
         format!("{:.3}", results.ant1_az),
         format!("{:.3}", results.ant1_el),
         format!("{:.3}", results.ant1_hgt),

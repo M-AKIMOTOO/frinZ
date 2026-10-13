@@ -684,12 +684,13 @@ pub fn process_cor_file(
         );
         let manual_acel_correct = args.acel_correct;
 
-        if manual_delay_correct != 0.0
+        let needs_recorded_times = manual_delay_correct != 0.0
             || manual_rate_correct != 0.0
             || manual_acel_correct != 0.0
             || args.jerk_correct != 0.0
             || args.snap_correct != 0.0
-        {
+            || args.primary_search_mode().is_some();
+        let sector_time_offsets = if needs_recorded_times {
             let (first_sector, _) = calculate_sector_range(
                 &header,
                 requested_length,
@@ -697,13 +698,31 @@ pub fn process_cor_file(
                 read_loop_index,
                 args.cumulate != 0,
             );
-            let time_offsets = read_sector_time_offsets(
+            read_sector_time_offsets(
                 input_data.as_slice(),
                 &header,
                 first_sector as usize,
                 actual_length as usize,
-            )?;
+            )?
+        } else {
+            Vec::new()
+        };
+        let phase_epoch = sector_time_offsets.first().copied().unwrap_or(0.0);
+        let search_phase_times: Vec<f64> = if args.primary_search_mode().is_some() {
+            sector_time_offsets
+                .iter()
+                .map(|time| time - phase_epoch)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
+        if manual_delay_correct != 0.0
+            || manual_rate_correct != 0.0
+            || manual_acel_correct != 0.0
+            || args.jerk_correct != 0.0
+            || args.snap_correct != 0.0
+        {
             apply_phase_correction_in_place_at_times(
                 &mut complex_vec,
                 fft_point_half_used,
@@ -714,7 +733,7 @@ pub fn process_cor_file(
                 args.snap_correct,
                 header.sampling_speed as u32,
                 effective_fft_point as u32,
-                &time_offsets,
+                &sector_time_offsets,
                 processing_header.observing_frequency,
             );
         }
@@ -842,7 +861,7 @@ pub fn process_cor_file(
                 // plane below; search measurements remain on native rows.
                 search_args.plot = false;
                 let mut search_result = if primary_search_mode == Some("deep") {
-                    search::run_deep_search(
+                    search::run_deep_search_with_phase_times(
                         &complex_vec,
                         &processing_header,
                         current_length,
@@ -856,9 +875,10 @@ pub fn process_cor_file(
                         pp,
                         search_args.cpu,
                         search_seed,
+                        &search_phase_times,
                     )?
                 } else if primary_search_mode == Some("coherent") {
-                    search::run_coherent_search(
+                    search::run_coherent_search_with_phase_times(
                         &complex_vec,
                         &processing_header,
                         current_length,
@@ -872,9 +892,10 @@ pub fn process_cor_file(
                         pp,
                         search_args.cpu,
                         search_seed,
+                        &search_phase_times,
                     )?
                 } else {
-                    search::run_peak_search(
+                    search::run_peak_search_with_phase_times(
                         &complex_vec,
                         &processing_header,
                         current_length,
@@ -888,6 +909,7 @@ pub fn process_cor_file(
                         pp,
                         search_args.cpu,
                         search_seed,
+                        &search_phase_times,
                     )?
                 };
                 search_result.analysis_results.residual_delay -= loop_args.delay_correct;
@@ -1578,16 +1600,52 @@ pub fn process_cor_file(
             if l1 == 0 {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
                 let station2_label = format!("{}-azel", header.station2_name.trim());
-                let header_str = format!(
-                        concat!(
-                            "#*************************************************************************************************************************************************************************************************************************\n",
-                            "#      Epoch        Label    Source     Length       Amp         SNR     Phase     Noise-level      Res-Delay     Res-Rate            {:<10}              {:<10}             MJD        RFI        BP    ACF  obsfreq\n",
-                            "#                                        [s]         [%]                  [deg]     1-sigma[%]       [sample]       [Hz]      az[deg]  el[deg]  hgt[m]    az[deg]  el[deg]  hgt[m]                   [MHz]      [T/F] [T/F] [MHz]\n",
-                            "#*************************************************************************************************************************************************************************************************************************"
-                        ),
-                        station1_label,
-                        station2_label
-                    );
+                let columns = format!(
+                    "# {:<17}   {:<5}  {:<10} {:<8} {:>14} {:>7} {:>10}  {:>10}  {:>15}   {:>15}   {:^26} {:^26} {:>12}   {:<15} {:<5} {:<5} {:>6}",
+                    "Epoch",
+                    "Label",
+                    "Source",
+                    "Length",
+                    "Amp",
+                    "SNR",
+                    "Phase",
+                    "Noise-level",
+                    "Res-Delay",
+                    "Res-Rate",
+                    station1_label,
+                    station2_label,
+                    "MJD",
+                    "RFI",
+                    "BP",
+                    "ACF",
+                    "obsfreq",
+                );
+                let units = format!(
+                    "# {:<17}   {:<5}  {:<10} {:>8} {:>14} {:>7} {:>10}  {:>10}  {:>15}   {:>15}   {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12}   {:<15} {:<5} {:<5} {:>6}",
+                    "",
+                    "",
+                    "",
+                    "[s]",
+                    "[%]",
+                    "",
+                    "[deg]",
+                    "1-sigma[%]",
+                    "[sample]",
+                    "[Hz]",
+                    "az[deg]",
+                    "el[deg]",
+                    "hgt[m]",
+                    "az[deg]",
+                    "el[deg]",
+                    "hgt[m]",
+                    "",
+                    "",
+                    "[T/F]",
+                    "[T/F]",
+                    "[MHz]",
+                );
+                let border = format!("#{}", "*".repeat(columns.len().saturating_sub(1)));
+                let header_str = format!("{border}\n{columns}\n{units}\n{border}");
                 if !suppress_output {
                     println!("{}", header_str);
                 }
@@ -1678,16 +1736,52 @@ pub fn process_cor_file(
             if l1 == 0 {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
                 let station2_label = format!("{}-azel", header.station2_name.trim());
-                let header_str = format!(
-                    concat!(
-                        "#*******************************************************************************************************************************************************************************************************************\n",
-                        "#      Epoch        Label    Source     Length       Amp         SNR     Phase     Frequency     Noise-level      Res-Rate            {:<10}             {:<10}        MJD        RFI       BP    ACF  obsfreq\n",
-                        "#                                        [s]         [%]                 [deg]       [MHz]       1-sigma[%]        [Hz]        az[deg]  el[deg]  hgt[m]   az[deg]  el[deg]  hgt[m]             [MHz]      [T/F] [T/F] [MHz]\n",
-                        "#*******************************************************************************************************************************************************************************************************************"
-                    ),
+                let columns = format!(
+                    "# {:<17}   {:<5}  {:<10} {:<8} {:>14}  {:>7}   {:>10} {:>12} {:>10} {:>15} {:^23}  {:^23} {:>12}   {:<15} {:<5} {:<5} {:>6}",
+                    "Epoch",
+                    "Label",
+                    "Source",
+                    "Length",
+                    "Amp",
+                    "SNR",
+                    "Phase",
+                    "Frequency",
+                    "Noise-level",
+                    "Res-Rate",
                     station1_label,
-                    station2_label
+                    station2_label,
+                    "MJD",
+                    "RFI",
+                    "BP",
+                    "ACF",
+                    "obsfreq",
                 );
+                let units = format!(
+                    "# {:<17}   {:<5}  {:<10} {:>8} {:>14}  {:>7}   {:>10} {:>12} {:>10} {:>15} {:>7} {:>7} {:>7}  {:>7} {:>7} {:>7} {:>12}   {:<15} {:<5} {:<5} {:>6}",
+                    "",
+                    "",
+                    "",
+                    "[s]",
+                    "[%]",
+                    "",
+                    "[deg]",
+                    "[MHz]",
+                    "1-sigma[%]",
+                    "[Hz]",
+                    "az[deg]",
+                    "el[deg]",
+                    "hgt[m]",
+                    "az[deg]",
+                    "el[deg]",
+                    "hgt[m]",
+                    "",
+                    "",
+                    "[T/F]",
+                    "[T/F]",
+                    "[MHz]",
+                );
+                let border = format!("#{}", "*".repeat(columns.len().saturating_sub(1)));
+                let header_str = format!("{border}\n{columns}\n{units}\n{border}");
                 if !suppress_output {
                     println!("{}", header_str);
                 }

@@ -2,8 +2,9 @@
 #![allow(clippy::too_many_arguments)]
 pub use acel::run_acel_search_analysis;
 pub use deep::{
-    run_coherent_search, run_deep2_search, run_deep_search, run_peak_search, DeepSearchParams,
-    DeepSearchResult,
+    run_coherent_search, run_coherent_search_with_phase_times, run_deep2_search, run_deep_search,
+    run_deep_search_with_phase_times, run_peak_search, run_peak_search_with_phase_times,
+    DeepSearchParams, DeepSearchResult,
 };
 
 mod acel {
@@ -606,7 +607,7 @@ mod deep {
     use crate::args::Args;
     use crate::bandpass::apply_bandpass_correction;
     use crate::fft::{
-        cached_fft_plan, process_fft, process_fft_with_phase_correction_at_frequency, process_ifft,
+        apply_phase_correction_in_place_at_times, cached_fft_plan, process_fft, process_ifft,
     };
     use crate::header::CorHeader;
     use crate::rfi::has_histogram_mode;
@@ -720,7 +721,6 @@ mod deep {
         rfi_ranges: &'a [(usize, usize)],
         bandpass_data: &'a Option<Vec<C32>>,
         args: &'a Args,
-        start_time_offset_sec: f32,
         effective_fft_point: i32,
         rfi_mask: Vec<bool>,
         bandpass_gains: Option<Vec<C32>>,
@@ -775,21 +775,27 @@ mod deep {
                     RATE_PADDING,
                 )
             } else {
-                process_fft_with_phase_correction_at_frequency(
-                    self.complex_vec,
-                    self.physical_length,
-                    self.effective_fft_point,
-                    self.header.sampling_speed,
-                    self.rfi_ranges,
-                    RATE_PADDING,
+                let mut corrected = self.complex_vec.to_vec();
+                apply_phase_correction_in_place_at_times(
+                    &mut corrected,
+                    (self.effective_fft_point / 2) as usize,
                     rate,
                     delay,
                     self.args.acel_correct,
                     self.args.jerk_correct,
                     self.args.snap_correct,
-                    self.effective_integ_time,
-                    self.start_time_offset_sec,
+                    self.header.sampling_speed as u32,
+                    self.effective_fft_point as u32,
+                    &self.phase_times,
                     self.header.observing_frequency,
+                );
+                process_fft(
+                    &corrected,
+                    self.physical_length,
+                    self.effective_fft_point,
+                    self.header.sampling_speed,
+                    self.rfi_ranges,
+                    RATE_PADDING,
                 )
             };
             if let Some(mask) = self.args.rfi_npz_mask.as_deref() {
@@ -1317,6 +1323,42 @@ mod deep {
             cpu_count_arg,
             previous_solution,
             DeepSearchAlgorithm::FullGrid,
+            None,
+        )
+    }
+
+    pub fn run_deep_search_with_phase_times(
+        complex_vec: &[C32],
+        header: &CorHeader,
+        current_length: i32,
+        physical_length: i32,
+        effective_integ_time: f32,
+        current_obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
+        rfi_ranges: &[(usize, usize)],
+        bandpass_data: &Option<Vec<C32>>,
+        args: &Args,
+        pp: i32,
+        cpu_count_arg: u32,
+        previous_solution: Option<(f32, f32)>,
+        phase_times: &[f64],
+    ) -> Result<DeepSearchResult, Box<dyn Error>> {
+        run_deep_search_impl(
+            complex_vec,
+            header,
+            current_length,
+            physical_length,
+            effective_integ_time,
+            current_obs_time,
+            obs_time,
+            rfi_ranges,
+            bandpass_data,
+            args,
+            pp,
+            cpu_count_arg,
+            previous_solution,
+            DeepSearchAlgorithm::FullGrid,
+            Some(phase_times),
         )
     }
 
@@ -1350,6 +1392,42 @@ mod deep {
             cpu_count_arg,
             previous_solution,
             DeepSearchAlgorithm::PeakPolish,
+            None,
+        )
+    }
+
+    pub fn run_peak_search_with_phase_times(
+        complex_vec: &[C32],
+        header: &CorHeader,
+        current_length: i32,
+        physical_length: i32,
+        effective_integ_time: f32,
+        current_obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
+        rfi_ranges: &[(usize, usize)],
+        bandpass_data: &Option<Vec<C32>>,
+        args: &Args,
+        pp: i32,
+        cpu_count_arg: u32,
+        previous_solution: Option<(f32, f32)>,
+        phase_times: &[f64],
+    ) -> Result<DeepSearchResult, Box<dyn Error>> {
+        run_deep_search_impl(
+            complex_vec,
+            header,
+            current_length,
+            physical_length,
+            effective_integ_time,
+            current_obs_time,
+            obs_time,
+            rfi_ranges,
+            bandpass_data,
+            args,
+            pp,
+            cpu_count_arg,
+            previous_solution,
+            DeepSearchAlgorithm::PeakPolish,
+            Some(phase_times),
         )
     }
 
@@ -1383,6 +1461,42 @@ mod deep {
             cpu_count_arg,
             previous_solution,
             DeepSearchAlgorithm::Coherent,
+            None,
+        )
+    }
+
+    pub fn run_coherent_search_with_phase_times(
+        complex_vec: &[C32],
+        header: &CorHeader,
+        current_length: i32,
+        physical_length: i32,
+        effective_integ_time: f32,
+        current_obs_time: &DateTime<Utc>,
+        obs_time: &DateTime<Utc>,
+        rfi_ranges: &[(usize, usize)],
+        bandpass_data: &Option<Vec<C32>>,
+        args: &Args,
+        pp: i32,
+        cpu_count_arg: u32,
+        previous_solution: Option<(f32, f32)>,
+        phase_times: &[f64],
+    ) -> Result<DeepSearchResult, Box<dyn Error>> {
+        run_deep_search_impl(
+            complex_vec,
+            header,
+            current_length,
+            physical_length,
+            effective_integ_time,
+            current_obs_time,
+            obs_time,
+            rfi_ranges,
+            bandpass_data,
+            args,
+            pp,
+            cpu_count_arg,
+            previous_solution,
+            DeepSearchAlgorithm::Coherent,
+            Some(phase_times),
         )
     }
 
@@ -1421,6 +1535,7 @@ mod deep {
             cpu_count_arg,
             previous_solution,
             DeepSearchAlgorithm::AxisThenLocal,
+            None,
         )
     }
 
@@ -1439,6 +1554,7 @@ mod deep {
         cpu_count_arg: u32,
         _previous_solution: Option<(f32, f32)>,
         algorithm: DeepSearchAlgorithm,
+        recorded_phase_times: Option<&[f64]>,
     ) -> Result<DeepSearchResult, Box<dyn Error>> {
         /*
         println!(
@@ -1449,14 +1565,8 @@ mod deep {
         */
 
         // Use the first sample of each analyzed segment as the phase reference
-        // for residual rate correction.
-        //
-        // process_fft_with_phase_correction_at_frequency() evaluates the time for row_idx as
-        //
-        //   t = row_idx * effective_integ_time + start_time_offset_sec.
-        //
-        // Therefore start_time_offset_sec=0 makes row 0 the phase epoch. This
-        // is also the MJD/UVW epoch written to the scalar contamination NPZ.
+        // for residual rate correction. When provided, recorded sector times
+        // preserve timestamp gaps; legacy callers use a uniform row grid.
         let start_time_offset_sec = 0.0;
 
         if current_length <= 0 {
@@ -1495,11 +1605,25 @@ mod deep {
         let bandpass_gains = bandpass_data
             .as_deref()
             .and_then(|data| build_bandpass_gains(fft_point_half, data));
-        let phase_times: Vec<f64> = (0..rows.min(physical_length.max(0) as usize))
-            .map(|row_idx| {
-                row_idx as f64 * effective_integ_time as f64 + start_time_offset_sec as f64
-            })
-            .collect();
+        let phase_row_count = rows.min(physical_length.max(0) as usize);
+        let phase_times: Vec<f64> = if let Some(times) = recorded_phase_times {
+            if times.len() != phase_row_count {
+                return Err(format!(
+                    "記録時刻数 ({}) と解析行数 ({}) が一致しません",
+                    times.len(),
+                    phase_row_count
+                )
+                .into());
+            }
+            let phase_epoch = times.first().copied().unwrap_or(0.0);
+            times.iter().map(|time| *time - phase_epoch).collect()
+        } else {
+            (0..phase_row_count)
+                .map(|row_idx| {
+                    row_idx as f64 * effective_integ_time as f64 + start_time_offset_sec as f64
+                })
+                .collect()
+        };
         let static_phase_cycles: Vec<f64> = phase_times
             .iter()
             .map(|&time_sec| {
@@ -1519,7 +1643,6 @@ mod deep {
             rfi_ranges,
             bandpass_data,
             args,
-            start_time_offset_sec,
             effective_fft_point,
             rfi_mask,
             bandpass_gains,

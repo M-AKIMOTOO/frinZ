@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "frinZ"
-version = "5.4.5"
+version = "5.4.6"
 dependencies = [
  "anyhow",
  "astro",

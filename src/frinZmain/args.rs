@@ -102,6 +102,7 @@ const PREFIX_ALIASES: &[PrefixAliasSpec] = &[
 ];
 
 const EXPLICIT_ALIASES: &[(&str, &[&str])] = &[
+    ("phase_reference", &["phsref"]),
     ("closure_phase", &["cp"]),
     ("cor2bin", &["c2b"]),
     ("delay_correct", &["delay", "delay-corr"]),
@@ -164,7 +165,7 @@ pub struct Args {
     #[arg(long)]
     pub input: Option<PathBuf>,
 
-    /// Phase referencing; see --detail.
+    /// Phase referencing (alias: --phsref); see --detail.
     #[arg(long, num_args = 3..=6, value_name = "ARGS")]
     pub phase_reference: Vec<String>,
 

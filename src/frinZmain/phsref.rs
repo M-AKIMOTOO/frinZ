@@ -417,7 +417,16 @@ pub fn run_phase_reference_analysis(
                 let parts: Vec<&str> = target_basename.split('_').collect();
                 if parts.len() >= 3 {
                     let new_basename = parts[..3].join("_");
-                    let output_filename_str = format!("{}_phsref.cor", new_basename);
+                    let observing_frequency = target_results.header.observing_frequency;
+                    let band = if (6_600_000_000.0..=7_112_000_000.0).contains(&observing_frequency)
+                    {
+                        "c"
+                    } else if (8_192_000_000.0..=8_704_000_000.0).contains(&observing_frequency) {
+                        "x"
+                    } else {
+                        ""
+                    };
+                    let output_filename_str = format!("{}_{}phsref.cor", new_basename, band);
                     let phase_reference_dir = target_path.parent().unwrap_or_else(|| Path::new(""));
                     fs::create_dir_all(phase_reference_dir)?;
                     let output_path = phase_reference_dir.join(output_filename_str);

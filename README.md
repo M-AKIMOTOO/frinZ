@@ -199,6 +199,8 @@ frinZ --input data.cor --skip 10
 ```bash
 # 110 m baseline: global quadratic phase model
 frinZ --phase-reference poly2 cal.cor target.cor
+# Alias with the same arguments
+frinZ --phsref poly2 cal.cor target.cor
 
 # VLBI: quadratic trend plus locally interpolated atmospheric residual
 frinZ --phase-reference hybrid cal.cor target.cor 60 120 3
@@ -595,7 +597,9 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 
 ### Required Arguments (one of)
 - `--input <FILE>`: Single .cor file for analysis
-- `--phase-reference <MODE> <CAL> <TARGET> [CAL_LENGTH TGT_LENGTH LOOP]`: Phase referencing mode
+- `--phase-reference <MODE> <CAL> <TARGET> [CAL_LENGTH TGT_LENGTH LOOP]`（別名 `--phsref`）: Phase referencing mode
+
+位相参照で保存するcorの接尾辞は、ターゲットのヘッダーの観測周波数で決めます。6600–7112 MHz（両端を含む）は `_cphsref.cor`、8192–8704 MHz（両端を含む）は `_xphsref.cor` です。それ以外の周波数では `_phsref.cor` を使います。
 
 ### Time Parameters
 - `--length <SECONDS>`: Integration time (default: entire file)

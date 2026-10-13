@@ -634,11 +634,12 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 
 ## Performance Notes
 
-`--rate-padding` defaults to 8 for ordinary, search, and cumulation modes.
-Zero padding samples the fringe-rate spectrum more finely without extending the
-observation or improving its intrinsic frequency resolution. FFT-plane memory
-scales linearly with this factor; use `--rate-padding 1` to reduce memory and
-computation for large observations.
+Ordinary `.cor` fringe analysis and `--search` use exactly the selected
+correlation rows for the fringe-rate FFT. They do not append zero rows to reach
+a power of two or oversample the rate axis, so lengths such as 7800 are valid
+FFT lengths and use only measured data. The legacy `--rate-padding` option is
+retained for specialized products; it does not change ordinary `.cor` fringe
+results.
 
 Large `.cor` inputs use memory mapping, and `.zst` inputs are decoded to a temporary
 backing file. NPZ entries are compressed sequentially into a temporary archive

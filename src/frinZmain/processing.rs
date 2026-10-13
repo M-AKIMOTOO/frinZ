@@ -240,24 +240,6 @@ fn rebin_complex_rows(
     rebinned
 }
 
-fn pad_time_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_width: usize) -> i32 {
-    if current_rows <= 0 || row_width == 0 {
-        return current_rows;
-    }
-    let target_rows = if current_rows <= 1 {
-        1
-    } else {
-        (current_rows as u32).next_power_of_two() as i32
-    };
-
-    if target_rows > current_rows {
-        let additional_samples = (target_rows - current_rows) as usize * row_width;
-        data.extend(std::iter::repeat_n(C32::new(0.0, 0.0), additional_samples));
-    }
-
-    target_rows
-}
-
 /// Holds the results of processing a single .cor file, needed for subsequent plotting.
 pub struct ProcessResult {
     pub header: CorHeader,
@@ -745,9 +727,8 @@ pub fn process_cor_file(
         let mut spike34_applied_delay = 0.0f32;
         let mut spike34_applied_rate = 0.0f32;
         if let Some(spikes) = &spike34m_peaks {
-            let mut search_vec = complex_vec.clone();
-            let search_length =
-                pad_time_rows_to_power_of_two(&mut search_vec, actual_length, fft_point_half_used);
+            let search_vec = complex_vec.clone();
+            let search_length = actual_length;
             let mut fullband_args = args.clone();
             fullband_args.spike34m = None;
             fullband_args.search = vec!["peak".to_string()];
@@ -762,7 +743,7 @@ pub fn process_cor_file(
             fullband_args.acel_correct = 0.0;
             fullband_args.jerk_correct = 0.0;
             fullband_args.snap_correct = 0.0;
-            fullband_args.rate_padding = fullband_args.rate_padding.max(4);
+            fullband_args.rate_padding = 1;
             let fullband = search::run_peak_search(
                 &search_vec,
                 &processing_header,
@@ -813,8 +794,7 @@ pub fn process_cor_file(
             complex_vec = corrected_spectra.into_iter().flatten().collect();
         }
 
-        let current_length =
-            pad_time_rows_to_power_of_two(&mut complex_vec, actual_length, fft_point_half_used);
+        let current_length = actual_length;
 
         let is_flagged = time_flag_ranges
             .iter()
@@ -834,6 +814,7 @@ pub fn process_cor_file(
         loop_args.acel_correct = 0.0;
         loop_args.jerk_correct = 0.0;
         loop_args.snap_correct = 0.0;
+        loop_args.rate_padding = 1;
 
         let primary_search_mode = args.primary_search_mode();
 
@@ -2266,7 +2247,7 @@ pub(crate) fn run_analysis_pipeline(
             effective_fft_point,
             header.sampling_speed,
             rfi_ranges,
-            base_args.rate_padding,
+            1,
             rate_correct,
             delay_correct,
             acel_correct,
@@ -2283,7 +2264,7 @@ pub(crate) fn run_analysis_pipeline(
             effective_fft_point,
             header.sampling_speed,
             rfi_ranges,
-            base_args.rate_padding,
+            1,
         )
     };
 

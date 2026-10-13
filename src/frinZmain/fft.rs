@@ -182,11 +182,8 @@ fn process_fft_impl(
     } else {
         rows
     };
-    let mut padding_length = base_length.saturating_mul(rate_padding.max(1) as usize);
-    if base_length == 1 {
-        padding_length = padding_length.saturating_mul(2);
-    }
-    let padding_length_half = padding_length / 2;
+    let padding_length = base_length.saturating_mul(rate_padding.max(1) as usize);
+    let fftshift_split = padding_length.div_ceil(2);
     let length_f32 = if physical_length > 0 {
         physical_length as f32
     } else {
@@ -258,7 +255,7 @@ fn process_fft_impl(
 
         fft.process_with_scratch(&mut fft_exe, &mut fft_scratch);
 
-        let (first_half, second_half) = fft_exe.split_at(padding_length_half);
+        let (first_half, second_half) = fft_exe.split_at(fftshift_split);
         let mut row = freq_rate_array.row_mut(i);
         for (dst, src) in row
             .iter_mut()

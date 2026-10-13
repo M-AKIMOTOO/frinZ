@@ -125,7 +125,7 @@ mod acel {
         // normalization in main.rs, so set the peak parameters explicitly here.
         let mut peak_args = args.clone();
         peak_args.search = vec!["peak".to_string()];
-        peak_args.rate_padding = 8;
+        peak_args.rate_padding = 1;
         if peak_args.iter < 4 {
             peak_args.iter = 4;
         }
@@ -758,13 +758,8 @@ mod deep {
     }
 
     impl<'a> DeepSearchContext<'a> {
-        fn fft_for_correction_with_padding(
-            &self,
-            delay: f32,
-            rate: f32,
-            rate_padding: u32,
-        ) -> (Array2<C32>, usize) {
-            let rate_padding = rate_padding.max(1);
+        fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
+            const RATE_PADDING: u32 = 1;
             let (mut freq_rate_array, padding_length) = if rate == 0.0
                 && delay == 0.0
                 && self.args.acel_correct == 0.0
@@ -777,7 +772,7 @@ mod deep {
                     self.effective_fft_point,
                     self.header.sampling_speed,
                     self.rfi_ranges,
-                    rate_padding,
+                    RATE_PADDING,
                 )
             } else {
                 process_fft_with_phase_correction_at_frequency(
@@ -786,7 +781,7 @@ mod deep {
                     self.effective_fft_point,
                     self.header.sampling_speed,
                     self.rfi_ranges,
-                    rate_padding,
+                    RATE_PADDING,
                     rate,
                     delay,
                     self.args.acel_correct,
@@ -811,10 +806,6 @@ mod deep {
                 }
             }
             (freq_rate_array, padding_length)
-        }
-
-        fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
-            self.fft_for_correction_with_padding(delay, rate, self.args.rate_padding)
         }
 
         fn apply_bandpass(&self, freq_rate_array: &mut Array2<C32>) {
@@ -994,8 +985,7 @@ mod deep {
                 );
                 */
                 let search_args = self.args;
-                let (mut freq_rate_array, padding_length) =
-                    self.fft_for_correction_with_padding(0.0, 0.0, self.args.rate_padding.max(1));
+                let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
                 self.apply_bandpass(&mut freq_rate_array);
                 if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
                     return Ok(self.coarse_estimates_streaming(
@@ -1031,8 +1021,7 @@ mod deep {
                 */
                 let mut search_args = self.args.clone();
                 search_args.search = vec![algorithm.mode_name().to_string()];
-                let (mut freq_rate_array, padding_length) =
-                    self.fft_for_correction_with_padding(0.0, 0.0, self.args.rate_padding.max(1));
+                let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
                 self.apply_bandpass(&mut freq_rate_array);
                 if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
                     return Ok(self.coarse_estimates_streaming(

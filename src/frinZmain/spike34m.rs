@@ -365,24 +365,6 @@ fn extract_subband(
     out
 }
 
-fn pad_time_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_width: usize) -> i32 {
-    if current_rows <= 0 || row_width == 0 {
-        return current_rows;
-    }
-    let target_rows = if current_rows <= 1 {
-        1
-    } else {
-        (current_rows as u32).next_power_of_two() as i32
-    };
-    if target_rows > current_rows {
-        data.resize(
-            data.len() + (target_rows - current_rows) as usize * row_width,
-            Complex::new(0.0, 0.0),
-        );
-    }
-    target_rows
-}
-
 fn write_spike_table(path: &Path, spikes: &[SpikePeak]) -> Result<(), Box<dyn Error>> {
     let mut out = String::new();
     out.push_str("# YAMAGU34 autocorrelation spike candidates\n");
@@ -506,7 +488,7 @@ fn write_interval_delay_rate_table_from_spectra(
     local_args.acel_correct = 0.0;
     local_args.jerk_correct = 0.0;
     local_args.snap_correct = 0.0;
-    local_args.rate_padding = local_args.rate_padding.max(4);
+    local_args.rate_padding = 1;
     let bandpass = None;
     let mut records = Vec::new();
 
@@ -520,9 +502,8 @@ fn write_interval_delay_rate_table_from_spectra(
         if width_chan < 8 {
             continue;
         }
-        let mut subband_vec = extract_subband(&flat, rows, original_half, start_chan, width_chan);
-        let current_length =
-            pad_time_rows_to_power_of_two(&mut subband_vec, physical_length, width_chan);
+        let subband_vec = extract_subband(&flat, rows, original_half, start_chan, width_chan);
+        let current_length = physical_length;
         let mut sub_header = header.clone();
         sub_header.fft_point = (width_chan * 2) as i32;
         sub_header.sampling_speed = (rbw_mhz * 1.0e6 * width_chan as f64 * 2.0).round() as i32;
@@ -833,20 +814,6 @@ fn align_phase_to_line(phase: f64, frequency: f64, slope: f64, intercept: f64) -
     phase + 2.0 * std::f64::consts::PI * ((expected - phase) / (2.0 * std::f64::consts::PI)).round()
 }
 
-fn pad_spectra_for_search(flat: &mut Vec<C32>, rows: usize, cols: usize) -> i32 {
-    if rows == 0 || cols == 0 {
-        return rows as i32;
-    }
-    let target = rows.next_power_of_two();
-    if target > rows {
-        flat.extend(std::iter::repeat_n(
-            C32::new(0.0, 0.0),
-            (target - rows) * cols,
-        ));
-    }
-    target as i32
-}
-
 fn apply_global_and_safe_spike_correction(
     header: &CorHeader,
     spectra: &[Vec<C32>],
@@ -862,8 +829,8 @@ fn apply_global_and_safe_spike_correction(
     }
     let cols = spectra[0].len();
     let rows = spectra.len();
-    let mut search_vec: Vec<C32> = spectra.iter().flat_map(|row| row.iter().copied()).collect();
-    let current_length = pad_spectra_for_search(&mut search_vec, rows, cols);
+    let search_vec: Vec<C32> = spectra.iter().flat_map(|row| row.iter().copied()).collect();
+    let current_length = rows as i32;
     let mut local_args = args.clone();
     local_args.spike34m = None;
     local_args.search = vec!["peak".to_string()];
@@ -878,7 +845,7 @@ fn apply_global_and_safe_spike_correction(
     local_args.acel_correct = 0.0;
     local_args.jerk_correct = 0.0;
     local_args.snap_correct = 0.0;
-    local_args.rate_padding = local_args.rate_padding.max(4);
+    local_args.rate_padding = 1;
     let result = search::run_peak_search(
         &search_vec,
         header,

@@ -27,24 +27,6 @@ fn split_label(basename: &str) -> Vec<String> {
     label
 }
 
-fn pad_time_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_width: usize) -> i32 {
-    if current_rows <= 0 || row_width == 0 {
-        return current_rows;
-    }
-    let target_rows = if current_rows <= 1 {
-        1
-    } else {
-        (current_rows as u32).next_power_of_two() as i32
-    };
-    if target_rows > current_rows {
-        data.resize(
-            data.len() + (target_rows - current_rows) as usize * row_width,
-            C32::new(0.0, 0.0),
-        );
-    }
-    target_rows
-}
-
 fn extract_subband(
     full: &[C32],
     rows: usize,
@@ -326,15 +308,14 @@ pub fn run_inband_analysis(
             let previous_solution = *previous_solution_slot;
             let start_chan = band_idx * channels_per_band;
             let band_start_mhz = start_chan as f32 * rbw_mhz;
-            let mut subband_vec = extract_subband(
+            let subband_vec = extract_subband(
                 &complex_vec,
                 rows,
                 original_half,
                 start_chan,
                 channels_per_band,
             );
-            let current_length =
-                pad_time_rows_to_power_of_two(&mut subband_vec, physical_length, channels_per_band);
+            let current_length = physical_length;
 
             let mut sub_header = header.clone();
             sub_header.fft_point = (channels_per_band * 2) as i32;
@@ -353,6 +334,7 @@ pub fn run_inband_analysis(
             let mut local_args = args.clone();
             local_args.frequency = false;
             local_args.inband = None;
+            local_args.rate_padding = 1;
 
             let analysis = match requested_search {
                 Some("deep") => {

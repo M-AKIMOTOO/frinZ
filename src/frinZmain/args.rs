@@ -296,7 +296,7 @@ pub struct Args {
     #[arg(long = "frange", num_args = 2, value_names = ["MIN", "MAX"])]
     pub frange: Vec<f32>,
 
-    /// Legacy rate-axis oversampling for specialized products; standard .cor fringe analysis uses native rows.
+    /// Rate-axis zero padding for plot grids; fringe analysis and SNR use native rows.
     #[arg(long, default_value_t = DEFAULT_RATE_PADDING)]
     pub rate_padding: u32,
 

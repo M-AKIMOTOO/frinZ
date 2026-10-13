@@ -637,9 +637,10 @@ Example: `YAMAGU32_YAMAGU34_2025001120000_3C84_x_len60s_rfi`
 Ordinary `.cor` fringe analysis and `--search` use exactly the selected
 correlation rows for the fringe-rate FFT. They do not append zero rows to reach
 a power of two or oversample the rate axis, so lengths such as 7800 are valid
-FFT lengths and use only measured data. The legacy `--rate-padding` option is
-retained for specialized products; it does not change ordinary `.cor` fringe
-results.
+FFT lengths and use only measured data. `--plot` zero-pads the row FFT only for
+the plotted rate grid; its default factor is 8 and `--rate-padding` changes
+that plot resolution. This padding does not affect fringe measurements, search
+results, or SNR. The same plot-only padding applies to `--plot --frequency`.
 
 Large `.cor` inputs use memory mapping, and `.zst` inputs are decoded to a temporary
 backing file. NPZ entries are compressed sequentially into a temporary archive

@@ -822,7 +822,7 @@ pub fn process_cor_file(
             mut analysis_results,
             mut freq_rate_array,
             mut delay_rate_2d_data_comp,
-            pre_bandpass_results,
+            _pre_bandpass_results,
         ) = match primary_search_mode {
             Some("peak") | Some("deep") | Some("coherent") => {
                 // Unified fringe search path:
@@ -837,6 +837,10 @@ pub fn process_cor_file(
                 } else {
                     prev_deep_solution
                 };
+                let mut search_args = loop_args.clone();
+                // Plot profiles are derived from the separate padded plot
+                // plane below; search measurements remain on native rows.
+                search_args.plot = false;
                 let mut search_result = if primary_search_mode == Some("deep") {
                     search::run_deep_search(
                         &complex_vec,
@@ -848,9 +852,9 @@ pub fn process_cor_file(
                         &file_start_time,
                         &rfi_ranges,
                         &bandpass_data,
-                        &loop_args,
+                        &search_args,
                         pp,
-                        loop_args.cpu,
+                        search_args.cpu,
                         search_seed,
                     )?
                 } else if primary_search_mode == Some("coherent") {
@@ -864,9 +868,9 @@ pub fn process_cor_file(
                         &file_start_time,
                         &rfi_ranges,
                         &bandpass_data,
-                        &loop_args,
+                        &search_args,
                         pp,
-                        loop_args.cpu,
+                        search_args.cpu,
                         search_seed,
                     )?
                 } else {
@@ -880,9 +884,9 @@ pub fn process_cor_file(
                         &file_start_time,
                         &rfi_ranges,
                         &bandpass_data,
-                        &loop_args,
+                        &search_args,
                         pp,
-                        loop_args.cpu,
+                        search_args.cpu,
                         search_seed,
                     )?
                 };
@@ -926,7 +930,7 @@ pub fn process_cor_file(
                     &file_start_time,
                     &rfi_ranges,
                     &bandpass_data,
-                    args.plot,
+                    false,
                     effective_fft_point,
                 )?;
                 analysis_results.length_f32 =
@@ -1066,6 +1070,246 @@ pub fn process_cor_file(
         }
 
         analysis_results.length_f32 = physical_length as f32 * effective_integ_time;
+
+        // Plot grids may oversample the rate axis by zero-padding the row FFT.
+        // Keep this second transform isolated from the native-resolution plane
+        // used for all reported measurements and search decisions.
+        let plot_products = if args.plot && args.cumulate == 0 {
+            let plot_args = {
+                let mut plot_args = loop_args.clone();
+                plot_args.rate_padding = args.rate_padding.max(1);
+                if primary_search_mode.is_some() {
+                    // Search output arrays are already in the final corrected
+                    // frame, where the residual peak is at the origin.
+                    plot_args.drange.clear();
+                    plot_args.rrange.clear();
+                    plot_args.mask.clear();
+                }
+                plot_args
+            };
+            let plot_delay_correction = if primary_search_mode.is_some() {
+                analysis_results.residual_delay
+            } else {
+                0.0
+            };
+            let plot_rate_correction = if primary_search_mode.is_some() {
+                analysis_results.residual_rate
+            } else {
+                0.0
+            };
+            let (mut plot_freq_rate_array, plot_padding_length) =
+                if plot_delay_correction != 0.0 || plot_rate_correction != 0.0 {
+                    process_fft_with_phase_correction_at_frequency(
+                        &complex_vec,
+                        physical_length,
+                        effective_fft_point,
+                        processing_header.sampling_speed,
+                        &rfi_ranges,
+                        plot_args.rate_padding,
+                        plot_rate_correction,
+                        plot_delay_correction,
+                        0.0,
+                        0.0,
+                        0.0,
+                        effective_integ_time,
+                        0.0,
+                        processing_header.observing_frequency,
+                    )
+                } else {
+                    process_fft(
+                        &complex_vec,
+                        physical_length,
+                        effective_fft_point,
+                        processing_header.sampling_speed,
+                        &rfi_ranges,
+                        plot_args.rate_padding,
+                    )
+                };
+            if let Some(mask) = plot_args.rfi_npz_mask.as_deref() {
+                let (frequency_count, rate_count) = plot_freq_rate_array.dim();
+                if let Some(values) = plot_freq_rate_array.as_slice_mut() {
+                    mask.apply_frequency_rate(
+                        values,
+                        frequency_count,
+                        rate_count,
+                        processing_header.sampling_speed,
+                        effective_fft_point,
+                        effective_integ_time,
+                    );
+                }
+            }
+
+            let mut pre_bandpass_freq_rate_array =
+                bandpass_data.as_ref().map(|_| plot_freq_rate_array.clone());
+            if let Some(bp_data) = &bandpass_data {
+                apply_bandpass_correction(&mut plot_freq_rate_array, bp_data);
+            }
+
+            // Apply the native-grid histogram decisions to the closest padded
+            // rate bin, preserving the same RFI exclusions in the PNG plane.
+            if let Some(histogram) = histogram_result.as_ref() {
+                let plot_rate_range =
+                    crate::utils::rate_cal(plot_padding_length as f32, effective_integ_time);
+                let native_rates = &analysis_results.rate_range;
+                let native_rate_step = native_rates
+                    .get(1)
+                    .zip(native_rates.first())
+                    .map(|(next, first)| next - first)
+                    .unwrap_or(1.0);
+                let native_rate_index = |rate: f32| -> usize {
+                    if native_rates.len() <= 1 || native_rate_step == 0.0 {
+                        0
+                    } else {
+                        (((rate - native_rates[0]) / native_rate_step).round() as isize)
+                            .clamp(0, native_rates.len() as isize - 1)
+                            as usize
+                    }
+                };
+                let (frequency_count, padded_rate_count) = plot_freq_rate_array.dim();
+                let native_rate_count = histogram.frequency_shape.1;
+                if histogram.frequency_shape.0 == frequency_count
+                    && native_rate_count > 0
+                    && histogram.frequency_mask.len()
+                        == histogram.frequency_shape.0 * native_rate_count
+                {
+                    if let Some(values) = plot_freq_rate_array.as_slice_mut() {
+                        if values.len() == frequency_count * padded_rate_count {
+                            for frequency in 0..frequency_count {
+                                for padded_rate in 0..padded_rate_count {
+                                    let rate = plot_rate_range[padded_rate];
+                                    let native_rate =
+                                        native_rate_index(rate).min(native_rate_count - 1);
+                                    if histogram.frequency_mask
+                                        [frequency * native_rate_count + native_rate]
+                                    {
+                                        values[frequency * padded_rate_count + padded_rate] =
+                                            C32::new(0.0, 0.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let skip_plot_delay_ifft =
+                args.frequency && args.drange.is_empty() && !has_histogram_mode(&args.rfi);
+            let mut plot_delay_rate = if skip_plot_delay_ifft {
+                Array2::zeros((1, 1))
+            } else {
+                process_ifft(
+                    &plot_freq_rate_array,
+                    effective_fft_point,
+                    plot_padding_length,
+                )
+            };
+            if let Some(mask) = plot_args.rfi_npz_mask.as_deref() {
+                let (rate_count, delay_count) = plot_delay_rate.dim();
+                if let Some(values) = plot_delay_rate.as_slice_mut() {
+                    mask.apply_delay_rate(
+                        values,
+                        rate_count,
+                        delay_count,
+                        effective_integ_time,
+                        effective_fft_point,
+                    );
+                }
+            }
+            if let Some(histogram) = histogram_result.as_ref() {
+                let native_rates = &analysis_results.rate_range;
+                let native_rate_step = native_rates
+                    .get(1)
+                    .zip(native_rates.first())
+                    .map(|(next, first)| next - first)
+                    .unwrap_or(1.0);
+                let native_rate_index = |rate: f32| -> usize {
+                    if native_rates.len() <= 1 || native_rate_step == 0.0 {
+                        0
+                    } else {
+                        (((rate - native_rates[0]) / native_rate_step).round() as isize)
+                            .clamp(0, native_rates.len() as isize - 1)
+                            as usize
+                    }
+                };
+                let plot_rates =
+                    crate::utils::rate_cal(plot_padding_length as f32, effective_integ_time);
+                let (padded_rate_count, delay_count) = plot_delay_rate.dim();
+                let (native_rate_count, native_delay_count) = histogram.delay_shape;
+                if native_rate_count > 0
+                    && histogram.delay_mask.len() == native_rate_count * native_delay_count
+                    && delay_count == native_delay_count
+                {
+                    for padded_rate in 0..padded_rate_count {
+                        let native_rate = native_rate_index(plot_rates[padded_rate])
+                            .min(native_rate_count.saturating_sub(1));
+                        for delay in 0..delay_count {
+                            if histogram.delay_mask[native_rate * native_delay_count + delay] {
+                                plot_delay_rate[[padded_rate, delay]] = C32::new(0.0, 0.0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let plot_analysis_results = analyze_results(
+                &plot_freq_rate_array,
+                &plot_delay_rate,
+                &processing_header,
+                current_length,
+                effective_integ_time,
+                &current_obs_time,
+                plot_padding_length,
+                &plot_args,
+                None,
+            );
+
+            let pre_bandpass_analysis_results =
+                if let Some(pre_bandpass_freq_rate) = pre_bandpass_freq_rate_array.as_mut() {
+                    let mut pre_bandpass_delay_rate = if skip_plot_delay_ifft {
+                        Array2::zeros((1, 1))
+                    } else {
+                        process_ifft(
+                            pre_bandpass_freq_rate,
+                            effective_fft_point,
+                            plot_padding_length,
+                        )
+                    };
+                    if let Some(mask) = plot_args.rfi_npz_mask.as_deref() {
+                        let (rate_count, delay_count) = pre_bandpass_delay_rate.dim();
+                        if let Some(values) = pre_bandpass_delay_rate.as_slice_mut() {
+                            mask.apply_delay_rate(
+                                values,
+                                rate_count,
+                                delay_count,
+                                effective_integ_time,
+                                effective_fft_point,
+                            );
+                        }
+                    }
+                    Some(analyze_results(
+                        pre_bandpass_freq_rate,
+                        &pre_bandpass_delay_rate,
+                        &processing_header,
+                        current_length,
+                        effective_integ_time,
+                        &current_obs_time,
+                        plot_padding_length,
+                        &plot_args,
+                        None,
+                    ))
+                } else {
+                    None
+                };
+
+            Some((
+                plot_analysis_results,
+                plot_freq_rate_array,
+                plot_delay_rate,
+                pre_bandpass_analysis_results,
+            ))
+        } else {
+            None
+        };
 
         let label_str: Vec<&str> = label.iter().map(|s| s.as_str()).collect();
         let filename_length = if args.length == 0 {
@@ -1599,6 +1843,14 @@ pub fn process_cor_file(
 
         if args.plot && args.cumulate == 0 {
             if let Some(path) = &plot_path {
+                let (
+                    plot_analysis_results,
+                    plot_freq_rate_array,
+                    plot_delay_rate_2d_data_comp,
+                    plot_pre_bandpass_results,
+                ) = plot_products
+                    .as_ref()
+                    .expect("plot products are built when --plot is enabled");
                 let length_label = if args.length == 0 {
                     "0".to_string()
                 } else {
@@ -1622,12 +1874,12 @@ pub fn process_cor_file(
                 let output_filename = plot_dir.join(format!("{output_stem}.png"));
 
                 if args.npz && !args.frequency {
-                    let rate_axis: Vec<f64> = analysis_results
+                    let rate_axis: Vec<f64> = plot_analysis_results
                         .rate_range
                         .iter()
                         .map(|&v| v as f64)
                         .collect();
-                    let delay_axis: Vec<f64> = analysis_results
+                    let delay_axis: Vec<f64> = plot_analysis_results
                         .delay_range
                         .iter()
                         .map(|&v| v as f64)
@@ -1642,55 +1894,50 @@ pub fn process_cor_file(
                     npz.add_f64_1d("delay_sample", &delay_axis);
                     npz.add_complex64_2d(
                         "delay_rate",
-                        delay_rate_2d_data_comp.dim(),
-                        delay_rate_2d_data_comp.iter().copied(),
+                        plot_delay_rate_2d_data_comp.dim(),
+                        plot_delay_rate_2d_data_comp.iter().copied(),
                     )?;
                     npz.write(&npz_path)?;
                 } else if args.npz {
-                    if let Some(freq_rate) = freq_rate_array.as_ref() {
-                        let frequency_axis: Vec<f64> = analysis_results
-                            .freq_range
-                            .iter()
-                            .map(|&v| v as f64)
-                            .collect();
-                        let rate_axis: Vec<f64> = analysis_results
-                            .rate_range
-                            .iter()
-                            .map(|&v| v as f64)
-                            .collect();
-                        let npz_path = npz_sidecar_path(&output_filename, "plot_freq_rate");
-                        let mut npz = NamedNpz::new(NpyMeta::new(
-                            "plot_freq_rate",
-                            effective_fft_point as u32,
-                            processing_header.number_of_sector as u32,
-                        ));
-                        npz.add_f64_1d("frequency_mhz", &frequency_axis);
-                        npz.add_f64_1d("rate_hz", &rate_axis);
-                        npz.add_complex64_2d(
-                            "freq_rate",
-                            freq_rate.dim(),
-                            freq_rate.iter().copied(),
-                        )?;
-                        npz.write(&npz_path)?;
-                    }
+                    let freq_rate = plot_freq_rate_array;
+                    let frequency_axis: Vec<f64> = plot_analysis_results
+                        .freq_range
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect();
+                    let rate_axis: Vec<f64> = plot_analysis_results
+                        .rate_range
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect();
+                    let npz_path = npz_sidecar_path(&output_filename, "plot_freq_rate");
+                    let mut npz = NamedNpz::new(NpyMeta::new(
+                        "plot_freq_rate",
+                        effective_fft_point as u32,
+                        processing_header.number_of_sector as u32,
+                    ));
+                    npz.add_f64_1d("frequency_mhz", &frequency_axis);
+                    npz.add_f64_1d("rate_hz", &rate_axis);
+                    npz.add_complex64_2d("freq_rate", freq_rate.dim(), freq_rate.iter().copied())?;
+                    npz.write(&npz_path)?;
                 }
 
                 if !args.frequency {
                     let mask_bounds = delay_rate_mask_bounds(&args.mask);
-                    let delay_profile: Vec<(f64, f64)> = analysis_results
+                    let delay_profile: Vec<(f64, f64)> = plot_analysis_results
                         .delay_range
                         .iter()
-                        .zip(analysis_results.visibility.iter())
+                        .zip(plot_analysis_results.visibility.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
-                    let rate_profile: Vec<(f64, f64)> = analysis_results
+                    let rate_profile: Vec<(f64, f64)> = plot_analysis_results
                         .rate_range
                         .iter()
-                        .zip(analysis_results.delay_rate.iter())
+                        .zip(plot_analysis_results.delay_rate.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
                     let delay_profile_pre_bp: Option<Vec<(f64, f64)>> =
-                        pre_bandpass_results.as_ref().map(|pre| {
+                        plot_pre_bandpass_results.as_ref().map(|pre| {
                             pre.delay_range
                                 .iter()
                                 .zip(pre.visibility.iter())
@@ -1698,18 +1945,18 @@ pub fn process_cor_file(
                                 .collect()
                         });
                     let rate_profile_pre_bp: Option<Vec<(f64, f64)>> =
-                        pre_bandpass_results.as_ref().map(|pre| {
+                        plot_pre_bandpass_results.as_ref().map(|pre| {
                             pre.rate_range
                                 .iter()
                                 .zip(pre.delay_rate.iter())
                                 .map(|(&x, &y)| (x as f64, y as f64))
                                 .collect()
                         });
-                    let rows = delay_rate_2d_data_comp.shape()[0] as u32;
-                    let cols = delay_rate_2d_data_comp.shape()[1] as u32;
+                    let rows = plot_delay_rate_2d_data_comp.shape()[0] as u32;
+                    let cols = plot_delay_rate_2d_data_comp.shape()[1] as u32;
                     let delay_data: Vec<f32> =
-                        analysis_results.delay_range.iter().copied().collect();
-                    let rate_data: Vec<f32> = analysis_results.rate_range.to_vec();
+                        plot_analysis_results.delay_range.iter().copied().collect();
+                    let rate_data: Vec<f32> = plot_analysis_results.rate_range.to_vec();
                     let mut plot_drange: Vec<f32> = if args.drange.len() == 2
                         && matches!(
                             primary_search_mode,
@@ -1821,7 +2068,8 @@ pub fn process_cor_file(
                             if in_delay_rate_mask(delay, rate, mask_bounds) {
                                 continue;
                             }
-                            max_norm = max_norm.max(delay_rate_2d_data_comp[[r_idx, d_idx]].norm());
+                            max_norm =
+                                max_norm.max(plot_delay_rate_2d_data_comp[[r_idx, d_idx]].norm());
                         }
                     }
 
@@ -1860,10 +2108,10 @@ pub fn process_cor_file(
                         let gy_floor = y_start + y_floor;
                         let gx_ceil = (x_start + x_ceil).min(x_end);
                         let gy_ceil = (y_start + y_ceil).min(y_end);
-                        let q11 = delay_rate_2d_data_comp[[gy_floor, gx_floor]].norm() as f64;
-                        let q12 = delay_rate_2d_data_comp[[gy_floor, gx_ceil]].norm() as f64;
-                        let q21 = delay_rate_2d_data_comp[[gy_ceil, gx_floor]].norm() as f64;
-                        let q22 = delay_rate_2d_data_comp[[gy_ceil, gx_ceil]].norm() as f64;
+                        let q11 = plot_delay_rate_2d_data_comp[[gy_floor, gx_floor]].norm() as f64;
+                        let q12 = plot_delay_rate_2d_data_comp[[gy_floor, gx_ceil]].norm() as f64;
+                        let q21 = plot_delay_rate_2d_data_comp[[gy_ceil, gx_floor]].norm() as f64;
+                        let q22 = plot_delay_rate_2d_data_comp[[gy_ceil, gx_ceil]].norm() as f64;
                         let r1 = q11 * (1.0 - fx) + q12 * fx;
                         let r2 = q21 * (1.0 - fx) + q22 * fx;
                         r1 * (1.0 - fy) + r2 * fy
@@ -1928,7 +2176,7 @@ pub fn process_cor_file(
                         &stat_keys.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
                         &stat_vals.iter().map(|s| s.as_ref()).collect::<Vec<&str>>(),
                         output_filename.to_str().unwrap(),
-                        &analysis_results.rate_range,
+                        &plot_analysis_results.rate_range,
                         analysis_results.length_f32,
                         effective_integ_time,
                         &plot_drange,
@@ -1940,20 +2188,23 @@ pub fn process_cor_file(
                         args.in_beam,
                     )?;
                 } else {
-                    let freq_rate_array = freq_rate_array.as_ref().ok_or(
-                        "--frequency が指定されているのに freq_rate_array が保持されていません",
-                    )?;
-                    let freq_amp_profile: Vec<(f64, f64)> = analysis_results
-                        .freq_range
-                        .iter()
-                        .zip(analysis_results.freq_rate_spectrum.iter().map(|c| c.norm()))
-                        .map(|(&x, y)| (x as f64, y as f64))
-                        .collect();
-                    let freq_phase_profile: Vec<(f64, f64)> = analysis_results
+                    let freq_rate_array = plot_freq_rate_array;
+                    let freq_amp_profile: Vec<(f64, f64)> = plot_analysis_results
                         .freq_range
                         .iter()
                         .zip(
-                            analysis_results
+                            plot_analysis_results
+                                .freq_rate_spectrum
+                                .iter()
+                                .map(|c| c.norm()),
+                        )
+                        .map(|(&x, y)| (x as f64, y as f64))
+                        .collect();
+                    let freq_phase_profile: Vec<(f64, f64)> = plot_analysis_results
+                        .freq_range
+                        .iter()
+                        .zip(
+                            plot_analysis_results
                                 .freq_rate_spectrum
                                 .iter()
                                 .map(|c| safe_arg(c).to_degrees()),
@@ -1961,7 +2212,7 @@ pub fn process_cor_file(
                         .map(|(&x, y)| (x as f64, y as f64))
                         .collect();
                     let freq_phase_profile_pre_bp: Option<Vec<(f64, f64)>> =
-                        pre_bandpass_results.as_ref().map(|pre| {
+                        plot_pre_bandpass_results.as_ref().map(|pre| {
                             pre.freq_range
                                 .iter()
                                 .zip(
@@ -1972,14 +2223,14 @@ pub fn process_cor_file(
                                 .map(|(&x, y)| (x as f64, y as f64))
                                 .collect()
                         });
-                    let rate_profile: Vec<(f64, f64)> = analysis_results
+                    let rate_profile: Vec<(f64, f64)> = plot_analysis_results
                         .rate_range
                         .iter()
-                        .zip(analysis_results.freq_rate.iter())
+                        .zip(plot_analysis_results.freq_rate.iter())
                         .map(|(&x, &y)| (x as f64, y as f64))
                         .collect();
                     let freq_amp_profile_pre_bp: Option<Vec<(f64, f64)>> =
-                        pre_bandpass_results.as_ref().map(|pre| {
+                        plot_pre_bandpass_results.as_ref().map(|pre| {
                             pre.freq_range
                                 .iter()
                                 .zip(pre.freq_rate_spectrum.iter().map(|c| c.norm()))
@@ -1987,15 +2238,16 @@ pub fn process_cor_file(
                                 .collect()
                         });
                     let rate_profile_pre_bp: Option<Vec<(f64, f64)>> =
-                        pre_bandpass_results.as_ref().map(|pre| {
+                        plot_pre_bandpass_results.as_ref().map(|pre| {
                             pre.rate_range
                                 .iter()
                                 .zip(pre.freq_rate.iter())
                                 .map(|(&x, &y)| (x as f64, y as f64))
                                 .collect()
                         });
-                    let freq_data: Vec<f32> = analysis_results.freq_range.iter().copied().collect();
-                    let rate_data: Vec<f32> = analysis_results.rate_range.to_vec();
+                    let freq_data: Vec<f32> =
+                        plot_analysis_results.freq_range.iter().copied().collect();
+                    let rate_data: Vec<f32> = plot_analysis_results.rate_range.to_vec();
                     let heatmap_func = |freq: f64, rate: f64| -> f64 {
                         let f_min = freq_data[0] as f64;
                         let f_max = *freq_data.last().unwrap() as f64;

@@ -1584,11 +1584,21 @@ pub fn process_cor_file(
         // The time-domain samples are no longer needed by plots or exporters.
         drop(complex_vec);
 
+        // Search runs on data after the manual delay/rate correction, so the
+        // Res-Delay and Res-Rate columns must report only the newly estimated
+        // residual. Keep the original values for plots, which show residual
+        // and applied correction in separate fields.
+        let mut output_analysis_results = analysis_results.clone();
+        if primary_search_mode.is_some() {
+            output_analysis_results.corrected_delay = 0.0;
+            output_analysis_results.corrected_rate = 0.0;
+        }
+
         if !args.frequency {
             let delay_output_line = format!(
                 "{} {:>6}",
                 format_delay_output(
-                    &analysis_results,
+                    &output_analysis_results,
                     &label_str,
                     args.length,
                     &rfi_display,
@@ -1661,7 +1671,7 @@ pub fn process_cor_file(
             }
             if args.output {
                 delay_tsv.push_str(&format_delay_tsv_row(
-                    &analysis_results,
+                    &output_analysis_results,
                     &label_str,
                     &rfi_display,
                     bandpass_active,
@@ -1724,7 +1734,7 @@ pub fn process_cor_file(
             let freq_output_line = format!(
                 "{} {:>6}",
                 format_freq_output(
-                    &analysis_results,
+                    &output_analysis_results,
                     &label_str,
                     args.length,
                     &rfi_display,
@@ -1797,7 +1807,7 @@ pub fn process_cor_file(
             }
             if args.output {
                 freq_tsv.push_str(&format_freq_tsv_row(
-                    &analysis_results,
+                    &output_analysis_results,
                     &label_str,
                     &rfi_display,
                     bandpass_active,

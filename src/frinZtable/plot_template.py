@@ -48,6 +48,8 @@ def output_with_suffix(path, suffix):
 
 
 def hours_since_reference(value, settings):
+    if settings.get("hour_conversion") == "seconds":
+        return value / 3600.0
     reference = settings["hour_reference_mjd"]
     mjd_reference = settings.get("reference_mjd") or 0.0
     return (value + mjd_reference - reference) * 24.0
@@ -91,6 +93,8 @@ def main():
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        import matplotlib.ticker as mticker
     except ImportError as error:
         raise SystemExit("Install matplotlib in your Python environment: python3 -m pip install matplotlib") from error
     plt.style.use("default")
@@ -190,6 +194,13 @@ def main():
     ax.ticklabel_format(style="plain", axis="y", useOffset=False)
     if mode != "sources":
         ax.ticklabel_format(style="plain", axis="x", useOffset=False)
+    if settings.get("x_axis_scale") == "date":
+        ax.xaxis.set_major_formatter(
+            mticker.FuncFormatter(
+                lambda value, _position: mdates.num2date(value - 40587.0).strftime("%Y-%m-%d\n%H:%M")
+            )
+        )
+        fig.autofmt_xdate()
     if args.xlim:
         ax.set_xlim(args.xlim)
     if args.ylim:

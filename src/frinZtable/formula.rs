@@ -1,9 +1,9 @@
 //! Row-wise arithmetic for calculated columns. References are names in brackets
 //! (e.g. [Noise-level]), simple names (Amp), or spreadsheet letters (E).
-use super::data::{column_letter, number, Column};
-use anyhow::{bail, Context, Result};
+use super::data::{Column, column_letter, number};
+use anyhow::{Context, Result, bail};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Expression {
     Number(f64),
     Column(usize),
@@ -253,10 +253,12 @@ mod tests {
             Expression::parse("2^3^2", &columns).unwrap().evaluate(&row),
             Some(512.0)
         );
-        assert!(Expression::parse("Amp / 0", &columns)
-            .unwrap()
-            .evaluate(&row)
-            .is_none());
+        assert!(
+            Expression::parse("Amp / 0", &columns)
+                .unwrap()
+                .evaluate(&row)
+                .is_none()
+        );
         assert!(Expression::parse("unknown + 1", &columns).is_err());
         assert!(Expression::parse("1 +", &columns).is_err());
     }

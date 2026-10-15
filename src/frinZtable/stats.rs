@@ -118,10 +118,12 @@ mod tests {
         assert_eq!(s.sample_stddev, Some(1.0));
         assert!((s.standard_error.unwrap() - 1.0 / 3.0_f64.sqrt()).abs() < 1e-12);
         assert!(Statistics::calculate([None]).is_none());
-        assert!(Statistics::calculate([Some(3.0)])
-            .unwrap()
-            .sample_stddev
-            .is_none());
+        assert!(
+            Statistics::calculate([Some(3.0)])
+                .unwrap()
+                .sample_stddev
+                .is_none()
+        );
     }
     #[test]
     fn histogram_keeps_endpoints_and_constants() {

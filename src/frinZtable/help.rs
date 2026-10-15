@@ -327,7 +327,9 @@ impl Default for HelpBrowser {
         command.build();
         let mut topics = Vec::new();
         for &(title, summary, options, example, sections) in specs {
-            let mut text = format!("{title}\n\n{summary}\n\n実行例（ファイル名・値は自身の観測へ置き換えてください）\n{example}\n\n現在の実装が受け付けるオプション\n");
+            let mut text = format!(
+                "{title}\n\n{summary}\n\n実行例（ファイル名・値は自身の観測へ置き換えてください）\n{example}\n\n現在の実装が受け付けるオプション\n"
+            );
             for &option in options {
                 if let Some(arg) = command
                     .get_arguments()
@@ -384,7 +386,10 @@ impl Default for HelpBrowser {
             }
         }
         let all_options = command.get_arguments().map(option_text).collect::<String>();
-        let full = format!("frinZmain 全仕様・全オプション\n\n現在のCLI定義\n{}\n\n全オプションの詳細・別名・既定値\n{all_options}\n\n--detail の全文\n{DETAIL}\n\nREADME 全文\n{README}\n\n.mbcor 入力仕様 全文\n{MBCOR}", command.render_long_help());
+        let full = format!(
+            "frinZmain 全仕様・全オプション\n\n現在のCLI定義\n{}\n\n全オプションの詳細・別名・既定値\n{all_options}\n\n--detail の全文\n{DETAIL}\n\nREADME 全文\n{README}\n\n.mbcor 入力仕様 全文\n{MBCOR}",
+            command.render_long_help()
+        );
         topics.push(Topic {
             title: "全仕様書・全オプション（全文）".into(),
             summary: "詳細ガイド、全CLI定義、README、.mbcor仕様を省略せずに参照".into(),

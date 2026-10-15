@@ -1,12 +1,13 @@
 use super::{
-    data::{epoch_mjd, number, Table},
+    data::{Table, epoch_mjd, number},
     stats::histogram,
 };
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use eframe::egui::{self, Color32};
 use egui_plot::{Axis, AxisHints, Legend, Line, LineStyle, MarkerShape, Placement, Plot, Points};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlotMode {
     Series,
@@ -14,7 +15,7 @@ pub enum PlotMode {
     Sources,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeriesStyle {
     #[default]
@@ -23,11 +24,23 @@ pub enum SeriesStyle {
     ScatterDotted,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XAxisScale {
+    #[default]
+    Automatic,
+    Hours,
+    Date,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PlotOptions {
     pub mode: PlotMode,
     pub series_style: SeriesStyle,
     pub x: Option<usize>,
+    pub x_axis_scale: XAxisScale,
+    pub date_origin: String,
     pub y: usize,
     pub y_source: Option<String>,
     pub y2: Option<usize>,
@@ -52,6 +65,8 @@ impl Default for PlotOptions {
             mode: PlotMode::Series,
             series_style: SeriesStyle::Scatter,
             x: None,
+            x_axis_scale: XAxisScale::Automatic,
+            date_origin: String::new(),
             y: 4,
             y_source: None,
             y2: None,
@@ -82,7 +97,15 @@ fn marker(index: usize) -> MarkerShape {
 }
 
 pub fn first_mjd_reference(table: &Table) -> Option<f64> {
-    if table.column("Epoch").is_none() && table.column("MJD").is_none() {
+    let has_mjd_time = table.column("Epoch").is_some()
+        || table.column("MJD").is_some()
+        || table.column("Time").is_some_and(|column| {
+            table
+                .rows
+                .iter()
+                .any(|row| epoch_mjd(&row[column]).is_some())
+        });
+    if !has_mjd_time {
         return None;
     }
     table
@@ -94,6 +117,92 @@ pub fn first_mjd_reference(table: &Table) -> Option<f64> {
         .map(f64::floor)
 }
 
+pub fn automatic_x_name(table: &Table) -> &'static str {
+    if table.column("Epoch").is_some() || table.column("MJD").is_some() {
+        "Epoch / MJD"
+    } else if table.column("Time").is_some() {
+        "Time"
+    } else {
+        "Row number"
+    }
+}
+
+pub fn uses_mjd_x(table: &Table, column: Option<usize>) -> bool {
+    column.map_or_else(
+        || {
+            table.column("Epoch").is_some()
+                || table.column("MJD").is_some()
+                || table
+                    .column("Time")
+                    .is_some_and(|c| table.rows.iter().any(|row| epoch_mjd(&row[c]).is_some()))
+        },
+        |c| {
+            table.columns[c].name.eq_ignore_ascii_case("MJD")
+                || table.columns[c].name.eq_ignore_ascii_case("Epoch")
+                || (table.columns[c].name.eq_ignore_ascii_case("Time")
+                    && table.rows.iter().any(|row| epoch_mjd(&row[c]).is_some()))
+        },
+    )
+}
+
+fn time_column(table: &Table, column: Option<usize>) -> Option<usize> {
+    column
+        .filter(|&c| table.columns[c].name.eq_ignore_ascii_case("Time"))
+        .or_else(|| {
+            (column.is_none() && table.column("Epoch").is_none() && table.column("MJD").is_none())
+                .then(|| table.column("Time"))
+                .flatten()
+        })
+}
+
+pub fn time_column_is_seconds(table: &Table, column: Option<usize>) -> bool {
+    time_column(table, column).is_some_and(|c| {
+        let unit = table.columns[c].unit.to_ascii_lowercase();
+        !unit.contains("mjd")
+            && !unit.contains("day")
+            && !unit.contains("[d]")
+            && table
+                .rows
+                .iter()
+                .any(|row| number(&row[c]).is_some() && epoch_mjd(&row[c]).is_none())
+    })
+}
+
+/// Parse an ISO/RFC3339 date (UTC when no zone is given), or an MJD value.
+pub fn date_origin_mjd(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if let Ok(mjd) = text.parse::<f64>() {
+        return (mjd.is_finite() && (30_000.0..100_000.0).contains(&mjd)).then_some(mjd);
+    }
+    let unix_seconds = DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|date| date.timestamp() as f64 + f64::from(date.timestamp_subsec_millis()) / 1000.0)
+        .or_else(|| {
+            ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+                .into_iter()
+                .find_map(|format| NaiveDateTime::parse_from_str(text, format).ok())
+                .map(|date| date.and_utc().timestamp() as f64)
+        })
+        .or_else(|| {
+            NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                .ok()
+                .map(|date| date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as f64)
+        })?;
+    Some(unix_seconds / 86_400.0 + 40_587.0)
+}
+
+pub fn mjd_date_label(mjd: f64) -> String {
+    let unix_seconds = (mjd - 40_587.0) * 86_400.0;
+    if !unix_seconds.is_finite() || unix_seconds < i64::MIN as f64 || unix_seconds > i64::MAX as f64
+    {
+        return String::new();
+    }
+    Utc.timestamp_opt(unix_seconds.floor() as i64, 0)
+        .single()
+        .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 pub fn x_value(
     table: &Table,
     row: usize,
@@ -101,14 +210,19 @@ pub fn x_value(
     reference_mjd: Option<f64>,
 ) -> Option<f64> {
     if let Some(column) = column {
-        let value = number(&table.rows[row][column]);
-        return if table.columns[column].name.eq_ignore_ascii_case("MJD") {
+        let text = &table.rows[row][column];
+        let name = &table.columns[column].name;
+        let value = number(text).or_else(|| epoch_mjd(text));
+        return if name.eq_ignore_ascii_case("MJD")
+            || name.eq_ignore_ascii_case("Epoch")
+            || (name.eq_ignore_ascii_case("Time") && number(text).is_none())
+        {
             value.map(|x| x - reference_mjd.unwrap_or(0.0))
         } else {
             value
         };
     }
-    let time_value = table
+    let mjd_value = table
         .column("Epoch")
         .and_then(|c| epoch_mjd(&table.rows[row][c]))
         .or_else(|| {
@@ -116,19 +230,46 @@ pub fn x_value(
                 .column("MJD")
                 .and_then(|c| number(&table.rows[row][c]))
         });
-    time_value
-        .map(|x| x - reference_mjd.unwrap_or(0.0))
-        .or_else(|| {
-            (table.column("Epoch").is_none() && table.column("MJD").is_none())
-                .then_some((row + 1) as f64)
-        })
+    if let Some(value) = mjd_value {
+        return Some(value - reference_mjd.unwrap_or(0.0));
+    }
+    if let Some(time) = table.column("Time") {
+        let text = &table.rows[row][time];
+        if let Some(value) = epoch_mjd(text) {
+            return Some(value - reference_mjd.unwrap_or(0.0));
+        }
+        if let Some(value) = number(text) {
+            return Some(value);
+        }
+    }
+    (table.column("Epoch").is_none()
+        && table.column("MJD").is_none()
+        && table.column("Time").is_none())
+    .then_some((row + 1) as f64)
+}
+
+pub fn x_value_for_scale(table: &Table, row: usize, options: &PlotOptions) -> Option<f64> {
+    match options.x_axis_scale {
+        XAxisScale::Automatic => x_value(table, row, options.x, options.reference_mjd),
+        XAxisScale::Hours if uses_mjd_x(table, options.x) => {
+            let reference = options.reference_mjd.or_else(|| first_mjd_reference(table));
+            Some(x_value(table, row, options.x, reference)? * 24.0)
+        }
+        XAxisScale::Hours if time_column_is_seconds(table, options.x) => {
+            Some(x_value(table, row, options.x, None)? / 3600.0)
+        }
+        XAxisScale::Hours => x_value(table, row, options.x, options.reference_mjd),
+        XAxisScale::Date if uses_mjd_x(table, options.x) => x_value(table, row, options.x, None),
+        XAxisScale::Date if time_column_is_seconds(table, options.x) => Some(
+            date_origin_mjd(&options.date_origin)?
+                + x_value(table, row, options.x, None)? / 86_400.0,
+        ),
+        XAxisScale::Date => x_value(table, row, options.x, options.reference_mjd),
+    }
 }
 
 pub fn x_label(table: &Table, column: Option<usize>, reference_mjd: Option<f64>) -> String {
-    let is_mjd = column.map_or_else(
-        || table.column("Epoch").is_some() || table.column("MJD").is_some(),
-        |c| table.columns[c].name.eq_ignore_ascii_case("MJD"),
-    );
+    let is_mjd = uses_mjd_x(table, column);
     if is_mjd && reference_mjd.is_some() {
         return format!(
             "MJD − {} (days)",
@@ -140,10 +281,85 @@ pub fn x_label(table: &Table, column: Option<usize>, reference_mjd: Option<f64>)
         .unwrap_or_else(|| {
             if table.column("Epoch").is_some() || table.column("MJD").is_some() {
                 "Epoch (MJD, UTC)".into()
+            } else if let Some(c) = table.column("Time") {
+                format!("{} {}", table.columns[c].name, table.columns[c].unit)
             } else {
                 "Original row".into()
             }
         })
+}
+
+pub fn x_label_for_options(table: &Table, options: &PlotOptions) -> String {
+    match options.x_axis_scale {
+        XAxisScale::Automatic => x_label(table, options.x, options.reference_mjd),
+        XAxisScale::Hours if uses_mjd_x(table, options.x) => {
+            let reference = options
+                .reference_mjd
+                .or_else(|| first_mjd_reference(table))
+                .unwrap_or(0.0);
+            format!("Hours since MJD {}", super::stats::display(reference))
+        }
+        XAxisScale::Hours if time_column_is_seconds(table, options.x) => "Time [h]".into(),
+        XAxisScale::Hours => x_label(table, options.x, options.reference_mjd),
+        XAxisScale::Date => "Date (UTC)".into(),
+    }
+}
+
+#[cfg(test)]
+mod x_axis_tests {
+    use super::*;
+
+    #[test]
+    fn add_plot_time_column_is_used_as_the_automatic_x_axis() {
+        let table = Table::parse(
+            "# Time\tAmp\tSNR\n# [s]\t[%]\t-\n0\t1.5\t3\n60\t2.5\t4\n",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(automatic_x_name(&table), "Time");
+        assert_eq!(x_value(&table, 0, None, None), Some(0.0));
+        assert_eq!(x_value(&table, 1, None, None), Some(60.0));
+        assert_eq!(x_label(&table, None, None), "Time [s]");
+
+        let options = PlotOptions {
+            x_axis_scale: XAxisScale::Hours,
+            ..Default::default()
+        };
+        assert_eq!(x_value_for_scale(&table, 1, &options), Some(1.0 / 60.0));
+
+        let date_options = PlotOptions {
+            x_axis_scale: XAxisScale::Date,
+            date_origin: "2026-10-10".into(),
+            ..Default::default()
+        };
+        let expected = date_origin_mjd("2026-10-10").unwrap() + 60.0 / 86_400.0;
+        assert!((x_value_for_scale(&table, 1, &date_options).unwrap() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn epoch_x_can_be_displayed_as_hours_or_calendar_dates() {
+        let table = Table::parse(
+            "Epoch\tAmp\n2026/283T04:57:00\t1.5\n2026/283T05:57:00\t2.5\n",
+            false,
+        )
+        .unwrap();
+        let reference = first_mjd_reference(&table).unwrap();
+        let hours = PlotOptions {
+            reference_mjd: Some(reference),
+            x_axis_scale: XAxisScale::Hours,
+            ..Default::default()
+        };
+        let date = PlotOptions {
+            reference_mjd: Some(reference),
+            x_axis_scale: XAxisScale::Date,
+            ..Default::default()
+        };
+
+        assert!((x_value_for_scale(&table, 1, &hours).unwrap() - 5.95).abs() < 1e-8);
+        assert!((x_value_for_scale(&table, 0, &date).unwrap() - 61323.20625).abs() < 1e-8);
+        assert_eq!(mjd_date_label(61323.20625), "2026-10-10 04:57");
+    }
 }
 
 pub fn figure_size(width: f32, height: f32) -> egui::Vec2 {
@@ -186,6 +402,8 @@ pub fn show(
         "parameter_plot",
         options.mode as u8,
         options.x,
+        options.x_axis_scale as u8,
+        options.date_origin.clone(),
         options.y,
         options.y_source.clone(),
         options.y2,
@@ -199,6 +417,9 @@ pub fn show(
         .height(size.y)
         .legend(Legend::default())
         .y_axis_label(&y_label);
+    if options.x_axis_scale == XAxisScale::Date {
+        plot = plot.x_axis_formatter(|mark, _| mjd_date_label(mark.value));
+    }
     if options.reset {
         plot = plot.reset();
         options.reset = false;
@@ -237,7 +458,7 @@ pub fn show(
     };
     let response = match options.mode {
         PlotMode::Series => {
-            let x_label = x_label(table, options.x, options.reference_mjd);
+            let x_label = x_label_for_options(table, options);
             let secondary_column = secondary_column(options);
             let primary_range = value_range(options.y, options.y_source.as_deref());
             let secondary_range = secondary_column
@@ -278,7 +499,7 @@ pub fn show(
             let mut groups: BTreeMap<String, Vec<(usize, [f64; 2])>> = BTreeMap::new();
             let mut secondary_groups: BTreeMap<String, Vec<[f64; 2]>> = BTreeMap::new();
             for &r in rows {
-                let x = x_value(table, r, options.x, options.reference_mjd);
+                let x = x_value_for_scale(table, r, options);
                 if options
                     .y_source
                     .as_deref()

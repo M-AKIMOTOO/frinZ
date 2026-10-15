@@ -1,9 +1,10 @@
 use super::{
-    data::{column_letter, number, ColumnSummary, Filter, Sort, SourceSummary, Table},
+    data::{ColumnSummary, Filter, Sort, SourceSummary, Table, column_letter, number},
     help::HelpBrowser,
     plot_export::{self, ExportFormat},
     plots::{self, PlotMode, PlotOptions, SeriesStyle},
-    stats::{display, Statistics},
+    project::{self, Project},
+    stats::{Statistics, display},
 };
 use anyhow::Result;
 use eframe::egui::{self, Color32, Key, RichText, ScrollArea, Sense};
@@ -16,6 +17,15 @@ const ROW_HEIGHT: f32 = 25.0;
 struct Cell {
     row: usize,
     column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewMode {
+    Spreadsheet,
+    Plot,
+    #[default]
+    Combined,
 }
 
 enum PendingAction {
@@ -42,12 +52,14 @@ pub struct TableApp {
     all_statistics: bool,
     group_sort: usize,
     group_descending: bool,
+    view_mode: ViewMode,
     plot: PlotOptions,
     export_format: ExportFormat,
-    graph_expanded: bool,
     undo: Vec<Table>,
     redo: Vec<Table>,
     dirty: bool,
+    project_dirty: bool,
+    project_path: Option<PathBuf>,
     message: String,
     formula_window: bool,
     formula_name: String,
@@ -100,9 +112,10 @@ impl TableApp {
             table, path, filter: Filter { sources: (!sources.is_empty()).then(|| sources.into_iter().collect()), ..Default::default() },
             min_text: String::new(), max_text: String::new(), sort: None, view: Vec::new(), numeric: Vec::new(),
             summaries: Vec::new(), groups: Vec::new(), selected: None, anchor: None,
-            edit: String::new(), edit_focus: false, statistics_selected: false, all_statistics: false,
-            group_sort: 0, group_descending: false, plot: PlotOptions::default(), export_format: ExportFormat::default(), graph_expanded: false, undo: Vec::new(), redo: Vec::new(),
-            dirty: false, message: "Click a cell to inspect it; double-click or F2 to edit. Shift-click selects a range.".into(),
+            edit: String::new(), edit_focus: false, statistics_selected: false, all_statistics: true,
+            group_sort: 0, group_descending: false, view_mode: ViewMode::Combined, plot: PlotOptions::default(), export_format: ExportFormat::default(), undo: Vec::new(), redo: Vec::new(),
+            dirty: false, project_dirty: false, project_path: None,
+            message: "Click a cell to inspect it; double-click or F2 to edit. Shift-click selects a range.".into(),
             formula_window: false, formula_name: "AmpToNoise".into(), formula_unit: String::new(),
             formula: "Amp / [Noise-level]".into(), pending: None, allow_close: false,
             screenshot, frames: 0,
@@ -128,7 +141,184 @@ impl TableApp {
     }
 
     pub fn expand_graph(&mut self) {
-        self.graph_expanded = true;
+        self.view_mode = ViewMode::Plot;
+    }
+
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+    }
+
+    pub fn restore_project(&mut self, project: Project, project_path: PathBuf) {
+        self.table = project.table;
+        self.path = project.data_path;
+        self.filter = project.filter;
+        self.min_text = project.min_text;
+        self.max_text = project.max_text;
+        self.sort = project.sort;
+        self.statistics_selected = project.statistics_selected;
+        self.all_statistics = project.all_statistics;
+        self.group_sort = project.group_sort;
+        self.group_descending = project.group_descending;
+        self.plot = project.plot;
+        self.export_format = project.export_format;
+        self.view_mode = project.view_mode;
+        self.project_path = Some(project_path);
+        self.undo.clear();
+        self.redo.clear();
+        self.dirty = false;
+        self.project_dirty = false;
+        self.rebuild();
+        let locate = |cell: Option<[usize; 2]>, view: &[usize]| {
+            cell.and_then(|[row, column]| {
+                (column < self.table.columns.len())
+                    .then(|| {
+                        view.iter()
+                            .position(|&visible_row| visible_row == row)
+                            .map(|row| Cell { row, column })
+                    })
+                    .flatten()
+            })
+        };
+        self.selected = locate(project.selected, &self.view);
+        self.anchor = locate(project.anchor, &self.view);
+        if let Some(cell) = self.selected {
+            self.edit = self.table.rows[self.view[cell.row]][cell.column].clone();
+            self.refresh_statistics();
+        }
+        self.message = format!(
+            "Resumed project: {} rows, {} columns.",
+            self.table.rows.len(),
+            self.table.columns.len()
+        );
+    }
+
+    fn save_project(&mut self, save_as: bool) -> bool {
+        if self.table.columns.is_empty() {
+            self.message = "Open a table before saving a project.".into();
+            return false;
+        }
+        if !self.commit_pending_edit() {
+            return false;
+        }
+        let path = if !save_as {
+            self.project_path.clone()
+        } else {
+            None
+        }
+        .or_else(|| {
+            let stem = self
+                .path
+                .as_ref()
+                .and_then(|path| path.file_stem())
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "frinZ".into());
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("frinZtable project", &["frztable"])
+                .set_file_name(format!("{stem}.frztable"));
+            if let Some(directory) = self
+                .project_path
+                .as_ref()
+                .or(self.path.as_ref())
+                .and_then(|path| path.parent())
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                dialog = dialog.set_directory(directory);
+            }
+            dialog.save_file()
+        });
+        let Some(path) = path else {
+            return false;
+        };
+        let path = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| !extension.eq_ignore_ascii_case("frztable"))
+        {
+            path.with_extension("frztable")
+        } else {
+            path
+        };
+        let project = Project {
+            version: project::CURRENT_VERSION,
+            table: self.table.clone(),
+            data_path: self.path.clone(),
+            filter: self.filter.clone(),
+            min_text: self.min_text.clone(),
+            max_text: self.max_text.clone(),
+            sort: self.sort,
+            statistics_selected: self.statistics_selected,
+            all_statistics: self.all_statistics,
+            group_sort: self.group_sort,
+            group_descending: self.group_descending,
+            plot: self.plot.clone(),
+            export_format: self.export_format,
+            view_mode: self.view_mode,
+            selected: self.selected.map(|cell| [self.view[cell.row], cell.column]),
+            anchor: self.anchor.map(|cell| [self.view[cell.row], cell.column]),
+        };
+        match project.save(&path) {
+            Ok(()) => {
+                self.project_path = Some(path.clone());
+                self.project_dirty = false;
+                self.dirty = false;
+                self.message = format!("Project saved: {}", path.display());
+                true
+            }
+            Err(error) => {
+                self.message = format!("Project save failed: {error}");
+                false
+            }
+        }
+    }
+
+    fn commit_pending_edit(&mut self) -> bool {
+        let Some(cell) = self.selected else {
+            return true;
+        };
+        let Some(&row) = self.view.get(cell.row) else {
+            return true;
+        };
+        if self.table.rows[row][cell.column] == self.edit {
+            return true;
+        }
+        if self
+            .table
+            .calculated
+            .iter()
+            .any(|derived| derived.column == cell.column)
+        {
+            self.message = "Calculated columns are read-only.".into();
+            return false;
+        }
+        if self.edit.contains(['\t', '\n', '\r']) {
+            self.message = "Cell edits cannot contain tabs or newlines.".into();
+            return false;
+        }
+        let selected = self.selected.map(|cell| [self.view[cell.row], cell.column]);
+        let anchor = self.anchor.map(|cell| [self.view[cell.row], cell.column]);
+        let before = self.table.clone();
+        self.table.rows[row][cell.column] = self.edit.clone();
+        self.table.recalculate();
+        self.record(before);
+        self.rebuild();
+        let locate = |cell: Option<[usize; 2]>, view: &[usize]| {
+            cell.and_then(|[row, column]| {
+                (column < self.table.columns.len())
+                    .then(|| {
+                        view.iter()
+                            .position(|&visible_row| visible_row == row)
+                            .map(|row| Cell { row, column })
+                    })
+                    .flatten()
+            })
+        };
+        self.selected = locate(selected, &self.view);
+        self.anchor = locate(anchor, &self.view);
+        if let Some(cell) = self.selected {
+            self.edit = self.table.rows[self.view[cell.row]][cell.column].clone();
+        }
+        self.refresh_statistics();
+        true
     }
 
     fn set_plot_rows(&mut self, rows: &[usize], enabled: bool) {
@@ -294,6 +484,7 @@ impl TableApp {
     }
 
     fn select(&mut self, cell: Cell, extend: bool) {
+        let previous_plot_column = self.plot.y;
         self.selected = Some(cell);
         if !extend || self.anchor.is_none() {
             self.anchor = Some(cell);
@@ -304,6 +495,9 @@ impl TableApp {
             self.plot.reset = true;
         }
         self.refresh_statistics();
+        if self.statistics_selected || self.plot.y != previous_plot_column {
+            self.project_dirty = true;
+        }
     }
 
     fn record(&mut self, before: Table) {
@@ -313,6 +507,7 @@ impl TableApp {
         }
         self.redo.clear();
         self.dirty = true;
+        self.project_dirty = true;
         self.numeric = self.table.numeric_columns();
         self.refresh_statistics();
         self.plot.reset = true;
@@ -361,6 +556,7 @@ impl TableApp {
                 self.redo.push(current);
             }
             self.dirty = true;
+            self.project_dirty = true;
             self.rebuild();
         }
     }
@@ -401,6 +597,7 @@ impl TableApp {
                 if !view_only {
                     self.path = Some(path);
                     self.dirty = false;
+                    self.project_dirty = true;
                 }
                 true
             }
@@ -497,13 +694,24 @@ impl TableApp {
     }
 
     fn request_open(&mut self, path: PathBuf) {
-        if self.dirty {
+        if self.dirty || self.project_dirty {
             self.pending = Some(PendingAction::Open(path));
         } else {
             self.open(path);
         }
     }
     fn open(&mut self, path: PathBuf) {
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("frztable"))
+        {
+            match Project::load(&path) {
+                Ok(project) => self.restore_project(project, path),
+                Err(error) => self.message = format!("Open project failed: {error}"),
+            }
+            return;
+        }
         match Table::load(&path) {
             Ok(table) => {
                 self.table = table;
@@ -515,6 +723,8 @@ impl TableApp {
                 self.undo.clear();
                 self.redo.clear();
                 self.dirty = false;
+                self.project_dirty = false;
+                self.project_path = None;
                 self.plot.y = self.table.column("Amp").unwrap_or(0);
                 self.plot.x = None;
                 self.plot.y_source = None;
@@ -560,7 +770,7 @@ impl TableApp {
         }
         let editing = ctx.wants_keyboard_input();
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) {
-            self.save_table(false);
+            self.save_project(false);
         }
         if !editing {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z)) {
@@ -629,7 +839,7 @@ impl TableApp {
 
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("frinZtable").color(Color32::WHITE));
                 ui.separator();
                 if ui.button("Open TSV…").clicked() {
@@ -640,62 +850,110 @@ impl TableApp {
                         self.request_open(path);
                     }
                 }
-                if ui
-                    .add_enabled(
-                        !self.table.columns.is_empty(),
-                        egui::Button::new("Save table as…"),
-                    )
-                    .clicked()
-                {
-                    self.save_table(false);
+                if ui.button("Open project…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("frinZtable project", &["frztable"])
+                        .pick_file()
+                    {
+                        self.request_open(path);
+                    }
                 }
                 if ui
                     .add_enabled(
                         !self.table.columns.is_empty(),
-                        egui::Button::new("Export view…"),
+                        egui::Button::new("Save project"),
                     )
                     .clicked()
                 {
-                    self.save_table(true);
-                }
-                if ui.button("Export statistics…").clicked() {
-                    self.export_statistics();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
-                    .clicked()
-                {
-                    self.undo(false);
-                }
-                if ui
-                    .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
-                    .clicked()
-                {
-                    self.undo(true);
+                    self.save_project(false);
                 }
                 if ui
                     .add_enabled(
                         !self.table.columns.is_empty(),
-                        egui::Button::new("+ Calculated column"),
+                        egui::Button::new("Save project as…"),
                     )
                     .clicked()
                 {
-                    self.formula_window = true;
+                    self.save_project(true);
+                }
+                if self.view_mode != ViewMode::Plot {
+                    if ui
+                        .add_enabled(
+                            !self.table.columns.is_empty(),
+                            egui::Button::new("Save table as…"),
+                        )
+                        .clicked()
+                    {
+                        self.save_table(false);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.table.columns.is_empty(),
+                            egui::Button::new("Export view…"),
+                        )
+                        .clicked()
+                    {
+                        self.save_table(true);
+                    }
+                    if ui.button("Export statistics…").clicked() {
+                        self.export_statistics();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
+                        .clicked()
+                    {
+                        self.undo(false);
+                    }
+                    if ui
+                        .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
+                        .clicked()
+                    {
+                        self.undo(true);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.table.columns.is_empty(),
+                            egui::Button::new("+ Calculated column"),
+                        )
+                        .clicked()
+                    {
+                        self.formula_window = true;
+                    }
                 }
                 if ui.button("Help / ヘルプ (F1)").clicked() {
                     self.help.open = true;
                 }
             });
+            ui.horizontal(|ui| {
+                let prior_view = self.view_mode;
+                ui.strong("View");
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Spreadsheet,
+                    "Spreadsheet only",
+                );
+                ui.selectable_value(&mut self.view_mode, ViewMode::Plot, "Plot only");
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Combined,
+                    "Spreadsheet + plot",
+                );
+                if self.view_mode != prior_view {
+                    self.project_dirty = true;
+                }
+            });
+            ui.separator();
             if let Some(path) = &self.path {
                 ui.label(
                     RichText::new(format!(
                         "{}{}",
                         path.display(),
-                        if self.dirty {
-                            "  • unsaved edits"
-                        } else {
-                            ""
+                        match (self.dirty, self.project_dirty) {
+                            (true, true) => "  • unsaved edits / project settings",
+                            (true, false) => "  • unsaved edits",
+                            (false, true) => "  • unsaved project settings",
+                            (false, false) => "",
                         }
                     ))
                     .small(),
@@ -753,18 +1011,6 @@ impl TableApp {
                             .desired_width(180.0),
                     )
                     .changed();
-                let mut by_source = self.sort.is_some_and(|s| s.by_source);
-                if ui
-                    .checkbox(&mut by_source, "Group sort by source")
-                    .changed()
-                {
-                    self.sort = Some(Sort {
-                        column: self.sort.map(|s| s.column).unwrap_or(self.plot.y),
-                        descending: self.sort.is_some_and(|s| s.descending),
-                        by_source,
-                    });
-                    changed = true;
-                }
                 if ui.button("Reset filters / sort").clicked() {
                     self.filter = Filter::default();
                     self.sort = None;
@@ -819,42 +1065,45 @@ impl TableApp {
                 {
                     ui.colored_label(Color32::WHITE, "Min is greater than Max");
                 }
-                ui.label(RichText::new("Click column headings to sort ↑ / ↓").small());
+                ui.label(RichText::new("Column headers sort · Row menu sorts by object").small());
             });
             if changed {
                 self.filter.min = number(&self.min_text);
                 self.filter.max = number(&self.max_text);
                 self.rebuild();
+                self.project_dirty = true;
             }
-            ui.horizontal(|ui| {
-                let label = self
-                    .selected
-                    .map(|cell| format!("{}{}", column_letter(cell.column), cell.row + 1))
-                    .unwrap_or_else(|| "Cell".into());
-                ui.label(RichText::new(label).monospace());
-                let writable = self
-                    .selected
-                    .is_some_and(|c| !self.table.calculated.iter().any(|d| d.column == c.column));
-                let response = ui.add_enabled(
-                    writable,
-                    egui::TextEdit::singleline(&mut self.edit)
-                        .desired_width((ui.available_width() - 170.0).max(80.0)),
-                );
-                if self.edit_focus {
-                    response.request_focus();
-                    self.edit_focus = false;
-                }
-                if ui
-                    .add_enabled(writable, egui::Button::new("Apply"))
-                    .clicked()
-                    || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                {
-                    self.apply_edit();
-                }
-                if ui.button("Copy range").clicked() {
-                    self.copy_selection(ctx);
-                }
-            });
+            if self.view_mode != ViewMode::Plot {
+                ui.horizontal(|ui| {
+                    let label = self
+                        .selected
+                        .map(|cell| format!("{}{}", column_letter(cell.column), cell.row + 1))
+                        .unwrap_or_else(|| "Cell".into());
+                    ui.label(RichText::new(label).monospace());
+                    let writable = self.selected.is_some_and(|c| {
+                        !self.table.calculated.iter().any(|d| d.column == c.column)
+                    });
+                    let response = ui.add_enabled(
+                        writable,
+                        egui::TextEdit::singleline(&mut self.edit)
+                            .desired_width((ui.available_width() - 170.0).max(80.0)),
+                    );
+                    if self.edit_focus {
+                        response.request_focus();
+                        self.edit_focus = false;
+                    }
+                    if ui
+                        .add_enabled(writable, egui::Button::new("Apply"))
+                        .clicked()
+                        || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                    {
+                        self.apply_edit();
+                    }
+                    if ui.button("Copy range").clicked() {
+                        self.copy_selection(ctx);
+                    }
+                });
+            }
         });
     }
 
@@ -866,7 +1115,9 @@ impl TableApp {
                 changed |= ui.selectable_value(&mut self.statistics_selected, false, "Visible rows").changed();
                 changed |= ui.selectable_value(&mut self.statistics_selected, true, "Selected rows").changed();
             });
-            ui.checkbox(&mut self.all_statistics, "Show every numeric column");
+            if ui.checkbox(&mut self.all_statistics, "All numeric columns").changed() {
+                self.project_dirty = true;
+            }
             if changed { self.refresh_statistics(); }
             let rows = if self.statistics_selected { self.selected_rows().len() } else { self.view.len() };
             ui.label(format!("Scope: {rows} rows · arithmetic statistics"));
@@ -888,7 +1139,7 @@ impl TableApp {
                         for (i, label) in ["Source", "N", "Mean", "Median", "Stddev", "Min", "Max"].iter().enumerate() {
                             if ui.small_button(*label).clicked() {
                                 self.group_descending = if self.group_sort == i { !self.group_descending } else { false };
-                                self.group_sort = i; self.sort_groups();
+                                self.group_sort = i; self.sort_groups(); self.project_dirty = true;
                             }
                         }
                         ui.end_row();
@@ -915,12 +1166,13 @@ impl TableApp {
                     if !set.remove(&source) { set.insert(source); }
                 } else { self.filter.sources = Some(std::iter::once(source).collect()); }
                 self.filter.source.clear(); self.rebuild();
+                self.project_dirty = true;
             }
         });
     }
 
     fn graphs(&mut self, ctx: &egui::Context) -> egui::Rect {
-        if self.graph_expanded {
+        if self.view_mode == ViewMode::Plot {
             egui::CentralPanel::default()
                 .show(ctx, |ui| self.graph_contents(ui))
                 .inner
@@ -1048,11 +1300,11 @@ impl TableApp {
             ui.separator();
             ui.label("Export format");
             for format in [ExportFormat::Png, ExportFormat::Pdf, ExportFormat::Eps] {
-                ui.selectable_value(
+                changed |= ui.selectable_value(
                     &mut self.export_format,
                     format,
                     format.label(),
-                );
+                ).changed();
             }
             if ui
                 .add_enabled(
@@ -1063,12 +1315,6 @@ impl TableApp {
             {
                 self.export_graph();
             }
-            let label = if self.graph_expanded {
-                "Back to table"
-            } else {
-                "Expand graph"
-            };
-            ui.toggle_value(&mut self.graph_expanded, label);
         });
         ui.horizontal_wrapped(|ui| {
             if self.plot.mode == PlotMode::Series {
@@ -1078,11 +1324,15 @@ impl TableApp {
                         self.plot
                             .x
                             .map(|c| self.table.columns[c].name.as_str())
-                            .unwrap_or("Epoch / MJD"),
+                            .unwrap_or_else(|| plots::automatic_x_name(&self.table)),
                     )
                     .show_ui(ui, |ui| {
                         changed |= ui
-                            .selectable_value(&mut self.plot.x, None, "Epoch / MJD")
+                            .selectable_value(
+                                &mut self.plot.x,
+                                None,
+                                plots::automatic_x_name(&self.table),
+                            )
                             .changed();
                         for &c in &self.numeric {
                             changed |= ui
@@ -1094,17 +1344,60 @@ impl TableApp {
                                 .changed();
                         }
                     });
-                let uses_mjd_x = self.plot.x.map_or_else(
-                    || self.table.column("Epoch").is_some() || self.table.column("MJD").is_some(),
-                    |c| self.table.columns[c].name.eq_ignore_ascii_case("MJD"),
-                );
-                if uses_mjd_x {
+                ui.label("X scale");
+                egui::ComboBox::from_id_salt("plot_x_scale")
+                    .selected_text(match self.plot.x_axis_scale {
+                        plots::XAxisScale::Automatic => "Automatic",
+                        plots::XAxisScale::Hours => "Hours",
+                        plots::XAxisScale::Date => "Date (UTC)",
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.plot.x_axis_scale,
+                                plots::XAxisScale::Automatic,
+                                "Automatic",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.plot.x_axis_scale,
+                                plots::XAxisScale::Hours,
+                                "Hours",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.plot.x_axis_scale,
+                                plots::XAxisScale::Date,
+                                "Date (UTC)",
+                            )
+                            .changed();
+                    });
+                let uses_mjd_x = plots::uses_mjd_x(&self.table, self.plot.x);
+                let time_is_seconds = plots::time_column_is_seconds(&self.table, self.plot.x);
+                if self.plot.x_axis_scale == plots::XAxisScale::Date && time_is_seconds {
+                    ui.label("Date origin");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.plot.date_origin)
+                            .desired_width(150.0)
+                            .hint_text("YYYY-MM-DD or ISO time"),
+                    );
+                    changed |= response.changed();
+                    if !self.plot.date_origin.trim().is_empty()
+                        && plots::date_origin_mjd(&self.plot.date_origin).is_none()
+                    {
+                        ui.colored_label(Color32::LIGHT_RED, "Invalid date or MJD");
+                    }
+                }
+                if uses_mjd_x && self.plot.x_axis_scale != plots::XAxisScale::Date {
                     ui.label("Reference MJD");
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.plot.reference_text)
                             .desired_width(96.0)
                             .hint_text("e.g. 61323"),
                     );
+                    self.project_dirty |= response.changed();
                     if response.changed() {
                         let value = self.plot.reference_text.trim();
                         if value.is_empty() {
@@ -1153,19 +1446,20 @@ impl TableApp {
                         "Scatter + dotted line",
                     )
                     .changed();
-                ui.checkbox(&mut self.plot.noise_bars, "Amp ± Noise-level");
+                changed |= ui.checkbox(&mut self.plot.noise_bars, "Amp ± Noise-level").changed();
             } else if self.plot.mode == PlotMode::Histogram {
                 ui.label("Bins");
                 changed |= ui
                     .add(egui::Slider::new(&mut self.plot.bins, 1..=100))
                     .changed();
             }
-            ui.checkbox(&mut self.plot.preview_9_6, "9:6 preview");
+            changed |= ui.checkbox(&mut self.plot.preview_9_6, "9:6 preview").changed();
             ui.label(RichText::new("Drag to pan · scroll to zoom · double-click to fit").small());
         });
         if changed {
             self.plot.reset = true;
             self.refresh_statistics();
+            self.project_dirty = true;
         }
         let selected = self.selected_rows();
         ui.horizontal_wrapped(|ui| {
@@ -1204,15 +1498,20 @@ impl TableApp {
     }
 
     fn main_panels(&mut self, ctx: &egui::Context) -> egui::Rect {
-        let expanded = self.graph_expanded;
-        if !expanded {
-            self.sidebar(ctx);
+        match self.view_mode {
+            ViewMode::Spreadsheet => {
+                self.sidebar(ctx);
+                self.sheet(ctx);
+                egui::Rect::NOTHING
+            }
+            ViewMode::Plot => self.graphs(ctx),
+            ViewMode::Combined => {
+                self.sidebar(ctx);
+                let graph = self.graphs(ctx);
+                self.sheet(ctx);
+                graph
+            }
         }
-        let graph = self.graphs(ctx);
-        if !expanded {
-            self.sheet(ctx);
-        }
-        graph
     }
 
     fn sheet(&mut self, ctx: &egui::Context) {
@@ -1223,7 +1522,9 @@ impl TableApp {
                 });
                 return;
             }
-            let mut sort_column = None;
+            let mut sort_column: Option<(usize, bool)> = None;
+            let mut row_sort_changed = false;
+            let mut plot_column = None;
             let mut clicked = None;
             let mut plot_changes = Vec::new();
             ScrollArea::horizontal()
@@ -1231,7 +1532,54 @@ impl TableApp {
                 .show(ui, |ui| {
                     ui.set_min_width(108.0 + self.table.columns.len() as f32 * CELL_WIDTH);
                     ui.horizontal(|ui| {
-                        ui.add_sized([42.0, 44.0], egui::Label::new("Row"));
+                        let source_column = self.table.column("Source");
+                        let row_order_label = match self.sort {
+                            Some(sort) if sort.by_source => {
+                                if sort.descending { "Object + value ↓" } else { "Object + value ↑" }
+                            }
+                            Some(sort) if Some(sort.column) == source_column => {
+                                if sort.descending { "Object Z–A" } else { "Object A–Z" }
+                            }
+                            Some(_) => "Column sort",
+                            None => "Row order",
+                        };
+                        egui::ComboBox::from_id_salt("row_sort")
+                            .width(88.0)
+                            .selected_text(row_order_label)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(&mut self.sort, None, "Original row order").changed() {
+                                    row_sort_changed = true;
+                                }
+                                if let Some(source) = source_column {
+                                    for (descending, label) in [
+                                        (false, "Object name A–Z"),
+                                        (true, "Object name Z–A"),
+                                    ] {
+                                        if ui.selectable_value(
+                                            &mut self.sort,
+                                            Some(Sort { column: source, descending, by_source: false }),
+                                            label,
+                                        ).changed() {
+                                            row_sort_changed = true;
+                                        }
+                                    }
+                                    ui.separator();
+                                    for (descending, label) in [
+                                        (false, "Object, then value ↑"),
+                                        (true, "Object, then value ↓"),
+                                    ] {
+                                        if ui.selectable_value(
+                                            &mut self.sort,
+                                            Some(Sort { column: self.plot.y, descending, by_source: true }),
+                                            label,
+                                        ).changed() {
+                                            row_sort_changed = true;
+                                        }
+                                    }
+                                } else {
+                                    ui.label("This table has no Source column.");
+                                }
+                            });
                         ui.add_sized([48.0, 44.0], egui::Label::new("Plot"));
                         for (c, column) in self.table.columns.iter().enumerate() {
                             let arrow = self
@@ -1251,15 +1599,33 @@ impl TableApp {
                             } else {
                                 Color32::from_gray(22)
                             };
-                            if ui
+                            let header = ui
                                 .add_sized(
                                     [CELL_WIDTH - ui.spacing().item_spacing.x, 44.0],
                                     egui::Button::new(RichText::new(label).size(11.0)).fill(fill),
-                                )
-                                .clicked()
-                            {
-                                sort_column = Some(c);
+                                );
+                            if header.clicked() {
+                                let descending = self.sort.is_some_and(|sort| {
+                                    sort.column == c && !sort.descending
+                                });
+                                sort_column = Some((c, descending));
                             }
+                            let is_numeric = self.numeric.contains(&c);
+                            header.on_hover_text("Click to toggle ascending / descending sort. Right-click for explicit sort options.")
+                                .context_menu(|ui| {
+                                    if ui.button("Sort ascending ↑").clicked() {
+                                        sort_column = Some((c, false));
+                                        ui.close();
+                                    }
+                                    if ui.button("Sort descending ↓").clicked() {
+                                        sort_column = Some((c, true));
+                                        ui.close();
+                                    }
+                                    if is_numeric && ui.button("Plot this column").clicked() {
+                                        plot_column = Some(c);
+                                        ui.close();
+                                    }
+                                });
                         }
                     });
                     ui.separator();
@@ -1343,17 +1709,27 @@ impl TableApp {
                             }
                         });
                 });
-            if let Some(c) = sort_column {
-                let descending = self.sort.is_some_and(|s| s.column == c && !s.descending);
+            if let Some((c, descending)) = sort_column {
                 self.sort = Some(Sort {
                     column: c,
                     descending,
-                    by_source: self.sort.is_some_and(|s| s.by_source),
+                    by_source: self.sort.is_some_and(|sort| sort.by_source),
                 });
                 if self.numeric.contains(&c) {
                     self.plot.y = c;
                 }
                 self.rebuild();
+                self.project_dirty = true;
+            }
+            if row_sort_changed {
+                self.rebuild();
+                self.project_dirty = true;
+            }
+            if let Some(column) = plot_column {
+                self.plot.y = column;
+                self.plot.reset = true;
+                self.refresh_statistics();
+                self.project_dirty = true;
             }
             if let Some((cell, extend, edit)) = clicked {
                 self.select(cell, extend);
@@ -1419,10 +1795,10 @@ impl TableApp {
         if self.pending.is_some() {
             let mut action = 0;
             egui::Modal::new(egui::Id::new("unsaved_edits")).show(ctx, |ui| {
-                ui.heading("Unsaved edits");
-                ui.label("Save your edited table before continuing?");
+                ui.heading("Unsaved project changes");
+                ui.label("Save the table and analysis settings before continuing?");
                 ui.horizontal(|ui| {
-                    if ui.button("Save table as…").clicked() {
+                    if ui.button("Save project…").clicked() {
                         action = 1;
                     }
                     if ui.button("Discard edits").clicked() {
@@ -1436,7 +1812,7 @@ impl TableApp {
             if action == 3 {
                 self.pending = None;
             }
-            if action == 2 || (action == 1 && self.save_table(false)) {
+            if action == 2 || (action == 1 && self.save_project(false)) {
                 match self.pending.take() {
                     Some(PendingAction::Open(path)) => self.open(path),
                     Some(PendingAction::Close) => {
@@ -1492,7 +1868,10 @@ impl eframe::App for TableApp {
                 }
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.allow_close {
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.dirty || self.project_dirty)
+            && !self.allow_close
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(PendingAction::Close);
         }
@@ -1671,7 +2050,7 @@ mod tests {
             );
             assert!(!output.shapes.is_empty());
         }
-        app.expand_graph();
+        app.set_view_mode(ViewMode::Plot);
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1689,6 +2068,21 @@ mod tests {
                 );
             },
         );
+        app.set_view_mode(ViewMode::Spreadsheet);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 940.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                app.toolbar(ctx);
+                app.main_panels(ctx);
+            },
+        );
+        assert!(!output.shapes.is_empty());
     }
 
     #[test]

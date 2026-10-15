@@ -1,4 +1,4 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -41,7 +41,9 @@ fn install_at(executable: &Path, data_home: &Path) -> Result<PathBuf> {
     fs::create_dir_all(&applications)?;
     fs::create_dir_all(&icons)?;
     let desktop = applications.join("frinZtable.desktop");
-    let entry = format!("[Desktop Entry]\nType=Application\nName=frinZtable\nGenericName=Fringe analysis spreadsheet\nGenericName[ja]=フリンジ解析結果の表・統計・グラフ\nComment=Explore frinZ TSV results, compare sources and export editable figures\nComment[ja]=frinZの解析結果を表で編集し、複数天体の統計とグラフを表示\nExec={executable} %f\nIcon=frinZtable\nTerminal=false\nCategories=Science;Astronomy;DataVisualization;\nKeywords=frinZ;TSV;VLBI;XRISM;statistics;spreadsheet;天体;統計;\nMimeType=text/tab-separated-values;text/plain;\nStartupNotify=false\nStartupWMClass=frinZtable\nActions=Help;\n\n[Desktop Action Help]\nName=frinZmain processing help\nName[ja]=frinZmainの処理一覧・仕様書\nExec={executable} --manual\n");
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=frinZtable\nGenericName=Fringe analysis spreadsheet\nGenericName[ja]=フリンジ解析結果の表・統計・グラフ\nComment=Explore frinZ TSV results, compare sources and export editable figures\nComment[ja]=frinZの解析結果を表で編集し、複数天体の統計とグラフを表示\nExec={executable} %f\nIcon=frinZtable\nTerminal=false\nCategories=Science;Astronomy;DataVisualization;\nKeywords=frinZ;TSV;VLBI;XRISM;statistics;spreadsheet;天体;統計;\nMimeType=text/tab-separated-values;text/plain;\nStartupNotify=false\nStartupWMClass=frinZtable\nActions=Help;\n\n[Desktop Action Help]\nName=frinZmain processing help\nName[ja]=frinZmainの処理一覧・仕様書\nExec={executable} --manual\n"
+    );
     fs::write(icons.join("frinZtable.svg"), ICON)?;
     fs::write(&desktop, entry)?;
     Ok(desktop)
@@ -86,10 +88,12 @@ mod tests {
         assert!(text.contains("Exec=\"/tmp/共同研究/frinZ table\" %f\n"));
         assert!(text.contains("Exec=\"/tmp/共同研究/frinZ table\" --manual"));
         assert!(text.contains("Terminal=false"));
-        assert!(directory
-            .path()
-            .join("icons/hicolor/scalable/apps/frinZtable.svg")
-            .exists());
+        assert!(
+            directory
+                .path()
+                .join("icons/hicolor/scalable/apps/frinZtable.svg")
+                .exists()
+        );
         assert_eq!(
             executable_value(Path::new("/tmp/a$`\"\\%b")).unwrap(),
             concat!("\"/tmp/a", "\\\\$", "\\\\`", "\\\\\"", "\\\\\\\\", "%%b\"")

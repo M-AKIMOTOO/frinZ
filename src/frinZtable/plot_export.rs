@@ -1,11 +1,13 @@
 use super::{
-    data::{number, Table},
+    data::{Table, number},
     plots::{
-        first_mjd_reference, secondary_column, x_label, x_value, PlotMode, PlotOptions, SeriesStyle,
+        PlotMode, PlotOptions, SeriesStyle, XAxisScale, first_mjd_reference, mjd_date_label,
+        secondary_column, time_column_is_seconds, uses_mjd_x, x_label_for_options,
+        x_value_for_scale,
     },
-    stats::{histogram, Statistics},
+    stats::{Statistics, histogram},
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use plotters::prelude::*;
 use serde::Serialize;
 use std::{
@@ -18,7 +20,8 @@ use std::{
 pub const IMAGE_SIZE: (u32, u32) = (1800, 1200);
 const SCRIPT: &str = include_str!("plot_template.py");
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     #[default]
     Png,
@@ -62,8 +65,10 @@ impl ExportFormat {
 struct Settings {
     mode: PlotMode,
     x_label: String,
+    x_axis_scale: XAxisScale,
     hour_label: Option<String>,
     time_axis: bool,
+    hour_conversion: String,
     y_label: String,
     title: String,
     reference_mjd: Option<f64>,
@@ -130,16 +135,24 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
         "No rows are enabled for plotting in this view"
     );
     path.file_stem().context("A graph filename is required")?;
-    let is_time_series = options.mode == PlotMode::Series
-        && options.x.map_or_else(
-            || table.column("Epoch").is_some() || table.column("MJD").is_some(),
-            |column| table.columns[column].name.eq_ignore_ascii_case("MJD"),
-        );
-    let hour_reference_mjd = is_time_series
+    let is_mjd_axis = uses_mjd_x(table, options.x);
+    let is_time_seconds_axis = time_column_is_seconds(table, options.x);
+    let make_hour_companion = options.mode == PlotMode::Series
+        && options.x_axis_scale == XAxisScale::Automatic
+        && (is_mjd_axis || is_time_seconds_axis);
+    let hour_reference_mjd = (make_hour_companion && is_mjd_axis)
         .then(|| options.reference_mjd.or_else(|| first_mjd_reference(table)))
         .flatten();
+    if options.x_axis_scale == XAxisScale::Date
+        && is_time_seconds_axis
+        && super::plots::date_origin_mjd(&options.date_origin).is_none()
+    {
+        anyhow::bail!(
+            "Date scale for Time in seconds requires a date origin (ISO date/time or MJD)"
+        );
+    }
     let script_path = path.with_extension("py");
-    let hour_path = hour_reference_mjd.map(|_| {
+    let hour_path = make_hour_companion.then(|| {
         let extension = path
             .extension()
             .map(|extension| extension.to_string_lossy())
@@ -154,7 +167,11 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
         paths.push(hour_path.clone());
     }
     for file in &paths {
-        ensure!(!file.exists(), "{} already exists. Choose a new graph name to preserve your previous script and settings.", file.display());
+        ensure!(
+            !file.exists(),
+            "{} already exists. Choose a new graph name to preserve your previous script and settings.",
+            file.display()
+        );
     }
     let column = &table.columns[options.y];
     let secondary_column = secondary_column(options);
@@ -166,7 +183,7 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
             Datum {
                 row: row + 1,
                 source: source.into(),
-                x: x_value(table, row, options.x, options.reference_mjd),
+                x: x_value_for_scale(table, row, options),
                 y: (options.mode != PlotMode::Series
                     || options
                         .y_source
@@ -199,17 +216,19 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
     };
     let settings = Settings {
         mode: options.mode,
-        x_label: x_label(table, options.x, options.reference_mjd),
-        hour_label: hour_reference_mjd
-            .map(|reference| format!("Hours since MJD {}", super::stats::display(reference))),
-        time_axis: hour_reference_mjd.is_some(),
+        x_label: x_label_for_options(table, options),
+        x_axis_scale: options.x_axis_scale,
+        hour_label: make_hour_companion.then(|| {
+            hour_reference_mjd.map_or_else(
+                || "Time [h]".into(),
+                |reference| format!("Hours since MJD {}", super::stats::display(reference)),
+            )
+        }),
+        time_axis: make_hour_companion,
+        hour_conversion: if is_mjd_axis { "mjd" } else { "seconds" }.into(),
         y_label: axis_label(options.y, options.y_source.as_deref()),
         title: column.name.clone(),
-        reference_mjd: options
-            .x
-            .is_none_or(|c| table.columns[c].name.eq_ignore_ascii_case("MJD"))
-            .then_some(options.reference_mjd)
-            .flatten(),
+        reference_mjd: is_mjd_axis.then_some(options.reference_mjd).flatten(),
         hour_reference_mjd,
         y2_label: secondary_column
             .filter(|_| options.mode == PlotMode::Series)
@@ -260,9 +279,9 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
     match format {
         ExportFormat::Png => {
             render(&staged[0], &settings, &layers)?;
-            if let Some(reference) = settings.hour_reference_mjd {
+            if settings.time_axis {
                 let hour_settings = hour_settings(&settings);
-                let hour_layers = layers_in_hours(&layers, settings.reference_mjd, reference);
+                let hour_layers = layers_in_hours(&layers, &settings);
                 render(
                     staged.get(2).context("Hour-axis PNG path is missing")?,
                     &hour_settings,
@@ -325,20 +344,32 @@ fn hours_since_reference(x: f64, reference_mjd: Option<f64>, hour_reference_mjd:
     (x + reference_mjd.unwrap_or(0.0) - hour_reference_mjd) * 24.0
 }
 
-fn layers_in_hours(
-    layers: &[Layer],
-    reference_mjd: Option<f64>,
-    hour_reference_mjd: f64,
-) -> Vec<Layer> {
+fn layers_in_hours(layers: &[Layer], settings: &Settings) -> Vec<Layer> {
     layers
         .iter()
         .cloned()
         .map(|mut layer| {
             for point in layer.points.iter_mut().chain(&mut layer.points2) {
-                point.0 = hours_since_reference(point.0, reference_mjd, hour_reference_mjd);
+                point.0 = if settings.hour_conversion == "seconds" {
+                    point.0 / 3600.0
+                } else {
+                    hours_since_reference(
+                        point.0,
+                        settings.reference_mjd,
+                        settings.hour_reference_mjd.unwrap_or(0.0),
+                    )
+                };
             }
             for (x, _, _) in &mut layer.errors {
-                *x = hours_since_reference(*x, reference_mjd, hour_reference_mjd);
+                *x = if settings.hour_conversion == "seconds" {
+                    *x / 3600.0
+                } else {
+                    hours_since_reference(
+                        *x,
+                        settings.reference_mjd,
+                        settings.hour_reference_mjd.unwrap_or(0.0),
+                    )
+                };
             }
             layer
         })
@@ -585,6 +616,8 @@ fn render(path: &Path, settings: &Settings, layers: &[Layer]) -> Result<()> {
             } else {
                 String::new()
             }
+        } else if settings.x_axis_scale == XAxisScale::Date {
+            mjd_date_label(*v)
         } else {
             super::stats::display(*v)
         }
@@ -807,15 +840,50 @@ mod tests {
                 .filter(|candidate| *candidate != extension)
             {
                 assert!(!path.with_extension(unselected).exists());
-                assert!(!directory
-                    .path()
-                    .join(format!("time_{extension}_hour.{unselected}"))
-                    .exists());
+                assert!(
+                    !directory
+                        .path()
+                        .join(format!("time_{extension}_hour.{unselected}"))
+                        .exists()
+                );
             }
             let script = fs::read_to_string(path.with_extension("py")).unwrap();
             assert!(script.contains("time_axis"));
             assert!(script.contains("hour_reference_mjd"));
             assert!(!script.contains("--time-axis"));
         }
+    }
+
+    #[test]
+    fn add_plot_seconds_export_also_writes_hours_and_accepts_a_date_origin() {
+        let table = Table::parse(
+            "# Time\tAmp\tSNR\n# [s]\t[%]\t-\n0\t1.5\t3\n3600\t2.5\t4\n",
+            false,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let automatic = PlotOptions {
+            y: 1,
+            ..Default::default()
+        };
+        let path = directory.path().join("add_plot.png");
+        export(&path, &table, &[0, 1], &automatic).unwrap();
+        assert!(directory.path().join("add_plot_hour.png").exists());
+        let script = fs::read_to_string(path.with_extension("py")).unwrap();
+        assert!(script.contains("hour_conversion"));
+
+        let dated = PlotOptions {
+            y: 1,
+            x_axis_scale: XAxisScale::Date,
+            date_origin: "2026-10-10T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let dated_path = directory.path().join("add_plot_date.png");
+        export(&dated_path, &table, &[0, 1], &dated).unwrap();
+        assert!(!directory.path().join("add_plot_date_hour.png").exists());
+        let dated_script = fs::read_to_string(dated_path.with_extension("py")).unwrap();
+        assert!(dated_script.contains("x_axis_scale"));
+        assert!(dated_script.contains("mdates.num2date"));
+        assert!(dated_script.contains("mticker.FuncFormatter"));
     }
 }

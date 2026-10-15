@@ -1,6 +1,6 @@
 use super::formula::Expression;
 use super::stats::Statistics;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 use std::{
@@ -10,20 +10,20 @@ use std::{
     path::Path,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CalculatedColumn {
     pub column: usize,
     pub formula: String,
     pub expression: Expression,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Column {
     pub name: String,
     pub unit: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<String>>,
@@ -32,7 +32,7 @@ pub struct Table {
     pub plot_enabled: Vec<bool>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Filter {
     pub source: String,
     /// None means every source; an empty set means no sources.
@@ -43,7 +43,7 @@ pub struct Filter {
     pub max: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sort {
     pub column: usize,
     pub descending: bool,
@@ -88,6 +88,24 @@ fn fields(line: &str, delimiter: u8) -> Result<Vec<String>> {
     Ok(record.iter().map(str::to_owned).collect())
 }
 
+fn looks_like_header(values: &[String]) -> bool {
+    values.len() > 1
+        && values
+            .iter()
+            .filter(|value| number(value).is_none() && epoch_mjd(value).is_none())
+            .count()
+            * 2
+            >= values.len()
+}
+
+fn looks_like_units(values: &[String]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| {
+            let value = value.trim();
+            value.is_empty() || value == "-" || (value.contains('[') && value.ends_with(']'))
+        })
+}
+
 fn default_columns(frequency: bool) -> Vec<Column> {
     let header = if frequency {
         frinZ::output::format_freq_tsv_header("Station1", "Station2")
@@ -109,21 +127,123 @@ impl Table {
 
     pub fn parse(text: &str, frequency: bool) -> Result<Self> {
         let mut table = Self::default();
-        let mut header = None;
-        let mut units = None;
+        let mut header: Option<Vec<String>> = None;
+        let mut units: Option<Vec<String>> = None;
         let mut excluded_rows = Vec::new();
-        let first_data = text
-            .trim_start_matches('\u{feff}')
-            .lines()
-            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
-        let delimiter = if first_data.is_some_and(|l| !l.contains('\t') && l.contains(',')) {
+        let lines: Vec<&str> = text.trim_start_matches('\u{feff}').lines().collect();
+        let first_data = lines
+            .iter()
+            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'));
+        let delimiter = if first_data.is_some_and(|line| !line.contains('\t') && line.contains(','))
+        {
             b','
         } else {
             b'\t'
         };
-        for (line_no, raw) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+        let first_width = first_data
+            .map(|line| fields(line.trim_end_matches('\r'), delimiter))
+            .transpose()?
+            .map(|values| values.len());
+        let expected_width = first_width.or_else(|| {
+            lines.iter().find_map(|line| {
+                let comment = line.trim_start().strip_prefix('#')?;
+                let values =
+                    fields(comment.strip_prefix(' ').unwrap_or(comment), delimiter).ok()?;
+                looks_like_header(&values).then_some(values.len())
+            })
+        });
+        let mut header_line = None;
+        let mut units_line = None;
+
+        // frinZ output files use comment-prefixed headers, but their first
+        // column varies between products (Epoch, Delay, Frequency, etc.).
+        // Match any tabular header to the width of the data rather than
+        // assuming one specific analysis table.
+        let mut best_comment_header: Option<(usize, usize, Vec<String>)> = None;
+        for (index, raw) in lines.iter().enumerate() {
+            let line = raw.trim_end_matches('\r');
+            let Some(comment) = line.trim_start().strip_prefix('#') else {
+                continue;
+            };
+            let comment = comment.strip_prefix(' ').unwrap_or(comment);
+            let values = fields(comment, delimiter)?;
+            if expected_width == Some(values.len()) && looks_like_header(&values) {
+                let known = values.first().is_some_and(|name| {
+                    ["Epoch", "Source", "Time", "MJD", "Frequency", "Delay"]
+                        .iter()
+                        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                });
+                let next_comment_is_units = lines.iter().skip(index + 1).find_map(|next| {
+                    let next = next.trim_end_matches('\r').trim_start();
+                    next.strip_prefix('#').and_then(|value| {
+                        fields(value.strip_prefix(' ').unwrap_or(value), delimiter)
+                            .ok()
+                            .filter(|fields| {
+                                fields.len() == values.len() && looks_like_units(fields)
+                            })
+                    })
+                });
+                let score = usize::from(known) * 2 + usize::from(next_comment_is_units.is_some());
+                if best_comment_header
+                    .as_ref()
+                    .is_none_or(|(_, best_score, _)| score > *best_score)
+                {
+                    best_comment_header = Some((index, score, values));
+                }
+            }
+        }
+        if let Some((index, _, names)) = best_comment_header {
+            header_line = Some(index);
+            header = Some(names);
+            units_line = lines
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .find_map(|(i, raw)| {
+                    let line = raw.trim_end_matches('\r').trim_start();
+                    let comment = line.strip_prefix('#')?;
+                    let values =
+                        fields(comment.strip_prefix(' ').unwrap_or(comment), delimiter).ok()?;
+                    (values.len() == header.as_ref()?.len() && looks_like_units(&values))
+                        .then_some(i)
+                });
+            if let Some(index) = units_line {
+                let line = lines[index].trim_end_matches('\r').trim_start();
+                let comment = line.strip_prefix('#').unwrap_or(line);
+                units = Some(fields(
+                    comment.strip_prefix(' ').unwrap_or(comment),
+                    delimiter,
+                )?);
+            }
+        } else if let Some((index, raw)) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        {
+            let values = fields(raw.trim_end_matches('\r'), delimiter)?;
+            if looks_like_header(&values) {
+                header_line = Some(index);
+                header = Some(values.clone());
+                if let Some((unit_index, unit_raw)) =
+                    lines.iter().enumerate().skip(index + 1).find(|(_, line)| {
+                        !line.trim().is_empty() && !line.trim_start().starts_with('#')
+                    })
+                {
+                    let unit_values = fields(unit_raw.trim_end_matches('\r'), delimiter)?;
+                    if unit_values.len() == values.len() && looks_like_units(&unit_values) {
+                        units_line = Some(unit_index);
+                        units = Some(unit_values);
+                    }
+                }
+            }
+        }
+
+        for (line_no, raw) in lines.iter().enumerate() {
             let line = raw.trim_end_matches('\r');
             if line.trim().is_empty() {
+                continue;
+            }
+            if Some(line_no) == header_line || Some(line_no) == units_line {
                 continue;
             }
             if let Some(comment) = line.trim_start().strip_prefix('#') {
@@ -143,40 +263,11 @@ impl Table {
                     }
                     continue;
                 }
-                let values = fields(comment.strip_prefix(' ').unwrap_or(comment), delimiter)?;
-                if values.len() > 1
-                    && values.first().is_some_and(|s| {
-                        s.eq_ignore_ascii_case("Epoch")
-                            || s.eq_ignore_ascii_case("Source")
-                            || s.eq_ignore_ascii_case("Time")
-                            || s.starts_with("Column")
-                    })
-                {
-                    header = Some(values);
-                } else if header.is_some()
-                    && units.is_none()
-                    && values.len() > 1
-                    && (values[0] == "-" || values[0].is_empty())
-                {
-                    units = Some(values);
-                } else {
-                    table.comments.push(line.to_owned());
-                }
+                table.comments.push(line.to_owned());
                 continue;
             }
             let values =
                 fields(line, delimiter).with_context(|| format!("Line {}", line_no + 1))?;
-            if table.rows.is_empty()
-                && header.is_none()
-                && values.first().is_some_and(|s| {
-                    s.eq_ignore_ascii_case("epoch")
-                        || s.eq_ignore_ascii_case("time")
-                        || s.eq_ignore_ascii_case("source")
-                })
-            {
-                header = Some(values);
-                continue;
-            }
             let expected = header
                 .as_ref()
                 .map(Vec::len)
@@ -488,11 +579,7 @@ fn compare_cells(a: &str, b: &str, descending: bool) -> Ordering {
         (None, Some(_)) => return Ordering::Greater,
         _ => a.to_lowercase().cmp(&b.to_lowercase()),
     };
-    if descending {
-        cmp.reverse()
-    } else {
-        cmp
-    }
+    if descending { cmp.reverse() } else { cmp }
 }
 
 pub fn column_letter(mut column: usize) -> String {
@@ -528,6 +615,51 @@ mod tests {
             "Frequency"
         );
         assert!((epoch_mjd("2026/283T04:57:00").unwrap() - 61323.20625).abs() < 1e-8);
+    }
+
+    #[test]
+    fn frequency_output_header_identifies_frequency_columns_without_a_filename_hint() {
+        let header = frinZ::output::format_freq_tsv_header("YAMAGU32", "YAMAGU34");
+        let row = "2026/283T04:57:00\tc\tNRAO530\t60\t0.5\t1169.5\t47.3\t6600.1234567\t0.0004\t0\t135\t30\t165\t135\t30\t166\t61323.20625\t-\tFalse\tFalse\t6600";
+        let table = Table::parse(&format!("{header}{row}\n"), false).unwrap();
+
+        assert_eq!(table.columns[7].name, "Frequency");
+        assert_eq!(
+            table.columns[7].unit, "[MHz]",
+            "columns: {:?}",
+            table.columns
+        );
+        assert_eq!(table.columns[8].name, "Noise-level");
+        assert_eq!(table.columns[9].name, "Res-Rate");
+        assert_eq!(table.rows[0][7], "6600.1234567");
+    }
+
+    #[test]
+    fn frinz_product_tsvs_accept_arbitrary_commented_headers_and_csv() {
+        let product = "# diagnostic product\n# Delay\tPower\tFlag\n# [sample]\t[Jy]\t-\n-2\t1.5\tok\n0\t2.5\tmasked\n";
+        let table = Table::parse(product, false).unwrap();
+        assert_eq!(
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Delay", "Power", "Flag"]
+        );
+        assert_eq!(table.columns[0].unit, "[sample]");
+        assert_eq!(table.columns[1].unit, "[Jy]");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.comments, ["# diagnostic product"]);
+
+        let csv = Table::parse("time,rate,source\n0.0,2.5,A\n1.0,3.5,B\n", false).unwrap();
+        assert_eq!(
+            csv.columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["time", "rate", "source"]
+        );
+        assert_eq!(csv.sources(), ["A", "B"]);
     }
     #[test]
     fn sort_filter_and_paste_use_displayed_rows() {
@@ -611,15 +743,17 @@ mod tests {
         assert_eq!(loaded.rows[0][0], "B");
         assert_eq!(loaded.plot_enabled, vec![false, true]);
         assert_eq!(loaded.plotted_rows(&[0, 1]), vec![1]);
-        assert!(table
-            .view(
-                &Filter {
-                    sources: Some(Default::default()),
-                    ..Default::default()
-                },
-                None
-            )
-            .is_empty());
+        assert!(
+            table
+                .view(
+                    &Filter {
+                        sources: Some(Default::default()),
+                        ..Default::default()
+                    },
+                    None
+                )
+                .is_empty()
+        );
         assert_eq!(table.view(&Filter::default(), None).len(), 3);
     }
 }

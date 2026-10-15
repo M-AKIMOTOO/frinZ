@@ -52,6 +52,16 @@ pub struct PlotOptions {
     pub bins: usize,
     pub preview_9_6: bool,
     pub reset: bool,
+    pub reset_generation: u64,
+}
+
+fn begin_plot_reset(options: &mut PlotOptions) -> bool {
+    if !options.reset {
+        return false;
+    }
+    options.reset = false;
+    options.reset_generation = options.reset_generation.wrapping_add(1);
+    true
 }
 
 pub fn secondary_column(options: &PlotOptions) -> Option<usize> {
@@ -78,6 +88,7 @@ impl Default for PlotOptions {
             bins: 15,
             preview_9_6: false,
             reset: true,
+            reset_generation: 0,
         }
     }
 }
@@ -398,6 +409,7 @@ pub fn show(
         ui.available_height(),
         options.preview_9_6,
     );
+    let reset = begin_plot_reset(options);
     let id = egui::Id::new((
         "parameter_plot",
         options.mode as u8,
@@ -410,6 +422,7 @@ pub fn show(
         options.y2_source.clone(),
         options.reference_mjd.map(f64::to_bits),
         options.log_y,
+        options.reset_generation,
     ));
     let mut plot = Plot::new(id)
         .id(id)
@@ -420,9 +433,8 @@ pub fn show(
     if options.x_axis_scale == XAxisScale::Date {
         plot = plot.x_axis_formatter(|mark, _| mjd_date_label(mark.value));
     }
-    if options.reset {
+    if reset {
         plot = plot.reset();
-        options.reset = false;
     }
     let log_y = options.log_y;
     let transform = |v: f64| -> Option<f64> {
@@ -755,6 +767,20 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plot_reset_advances_the_plot_state_generation() {
+        let mut options = PlotOptions::default();
+        assert!(begin_plot_reset(&mut options));
+        assert_eq!(options.reset_generation, 1);
+        assert!(!options.reset);
+        assert!(!begin_plot_reset(&mut options));
+
+        options.reset = true;
+        assert!(begin_plot_reset(&mut options));
+        assert_eq!(options.reset_generation, 2);
+    }
+
     #[test]
     fn figure_ratio_is_independent_of_data_axis_units() {
         for (width, height) in [(1200.0, 350.0), (400.0, 600.0)] {

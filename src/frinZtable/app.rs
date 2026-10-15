@@ -773,6 +773,9 @@ impl TableApp {
             self.help.open = true;
         }
         let editing = ctx.wants_keyboard_input();
+        if !editing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Home)) {
+            self.plot.reset = true;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) {
             self.save_project(false);
         }
@@ -942,6 +945,11 @@ impl TableApp {
             ui.horizontal(|ui| {
                 ui.strong(if gui_mode == ViewMode::Plot { "Plot GUI" } else { "Spreadsheet GUI" });
                 ui.label("The other workspace opens in its own window.");
+                if gui_mode == ViewMode::Plot && ui.button("Reset zoom / fit data").clicked() {
+                    self.plot.reset = true;
+                    self.project_dirty = true;
+                    self.message = "Plot range fitted to the data (Home).".into();
+                }
             });
             ui.separator();
             if let Some(path) = &self.path {
@@ -1318,9 +1326,6 @@ impl TableApp {
                 }
             }
             changed |= ui.checkbox(&mut self.plot.log_y, "log10").changed();
-            if ui.button("Fit plot").clicked() {
-                self.plot.reset = true;
-            }
             ui.separator();
             ui.label("Export format");
             for format in [ExportFormat::Png, ExportFormat::Pdf, ExportFormat::Eps] {

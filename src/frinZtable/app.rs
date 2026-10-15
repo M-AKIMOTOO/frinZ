@@ -971,6 +971,7 @@ impl TableApp {
             ui.horizontal(|ui| {
                 ui.label("Source");
                 egui::ComboBox::from_id_salt("source_filter")
+                    .width(145.0)
                     .selected_text(match &self.filter.sources {
                         None => "All sources".into(),
                         Some(sources) if sources.is_empty() => "No sources".into(),
@@ -1016,25 +1017,12 @@ impl TableApp {
                     .add(
                         egui::TextEdit::singleline(&mut self.filter.text)
                             .hint_text("Search all cells")
-                            .desired_width(180.0),
+                            .desired_width(190.0),
                     )
                     .changed();
-                if ui.button("Reset filters / sort").clicked() {
-                    self.filter = Filter::default();
-                    self.sort = None;
-                    self.min_text.clear();
-                    self.max_text.clear();
-                    changed = true;
-                }
-                ui.label(format!(
-                    "{} / {} rows",
-                    self.view.len(),
-                    self.table.rows.len()
-                ));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Numeric filter");
+                ui.label("Numeric");
                 egui::ComboBox::from_id_salt("numeric_filter")
+                    .width(135.0)
                     .selected_text(
                         self.filter
                             .numeric_column
@@ -1057,23 +1045,30 @@ impl TableApp {
                     });
                 ui.label("Min");
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut self.min_text).desired_width(95.0))
+                    .add(egui::TextEdit::singleline(&mut self.min_text).desired_width(68.0))
                     .changed();
                 ui.label("Max");
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut self.max_text).desired_width(95.0))
+                    .add(egui::TextEdit::singleline(&mut self.max_text).desired_width(68.0))
                     .changed();
                 if (!self.min_text.is_empty() && number(&self.min_text).is_none())
                     || (!self.max_text.is_empty() && number(&self.max_text).is_none())
                 {
-                    ui.colored_label(Color32::WHITE, "Enter finite numeric bounds");
+                    ui.colored_label(Color32::WHITE, "Invalid bound");
                 } else if number(&self.min_text)
                     .zip(number(&self.max_text))
                     .is_some_and(|(a, b)| a > b)
                 {
-                    ui.colored_label(Color32::WHITE, "Min is greater than Max");
+                    ui.colored_label(Color32::WHITE, "Min > Max");
                 }
-                ui.label(RichText::new("Column headers sort · Row menu sorts by object").small());
+                if ui.small_button("Reset").on_hover_text("Reset filters and sort").clicked() {
+                    self.filter = Filter::default();
+                    self.sort = None;
+                    self.min_text.clear();
+                    self.max_text.clear();
+                    changed = true;
+                }
+                ui.label(RichText::new(format!("{} / {} rows", self.view.len(), self.table.rows.len())).small());
             });
             if changed {
                 self.filter.min = number(&self.min_text);

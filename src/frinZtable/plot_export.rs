@@ -1,5 +1,6 @@
 use super::{
     data::{Table, number},
+    fit::FitResult,
     plots::{
         PlotMode, PlotOptions, SeriesStyle, XAxisScale, first_mjd_reference, mjd_date_label,
         secondary_column, time_column_is_seconds, uses_mjd_x, x_label_for_options,
@@ -68,6 +69,7 @@ struct Settings {
     x_axis_scale: XAxisScale,
     hour_label: Option<String>,
     time_axis: bool,
+    hours_axis: bool,
     hour_conversion: String,
     y_label: String,
     title: String,
@@ -81,6 +83,7 @@ struct Settings {
     bins: usize,
     figsize: [f64; 2],
     dpi: u32,
+    fit: Option<FitResult>,
 }
 
 struct Datum {
@@ -101,6 +104,16 @@ struct Layer {
 }
 
 pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions) -> Result<()> {
+    export_with_fit(path, table, rows, options, None)
+}
+
+pub fn export_with_fit(
+    path: &Path,
+    table: &Table,
+    rows: &[usize],
+    options: &PlotOptions,
+    fit: Option<&FitResult>,
+) -> Result<()> {
     let format = ExportFormat::from_path(path)?;
     ensure!(options.y < table.columns.len(), "Select a numeric Y column");
     ensure!(
@@ -225,6 +238,7 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
             )
         }),
         time_axis: make_hour_companion,
+        hours_axis: false,
         hour_conversion: if is_mjd_axis { "mjd" } else { "seconds" }.into(),
         y_label: axis_label(options.y, options.y_source.as_deref()),
         title: column.name.clone(),
@@ -247,6 +261,9 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
         bins: options.bins,
         figsize: [9.0, 6.0],
         dpi: 200,
+        fit: (options.mode == PlotMode::Series)
+            .then(|| fit.cloned())
+            .flatten(),
     };
     let layers = layers(&data, &settings);
     ensure!(
@@ -334,6 +351,7 @@ pub fn export(path: &Path, table: &Table, rows: &[usize], options: &PlotOptions)
 
 fn hour_settings(settings: &Settings) -> Settings {
     let mut settings = settings.clone();
+    settings.hours_axis = true;
     if let Some(label) = settings.hour_label.clone() {
         settings.x_label = label;
     }
@@ -769,6 +787,39 @@ fn render(path: &Path, settings: &Settings, layers: &[Layer]) -> Result<()> {
             }
         }
     }
+    if settings.mode == PlotMode::Series {
+        if let Some(fit) = &settings.fit {
+            let fit_points: Vec<_> = (0..=256)
+                .filter_map(|index| {
+                    let fraction = index as f64 / 256.0;
+                    let original_x = fit.x_min + fraction * (fit.x_max - fit.x_min);
+                    let x = if settings.hours_axis {
+                        if settings.hour_conversion == "seconds" {
+                            original_x / 3600.0
+                        } else {
+                            hours_since_reference(
+                                original_x,
+                                settings.reference_mjd,
+                                settings.hour_reference_mjd.unwrap_or(0.0),
+                            )
+                        }
+                    } else {
+                        original_x
+                    };
+                    let y = transform(fit.value(original_x)?, settings.log_y)?;
+                    Some((x, y))
+                })
+                .collect();
+            if fit_points.len() >= 2 {
+                chart
+                    .draw_series(LineSeries::new(fit_points, WHITE.stroke_width(3)))?
+                    .label(fit.legend_label())
+                    .legend(|(x, y)| {
+                        PathElement::new(vec![(x, y), (x + 20, y)], WHITE.stroke_width(3))
+                    });
+            }
+        }
+    }
     chart
         .configure_series_labels()
         .background_style(BLACK.mix(0.85))
@@ -782,6 +833,40 @@ fn render(path: &Path, settings: &Settings, layers: &[Layer]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_graph_contains_the_fitted_curve_for_the_python_regenerator() {
+        let table = Table::parse(
+            "Source\tMJD\tAmp\nA\t60000\t0\nA\t60001\t2\nA\t60002\t4",
+            false,
+        )
+        .unwrap();
+        let fit = FitResult {
+            model: super::super::fit::FitModel::Linear,
+            source: Some("A".into()),
+            parameters: vec![2.0, 2.0],
+            x_center: 1.0,
+            x_scale: 1.0,
+            x_min: 0.0,
+            x_max: 2.0,
+            count: 3,
+            rmse: 0.0,
+            r_squared: Some(1.0),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fit.png");
+        let options = PlotOptions {
+            y: 2,
+            reference_mjd: Some(60000.0),
+            ..Default::default()
+        };
+        export_with_fit(&path, &table, &[0, 1, 2], &options, Some(&fit)).unwrap();
+        let script = fs::read_to_string(path.with_extension("py")).unwrap();
+        assert!(script.contains("def fitted_value(fit, x):"));
+        assert!(script.contains("\\\"model\\\":\\\"linear\\\""));
+        assert_eq!(image::image_dimensions(path).unwrap(), IMAGE_SIZE);
+    }
+
     #[test]
     fn png_export_writes_only_png_and_script_and_embeds_enabled_rows() {
         let mut table =

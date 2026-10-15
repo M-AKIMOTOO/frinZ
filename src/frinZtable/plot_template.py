@@ -43,6 +43,28 @@ def transform(value, log):
     return math.log10(value) if log else value
 
 
+def fitted_value(fit, x):
+    parameters = fit["parameters"]
+    u = (x - fit["x_center"]) / fit["x_scale"]
+    model = fit["model"]
+    if model in ("linear", "polynomial"):
+        value = 0.0
+        for coefficient in reversed(parameters):
+            value = value * u + coefficient
+        return value
+    if model == "logarithmic":
+        return parameters[0] + parameters[1] * math.log(x) if x > 0 else None
+    if model == "sinusoidal":
+        return parameters[0] + parameters[1] * math.sin(
+            2 * math.pi * u / parameters[2] + parameters[3]
+        )
+    if model == "exponential":
+        return parameters[0] + parameters[1] * math.exp(
+            max(-700, min(700, parameters[2] * u))
+        )
+    return None
+
+
 def output_with_suffix(path, suffix):
     return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
 
@@ -184,6 +206,20 @@ def main():
                 low, high = transform(raw - sem, log), transform(raw + sem, log)
                 if low is not None and high is not None:
                     ax.vlines(source_index, low, high, color=series[0].get_color())
+    fit = settings.get("fit")
+    if mode == "series" and fit is not None:
+        fit_source = fit.get("source")
+        if fit_source is None or args.sources is None or fit_source in args.sources:
+            xs = [fit["x_min"] + (fit["x_max"] - fit["x_min"]) * i / 256
+                  for i in range(257)]
+            fitted = [(x, transform(fitted_value(fit, x), log)) for x in xs]
+            fitted = [(x, y) for x, y in fitted if y is not None]
+            if len(fitted) >= 2:
+                label = f'{fit["model"].replace("_", " ").title()} fit'
+                if fit_source is not None:
+                    label += f" [{fit_source}]"
+                ax.plot([point[0] for point in fitted], [point[1] for point in fitted],
+                        linestyle="--", label=label)
     if mode == "sources":
         ax.set_xticks(range(len(groups)), list(groups))
     ax.set_xlabel(args.xlabel or (parameter_label if mode == "histogram" else "Source (mean ± standard error)" if mode == "sources" else settings["x_label"]))

@@ -385,6 +385,12 @@ impl Default for HelpBrowser {
                 }
             }
         }
+        topics.push(Topic {
+            title: "frinZtable 最小二乗フィット".into(),
+            summary: "プロットする行・天体・横軸範囲を指定し、基本関数をフィット".into(),
+            options: Vec::new(),
+            text: "frinZtable 最小二乗フィット\n\nプロット画面の「Least-squares fit」を開き、関数、天体、フィット範囲を指定して「Fit plotted data」を押します。フィットには現在表示中で「Plot」対象にした行だけを使います。天体を All plotted sources にすると複数天体をまとめてフィットし、天体名を選ぶとその天体だけを使います。\n\n横軸範囲の min / max は現在のプロット横軸と同じ単位です。Hours表示なら時間、MJD表示ならMJD、通常表示なら選択中のX列の単位を使います。片方または両方を空欄にすると、その側はデータ範囲の端まで含めます。\n\n関数\n• Linear: y = a + b(x − 中心)\n• Polynomial: 正規化した横軸 u = (x − 中心) / scale に対する1〜8次多項式\n• Sinusoid: y = offset + amplitude × sin(2π(x − center) / period + phase)\n• Exponential: y = offset + amplitude × exp(rate × (x − center))\n• Logarithmic: y = a + b ln(x)。正のXが必要です。\n\nLinear、Polynomial、Logarithmicは係数を直接求めるため初期値は不要です。Sinusoidではoffset、amplitude、period、phase（ラジアン）、Exponentialではoffset、amplitude、rate（横軸単位の逆数）の初期値を編集できます。三角関数と指数関数は初期値により収束先が変わる場合があるので、結果とグラフを確認してください。\n\n計算後、フィット曲線をプロットに重ね、使用点数、RMSE、R²、係数を表示します。残差は元のY値に対して計算し、Y軸をlog表示にしてもフィット自体は元の値で行います。プロジェクト（.frztable）を保存すると、関数設定、初期値、範囲、係数とフィット結果も保存され、再開後に曲線を復元します。PNG/PDF/EPSを出力するとフィット曲線も入り、同梱Pythonスクリプトからも再生成できます。\n".into(),
+        });
         let all_options = command.get_arguments().map(option_text).collect::<String>();
         let full = format!(
             "frinZmain 全仕様・全オプション\n\n現在のCLI定義\n{}\n\n全オプションの詳細・別名・既定値\n{all_options}\n\n--detail の全文\n{DETAIL}\n\nREADME 全文\n{README}\n\n.mbcor 入力仕様 全文\n{MBCOR}",

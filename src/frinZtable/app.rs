@@ -1,5 +1,6 @@
 use super::{
     data::{ColumnSummary, Filter, Sort, SourceSummary, Table, column_letter, number},
+    fit::{FitConfig, FitModel, FitResult, least_squares},
     help::HelpBrowser,
     plot_export::{self, ExportFormat},
     plots::{self, PlotMode, PlotOptions, SeriesStyle},
@@ -55,6 +56,9 @@ pub struct TableApp {
     view_mode: ViewMode,
     secondary_window_open: bool,
     plot: PlotOptions,
+    fit_config: FitConfig,
+    fit_result: Option<FitResult>,
+    fit_error: Option<String>,
     export_format: ExportFormat,
     undo: Vec<Table>,
     redo: Vec<Table>,
@@ -114,7 +118,7 @@ impl TableApp {
             min_text: String::new(), max_text: String::new(), sort: None, view: Vec::new(), numeric: Vec::new(),
             summaries: Vec::new(), groups: Vec::new(), selected: None, anchor: None,
             edit: String::new(), edit_focus: false, statistics_selected: false, all_statistics: true,
-            group_sort: 0, group_descending: false, view_mode: ViewMode::Spreadsheet, secondary_window_open: false, plot: PlotOptions::default(), export_format: ExportFormat::default(), undo: Vec::new(), redo: Vec::new(),
+            group_sort: 0, group_descending: false, view_mode: ViewMode::Spreadsheet, secondary_window_open: false, plot: PlotOptions::default(), fit_config: FitConfig::default(), fit_result: None, fit_error: None, export_format: ExportFormat::default(), undo: Vec::new(), redo: Vec::new(),
             dirty: false, project_dirty: false, project_path: None,
             message: "Click a cell to inspect it; double-click or F2 to edit. Shift-click selects a range.".into(),
             formula_window: false, formula_name: "AmpToNoise".into(), formula_unit: String::new(),
@@ -150,6 +154,7 @@ impl TableApp {
     }
 
     pub fn restore_project(&mut self, project: Project, project_path: PathBuf) {
+        let restored_fit = project.fit_result;
         self.table = project.table;
         self.path = project.data_path;
         self.filter = project.filter;
@@ -161,6 +166,9 @@ impl TableApp {
         self.group_sort = project.group_sort;
         self.group_descending = project.group_descending;
         self.plot = project.plot;
+        self.fit_config = project.fit;
+        self.fit_result = None;
+        self.fit_error = None;
         self.export_format = project.export_format;
         // Older workbooks may have been saved in the former combined layout.
         // Keep the spreadsheet and plot as distinct windows when reopening them.
@@ -172,6 +180,7 @@ impl TableApp {
         self.dirty = false;
         self.project_dirty = false;
         self.rebuild();
+        self.fit_result = restored_fit;
         let locate = |cell: Option<[usize; 2]>, view: &[usize]| {
             cell.and_then(|[row, column]| {
                 (column < self.table.columns.len())
@@ -255,6 +264,8 @@ impl TableApp {
             group_sort: self.group_sort,
             group_descending: self.group_descending,
             plot: self.plot.clone(),
+            fit: self.fit_config.clone(),
+            fit_result: self.fit_result.clone(),
             export_format: self.export_format,
             view_mode: self.view_mode,
             selected: self.selected.map(|cell| [self.view[cell.row], cell.column]),
@@ -376,7 +387,13 @@ impl TableApp {
             return;
         };
         let path = path.with_extension(extension);
-        match plot_export::export(&path, &self.table, &rows, &self.plot) {
+        match plot_export::export_with_fit(
+            &path,
+            &self.table,
+            &rows,
+            &self.plot,
+            self.fit_result.as_ref(),
+        ) {
             Ok(()) => {
                 self.message = format!(
                     "Saved {} graph output and editable Python script: {}",
@@ -389,6 +406,8 @@ impl TableApp {
     }
 
     fn rebuild(&mut self) {
+        self.fit_result = None;
+        self.fit_error = None;
         self.numeric = self.table.numeric_columns();
         let width = self.table.columns.len();
         let sources = self.table.sources();
@@ -497,6 +516,8 @@ impl TableApp {
         if self.numeric.contains(&cell.column) && self.plot.y != cell.column {
             self.plot.y = cell.column;
             self.plot.reset = true;
+            self.fit_result = None;
+            self.fit_error = None;
         }
         self.refresh_statistics();
         if self.statistics_selected || self.plot.y != previous_plot_column {
@@ -515,6 +536,8 @@ impl TableApp {
         self.numeric = self.table.numeric_columns();
         self.refresh_statistics();
         self.plot.reset = true;
+        self.fit_result = None;
+        self.fit_error = None;
     }
 
     fn apply_edit(&mut self) {
@@ -1480,10 +1503,199 @@ impl TableApp {
             changed |= ui.checkbox(&mut self.plot.preview_9_6, "9:6 preview").changed();
             ui.label(RichText::new("Drag to pan · scroll to zoom · double-click to fit").small());
         });
+        let mut fit_changed = false;
+        let mut run_fit = false;
+        ui.collapsing("Least-squares fit", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Function");
+                egui::ComboBox::from_id_salt("fit_model")
+                    .selected_text(self.fit_config.model.label())
+                    .show_ui(ui, |ui| {
+                        for model in [
+                            FitModel::Linear,
+                            FitModel::Polynomial,
+                            FitModel::Sinusoidal,
+                            FitModel::Exponential,
+                            FitModel::Logarithmic,
+                        ] {
+                            fit_changed |= ui
+                                .selectable_value(
+                                    &mut self.fit_config.model,
+                                    model,
+                                    model.label(),
+                                )
+                                .changed();
+                        }
+                    });
+                if self.fit_config.model == FitModel::Polynomial {
+                    ui.label("Degree");
+                    fit_changed |= ui
+                        .add(egui::Slider::new(&mut self.fit_config.degree, 1..=8))
+                        .changed();
+                }
+                ui.label("Source");
+                egui::ComboBox::from_id_salt("fit_source")
+                    .selected_text(
+                        self.fit_config
+                            .source
+                            .as_deref()
+                            .unwrap_or("All plotted sources"),
+                    )
+                    .show_ui(ui, |ui| {
+                        fit_changed |= ui
+                            .selectable_value(
+                                &mut self.fit_config.source,
+                                None,
+                                "All plotted sources",
+                            )
+                            .changed();
+                        for source in &plot_sources {
+                            fit_changed |= ui
+                                .selectable_value(
+                                    &mut self.fit_config.source,
+                                    Some(source.clone()),
+                                    source,
+                                )
+                                .changed();
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fit X range");
+                ui.label("min");
+                fit_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.fit_config.x_min)
+                            .desired_width(110.0)
+                            .hint_text("automatic"),
+                    )
+                    .changed();
+                ui.label("max");
+                fit_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.fit_config.x_max)
+                            .desired_width(110.0)
+                            .hint_text("automatic"),
+                    )
+                    .changed();
+                ui.label("(plot X units)");
+            });
+            match self.fit_config.model {
+                FitModel::Sinusoidal => {
+                    ui.label(
+                        RichText::new(
+                            "y = offset + amplitude × sin(2π(x − center) / period + phase); phase in radians.",
+                        )
+                        .small(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Initial guesses");
+                        fit_changed |=
+                            fit_value_edit(ui, "offset", &mut self.fit_config.initial_offset);
+                        fit_changed |= fit_value_edit(
+                            ui,
+                            "amplitude",
+                            &mut self.fit_config.initial_amplitude,
+                        );
+                        fit_changed |=
+                            fit_value_edit(ui, "period", &mut self.fit_config.initial_period);
+                        fit_changed |= fit_value_edit(
+                            ui,
+                            "phase [rad]",
+                            &mut self.fit_config.initial_phase,
+                        );
+                    });
+                }
+                FitModel::Exponential => {
+                    ui.label(
+                        RichText::new(
+                            "y = offset + amplitude × exp(rate × (x − center)); rate is per plot-X unit.",
+                        )
+                        .small(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Initial guesses");
+                        fit_changed |=
+                            fit_value_edit(ui, "offset", &mut self.fit_config.initial_offset);
+                        fit_changed |= fit_value_edit(
+                            ui,
+                            "amplitude",
+                            &mut self.fit_config.initial_amplitude,
+                        );
+                        fit_changed |=
+                            fit_value_edit(ui, "rate / X", &mut self.fit_config.initial_rate);
+                    });
+                }
+                FitModel::Linear | FitModel::Polynomial | FitModel::Logarithmic => {
+                    ui.label("Coefficients are solved directly; no coefficient guesses are required.");
+                }
+            }
+            ui.horizontal(|ui| {
+                run_fit = ui
+                    .add_enabled(
+                        self.plot.mode == PlotMode::Series,
+                        egui::Button::new("Fit plotted data"),
+                    )
+                    .clicked();
+                ui.label(
+                    RichText::new(
+                        "Uses visible rows marked for plotting; residuals use original Y values.",
+                    )
+                    .small(),
+                );
+            });
+            if let Some(error) = &self.fit_error {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if let Some(result) = &self.fit_result {
+                ui.label(format!(
+                    "{} · N={} · RMSE={} · R²={}",
+                    result.model.label(),
+                    result.count,
+                    display(result.rmse),
+                    result
+                        .r_squared
+                        .map(display)
+                        .unwrap_or_else(|| "undefined".into())
+                ));
+                ui.label(RichText::new(result.equation_basis()).small());
+                ui.horizontal_wrapped(|ui| {
+                    for (name, value) in result.named_parameters() {
+                        ui.label(format!("{name} = {}", display(value)));
+                    }
+                });
+            }
+        });
+        if fit_changed {
+            self.fit_result = None;
+            self.fit_error = None;
+            self.project_dirty = true;
+        }
         if changed {
             self.plot.reset = true;
             self.refresh_statistics();
             self.project_dirty = true;
+            self.fit_result = None;
+            self.fit_error = None;
+        }
+        if run_fit {
+            match self.fit_points() {
+                Ok(points) => match least_squares(&points, &self.fit_config) {
+                    Ok(result) => {
+                        self.fit_result = Some(result);
+                        self.fit_error = None;
+                        self.project_dirty = true;
+                    }
+                    Err(error) => {
+                        self.fit_result = None;
+                        self.fit_error = Some(error);
+                    }
+                },
+                Err(error) => {
+                    self.fit_result = None;
+                    self.fit_error = Some(error);
+                }
+            }
         }
         let selected = self.selected_rows();
         ui.horizontal_wrapped(|ui| {
@@ -1518,7 +1730,63 @@ impl TableApp {
             }
         });
         let rows = self.table.plotted_rows(&self.view);
-        plots::show(ui, &self.table, &rows, &selected, &mut self.plot)
+        plots::show(
+            ui,
+            &self.table,
+            &rows,
+            &selected,
+            &mut self.plot,
+            self.fit_result.as_ref(),
+        )
+    }
+
+    fn fit_points(&self) -> Result<Vec<(f64, f64)>, String> {
+        let bound = |text: &str, name: &str| -> Result<Option<f64>, String> {
+            if text.trim().is_empty() {
+                return Ok(None);
+            }
+            number(text)
+                .filter(|value| value.is_finite())
+                .map(Some)
+                .ok_or_else(|| format!("Fit X {name} must be a finite number."))
+        };
+        let minimum = bound(&self.fit_config.x_min, "minimum")?;
+        let maximum = bound(&self.fit_config.x_max, "maximum")?;
+        if minimum
+            .zip(maximum)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            return Err("Fit X minimum must not exceed its maximum.".into());
+        }
+        if self.plot.mode != PlotMode::Series {
+            return Err("Least-squares fitting is available for the time/scatter plot.".into());
+        }
+        let points: Vec<_> = self
+            .table
+            .plotted_rows(&self.view)
+            .into_iter()
+            .filter(|&row| {
+                self.fit_config
+                    .source
+                    .as_deref()
+                    .is_none_or(|source| self.table.source(row) == source)
+            })
+            .filter_map(|row| {
+                let x = plots::x_value_for_scale(&self.table, row, &self.plot)?;
+                if minimum.is_some_and(|value| x < value)
+                    || maximum.is_some_and(|value| x > value)
+                {
+                    return None;
+                }
+                let y = number(&self.table.rows[row][self.plot.y])?;
+                Some((x, y))
+            })
+            .collect();
+        if points.is_empty() {
+            Err("No plotted data points fall within this X range.".into())
+        } else {
+            Ok(points)
+        }
     }
 
     fn main_panels(&mut self, ctx: &egui::Context) -> egui::Rect {
@@ -1979,6 +2247,16 @@ fn dark_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+fn fit_value_edit(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
+    ui.label(label);
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width(76.0)
+            .horizontal_align(egui::Align::RIGHT),
+    )
+    .changed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2124,5 +2402,24 @@ mod tests {
         assert_eq!(app.table.plotted_rows(&app.view), vec![1, 0]);
         app.undo(true);
         assert_eq!(app.table.plotted_rows(&app.view), vec![0]);
+    }
+
+    #[test]
+    fn fit_points_respect_enabled_rows_source_and_x_range() {
+        let mut table = Table::parse(
+            "Source\tMJD\tAmp\nA\t60000\t1\nA\t60001\t2\nB\t60001\t10\nA\t60002\t3",
+            false,
+        )
+        .unwrap();
+        table.plot_enabled[1] = false;
+        let mut app = TableApp::from_table(table, None, Vec::new(), None);
+        app.plot.y = 2;
+        app.fit_config.source = Some("A".into());
+        app.fit_config.x_min = "0".into();
+        app.fit_config.x_max = "2".into();
+        assert_eq!(app.fit_points().unwrap(), vec![(0.0, 1.0), (2.0, 3.0)]);
+        app.fit_config.x_min = "1".into();
+        app.fit_config.x_max = "1.9".into();
+        assert!(app.fit_points().is_err());
     }
 }

@@ -1,5 +1,6 @@
 use super::{
     data::{Table, epoch_mjd, number},
+    fit::FitResult,
     stats::histogram,
 };
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -392,6 +393,7 @@ pub fn show(
     rows: &[usize],
     selected: &[usize],
     options: &mut PlotOptions,
+    fit: Option<&FitResult>,
 ) -> egui::Rect {
     if table.columns.is_empty() {
         ui.label("Open a frinZ TSV to plot its parameters.");
@@ -646,6 +648,24 @@ pub fn show(
                                     .radius(4.5),
                             );
                         }
+                    }
+                }
+                if let Some(fit) = fit {
+                    let steps = 256usize;
+                    let curve: Vec<[f64; 2]> = (0..=steps)
+                        .filter_map(|index| {
+                            let fraction = index as f64 / steps as f64;
+                            let x = fit.x_min + fraction * (fit.x_max - fit.x_min);
+                            Some([x, transform(fit.value(x)?)?])
+                        })
+                        .collect();
+                    if curve.len() >= 2 {
+                        plot_ui.line(
+                            Line::new(fit.legend_label(), curve)
+                                .color(Color32::LIGHT_GRAY)
+                                .width(2.0)
+                                .style(LineStyle::dashed_dense()),
+                        );
                     }
                 }
             })

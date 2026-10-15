@@ -1,6 +1,7 @@
 use super::{
     app::ViewMode,
     data::{Filter, Sort, Table},
+    fit::{FitConfig, FitResult},
     plot_export::ExportFormat,
     plots::PlotOptions,
 };
@@ -26,6 +27,10 @@ pub struct Project {
     pub group_sort: usize,
     pub group_descending: bool,
     pub plot: PlotOptions,
+    #[serde(default)]
+    pub fit: FitConfig,
+    #[serde(default)]
+    pub fit_result: Option<FitResult>,
     pub export_format: ExportFormat,
     pub view_mode: ViewMode,
     pub selected: Option<[usize; 2]>,
@@ -56,6 +61,13 @@ impl Project {
         anyhow::ensure!(
             project.table.plot_enabled.len() == project.table.rows.len(),
             "Project plot-selection flags do not match the number of rows"
+        );
+        anyhow::ensure!(
+            project
+                .fit_result
+                .as_ref()
+                .is_none_or(FitResult::is_well_formed),
+            "Project contains invalid least-squares fit results"
         );
         Ok(project)
     }
@@ -107,6 +119,25 @@ mod tests {
                 reference_mjd: Some(61323.0),
                 ..Default::default()
             },
+            fit: FitConfig {
+                model: super::super::fit::FitModel::Polynomial,
+                degree: 3,
+                x_min: "0.5".into(),
+                x_max: "8".into(),
+                ..Default::default()
+            },
+            fit_result: Some(FitResult {
+                model: super::super::fit::FitModel::Polynomial,
+                source: Some("A".into()),
+                parameters: vec![1.0, 2.0, 3.0, 4.0],
+                x_center: 5.0,
+                x_scale: 4.5,
+                x_min: 0.5,
+                x_max: 9.5,
+                count: 4,
+                rmse: 0.01,
+                r_squared: Some(0.999),
+            }),
             export_format: ExportFormat::Pdf,
             view_mode: ViewMode::Plot,
             selected: None,
@@ -122,6 +153,10 @@ mod tests {
         assert_eq!(loaded.filter.text, "target");
         assert_eq!(loaded.sort, project.sort);
         assert_eq!(loaded.plot.reference_mjd, Some(61323.0));
+        assert_eq!(loaded.fit.model, super::super::fit::FitModel::Polynomial);
+        assert_eq!(loaded.fit.degree, 3);
+        assert_eq!(loaded.fit.x_min, "0.5");
+        assert_eq!(loaded.fit_result.as_ref().unwrap().parameters.len(), 4);
         assert_eq!(loaded.export_format, ExportFormat::Pdf);
         assert_eq!(loaded.view_mode, ViewMode::Plot);
     }

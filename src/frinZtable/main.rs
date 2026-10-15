@@ -2,6 +2,7 @@ mod app;
 mod data;
 mod desktop;
 mod formula;
+mod fit;
 mod help;
 mod plot_export;
 mod plots;

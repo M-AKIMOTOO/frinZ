@@ -22,9 +22,9 @@ struct Cell {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
+    #[default]
     Spreadsheet,
     Plot,
-    #[default]
     Combined,
 }
 
@@ -53,6 +53,7 @@ pub struct TableApp {
     group_sort: usize,
     group_descending: bool,
     view_mode: ViewMode,
+    secondary_window_open: bool,
     plot: PlotOptions,
     export_format: ExportFormat,
     undo: Vec<Table>,
@@ -113,7 +114,7 @@ impl TableApp {
             min_text: String::new(), max_text: String::new(), sort: None, view: Vec::new(), numeric: Vec::new(),
             summaries: Vec::new(), groups: Vec::new(), selected: None, anchor: None,
             edit: String::new(), edit_focus: false, statistics_selected: false, all_statistics: true,
-            group_sort: 0, group_descending: false, view_mode: ViewMode::Combined, plot: PlotOptions::default(), export_format: ExportFormat::default(), undo: Vec::new(), redo: Vec::new(),
+            group_sort: 0, group_descending: false, view_mode: ViewMode::Spreadsheet, secondary_window_open: false, plot: PlotOptions::default(), export_format: ExportFormat::default(), undo: Vec::new(), redo: Vec::new(),
             dirty: false, project_dirty: false, project_path: None,
             message: "Click a cell to inspect it; double-click or F2 to edit. Shift-click selects a range.".into(),
             formula_window: false, formula_name: "AmpToNoise".into(), formula_unit: String::new(),
@@ -161,7 +162,10 @@ impl TableApp {
         self.group_descending = project.group_descending;
         self.plot = project.plot;
         self.export_format = project.export_format;
-        self.view_mode = project.view_mode;
+        // Older workbooks may have been saved in the former combined layout.
+        // Keep the spreadsheet and plot as distinct windows when reopening them.
+        self.view_mode = if project.view_mode == ViewMode::Plot { ViewMode::Plot } else { ViewMode::Spreadsheet };
+        self.secondary_window_open = false;
         self.project_path = Some(project_path);
         self.undo.clear();
         self.redo.clear();
@@ -837,7 +841,7 @@ impl TableApp {
         }
     }
 
-    fn toolbar(&mut self, ctx: &egui::Context) {
+    fn toolbar(&mut self, ctx: &egui::Context, gui_mode: ViewMode) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("frinZtable").color(Color32::WHITE));
@@ -876,7 +880,7 @@ impl TableApp {
                 {
                     self.save_project(true);
                 }
-                if self.view_mode != ViewMode::Plot {
+                if gui_mode != ViewMode::Plot {
                     if ui
                         .add_enabled(
                             !self.table.columns.is_empty(),
@@ -924,24 +928,20 @@ impl TableApp {
                 if ui.button("Help / ヘルプ (F1)").clicked() {
                     self.help.open = true;
                 }
+                ui.separator();
+                let other_gui = if gui_mode == ViewMode::Plot {
+                    "Open spreadsheet GUI in separate window"
+                } else {
+                    "Open plot GUI in separate window"
+                };
+                let window_button = if self.secondary_window_open { "Close separate GUI" } else { other_gui };
+                if ui.button(window_button).clicked() {
+                    self.secondary_window_open = !self.secondary_window_open;
+                }
             });
             ui.horizontal(|ui| {
-                let prior_view = self.view_mode;
-                ui.strong("View");
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Spreadsheet,
-                    "Spreadsheet only",
-                );
-                ui.selectable_value(&mut self.view_mode, ViewMode::Plot, "Plot only");
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Combined,
-                    "Spreadsheet + plot",
-                );
-                if self.view_mode != prior_view {
-                    self.project_dirty = true;
-                }
+                ui.strong(if gui_mode == ViewMode::Plot { "Plot GUI" } else { "Spreadsheet GUI" });
+                ui.label("The other workspace opens in its own window.");
             });
             ui.separator();
             if let Some(path) = &self.path {
@@ -1073,7 +1073,7 @@ impl TableApp {
                 self.rebuild();
                 self.project_dirty = true;
             }
-            if self.view_mode != ViewMode::Plot {
+            if gui_mode != ViewMode::Plot {
                 ui.horizontal(|ui| {
                     let label = self
                         .selected
@@ -1107,68 +1107,92 @@ impl TableApp {
         });
     }
 
-    fn sidebar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("statistics").resizable(true).default_width(345.0).min_width(260.0).show(ctx, |ui| {
-            ui.heading("Column statistics");
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                changed |= ui.selectable_value(&mut self.statistics_selected, false, "Visible rows").changed();
-                changed |= ui.selectable_value(&mut self.statistics_selected, true, "Selected rows").changed();
-            });
-            if ui.checkbox(&mut self.all_statistics, "All numeric columns").changed() {
-                self.project_dirty = true;
-            }
-            if changed { self.refresh_statistics(); }
-            let rows = if self.statistics_selected { self.selected_rows().len() } else { self.view.len() };
-            ui.label(format!("Scope: {rows} rows · arithmetic statistics"));
-            ui.label(RichText::new("Stddev: sample (n−1). SEM: stddev / √n.").small());
-            let mut filter_source = None;
-            ScrollArea::vertical().id_salt("statistics_scroll").show(ui, |ui| {
-                let columns = if self.all_statistics { self.numeric.clone() } else { vec![self.plot.y] };
-                for c in columns {
-                    let Some(summary) = self.summaries.get(c) else { continue; };
+    fn statistics_panel(&mut self, ctx: &egui::Context) {
+        if self.table.columns.is_empty() { return; }
+        egui::TopBottomPanel::bottom("column_statistics")
+            .resizable(true).default_height(250.0).min_height(175.0).show(ctx, |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.heading("Column statistics");
                     ui.separator();
-                    ui.strong(format!("{} {}", summary.column, summary.unit));
-                    if let Some(s) = &summary.statistics { statistics_grid(ui, c, s); } else { ui.label("No finite numeric cells in scope."); }
-                    if summary.column == "Phase" { ui.label(RichText::new("Phase uses arithmetic statistics; ±180° wrapping is not corrected.").small().color(Color32::WHITE)); }
-                }
-                ui.separator(); ui.heading("By source");
-                ui.label(RichText::new("Click a source to filter; Ctrl-click adds/removes it.").small());
-                ScrollArea::horizontal().id_salt("source_scroll").show(ui, |ui| {
-                    egui::Grid::new("source_summary").striped(true).show(ui, |ui| {
-                        for (i, label) in ["Source", "N", "Mean", "Median", "Stddev", "Min", "Max"].iter().enumerate() {
-                            if ui.small_button(*label).clicked() {
-                                self.group_descending = if self.group_sort == i { !self.group_descending } else { false };
-                                self.group_sort = i; self.sort_groups(); self.project_dirty = true;
-                            }
+                    changed |= ui.selectable_value(&mut self.statistics_selected, false, "Visible rows").changed();
+                    changed |= ui.selectable_value(&mut self.statistics_selected, true, "Selected rows").changed();
+                    if ui.checkbox(&mut self.all_statistics, "All numeric columns").changed() { self.project_dirty = true; }
+                    ui.separator();
+                    let rows = if self.statistics_selected { self.selected_rows().len() } else { self.view.len() };
+                    ui.label(format!("{rows} rows · sample stddev (n−1) · SEM = stddev / √n"));
+                });
+                if changed { self.refresh_statistics(); }
+
+                let mut filter_source = None;
+                ScrollArea::vertical().id_salt("statistics_content").show(ui, |ui| {
+                let selected_columns = if self.all_statistics { self.numeric.clone() } else { vec![self.plot.y] };
+                let columns: Vec<_> = selected_columns.into_iter().map(|column| {
+                    (column, self.summaries.get(column).and_then(|summary| summary.statistics.clone()))
+                }).collect();
+                ScrollArea::horizontal().id_salt("statistics_matrix_horizontal").show(ui, |ui| {
+                    egui::Grid::new("statistics_matrix").striped(true).min_col_width(112.0).show(ui, |ui| {
+                        ui.strong("Statistic");
+                        for &(column, _) in &columns {
+                            let summary = &self.summaries[column];
+                            ui.strong(if summary.unit.is_empty() { summary.column.clone() } else { format!("{} [{}]", summary.column, summary.unit) });
                         }
                         ui.end_row();
-                        for (i, group) in self.groups.iter().enumerate() {
-                            if ui.selectable_label(false, RichText::new(&group.source).color(plots::color(i))).clicked() { filter_source = Some(group.source.clone()); }
-                            ui.label(group.rows.to_string());
-                            for value in [group.statistics.as_ref().map(|s| s.mean), group.statistics.as_ref().map(|s| s.median), group.statistics.as_ref().and_then(|s| s.sample_stddev), group.statistics.as_ref().map(|s| s.min), group.statistics.as_ref().map(|s| s.max)] {
-                                ui.label(value.map(display).unwrap_or_else(|| "—".into()));
+                        let metrics: [(&str, fn(&Statistics) -> String); 10] = [
+                            ("Numeric N", |s| s.count.to_string()), ("Missing / nonnumeric", |s| s.missing.to_string()),
+                            ("Sum", |s| display(s.sum)), ("Mean", |s| display(s.mean)), ("Median", |s| display(s.median)),
+                            ("Sample stddev", |s| s.sample_stddev.map(display).unwrap_or_else(|| "—".into())),
+                            ("Standard error", |s| s.standard_error.map(display).unwrap_or_else(|| "—".into())),
+                            ("Minimum", |s| display(s.min)), ("Maximum", |s| display(s.max)), ("RMS", |s| display(s.rms)),
+                        ];
+                        for (label, value) in metrics {
+                            ui.label(label);
+                            for (_, statistics) in &columns {
+                                ui.label(RichText::new(statistics.as_ref().map(value).unwrap_or_else(|| "—".into())).monospace());
                             }
                             ui.end_row();
                         }
                     });
                 });
-                ui.separator();
-                for d in &self.table.calculated { ui.label(format!("{} = {}", self.table.columns[d.column].name, d.formula)); }
-                if !self.table.comments.is_empty() {
-                    ui.collapsing("File comments (#)", |ui| { for comment in &self.table.comments { ui.label(comment); } });
+
+                ui.collapsing("By source", |ui| {
+                    ui.label(RichText::new("Click a source to filter; Ctrl-click adds/removes it.").small());
+                    ScrollArea::horizontal().id_salt("source_scroll").show(ui, |ui| {
+                        egui::Grid::new("source_summary").striped(true).show(ui, |ui| {
+                            for (i, label) in ["Source", "N", "Mean", "Median", "Stddev", "Min", "Max"].iter().enumerate() {
+                                if ui.small_button(*label).clicked() {
+                                    self.group_descending = if self.group_sort == i { !self.group_descending } else { false };
+                                    self.group_sort = i; self.sort_groups(); self.project_dirty = true;
+                                }
+                            }
+                            ui.end_row();
+                            for (i, group) in self.groups.iter().enumerate() {
+                                if ui.selectable_label(false, RichText::new(&group.source).color(plots::color(i))).clicked() { filter_source = Some(group.source.clone()); }
+                                ui.label(group.rows.to_string());
+                                for value in [group.statistics.as_ref().map(|s| s.mean), group.statistics.as_ref().map(|s| s.median), group.statistics.as_ref().and_then(|s| s.sample_stddev), group.statistics.as_ref().map(|s| s.min), group.statistics.as_ref().map(|s| s.max)] {
+                                    ui.label(value.map(display).unwrap_or_else(|| "—".into()));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+                if !self.table.calculated.is_empty() || !self.table.comments.is_empty() {
+                    ui.collapsing("Column formulas and file comments", |ui| {
+                        for d in &self.table.calculated { ui.label(format!("{} = {}", self.table.columns[d.column].name, d.formula)); }
+                        for comment in &self.table.comments { ui.label(comment); }
+                    });
+                }
+                });
+                if let Some(source) = filter_source {
+                    if ui.input(|i| i.modifiers.command) {
+                        let all_sources = self.table.sources().into_iter().collect();
+                        let set = self.filter.sources.get_or_insert(all_sources);
+                        if !set.remove(&source) { set.insert(source); }
+                    } else { self.filter.sources = Some(std::iter::once(source).collect()); }
+                    self.filter.source.clear(); self.rebuild(); self.project_dirty = true;
                 }
             });
-            if let Some(source) = filter_source {
-                if ui.input(|i| i.modifiers.command) {
-                    let all_sources = self.table.sources().into_iter().collect();
-                    let set = self.filter.sources.get_or_insert(all_sources);
-                    if !set.remove(&source) { set.insert(source); }
-                } else { self.filter.sources = Some(std::iter::once(source).collect()); }
-                self.filter.source.clear(); self.rebuild();
-                self.project_dirty = true;
-            }
-        });
     }
 
     fn graphs(&mut self, ctx: &egui::Context) -> egui::Rect {
@@ -1499,19 +1523,44 @@ impl TableApp {
 
     fn main_panels(&mut self, ctx: &egui::Context) -> egui::Rect {
         match self.view_mode {
-            ViewMode::Spreadsheet => {
-                self.sidebar(ctx);
+            ViewMode::Spreadsheet | ViewMode::Combined => {
+                self.statistics_panel(ctx);
                 self.sheet(ctx);
                 egui::Rect::NOTHING
             }
             ViewMode::Plot => self.graphs(ctx),
-            ViewMode::Combined => {
-                self.sidebar(ctx);
-                let graph = self.graphs(ctx);
-                self.sheet(ctx);
-                graph
-            }
         }
+    }
+
+    fn auxiliary_window(&mut self, ctx: &egui::Context) {
+        if !self.secondary_window_open { return; }
+        let secondary_mode = if self.view_mode == ViewMode::Plot { ViewMode::Spreadsheet } else { ViewMode::Plot };
+        let (title, size) = if secondary_mode == ViewMode::Plot {
+            ("frinZtable — Plot GUI", [1200.0, 800.0])
+        } else {
+            ("frinZtable — Spreadsheet GUI", [1480.0, 940.0])
+        };
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("frinztable_auxiliary_gui"),
+            egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size([900.0, 600.0]),
+            |viewport_ctx, _class| {
+                dark_theme(viewport_ctx);
+                if viewport_ctx.input(|i| i.viewport().close_requested()) { close_requested = true; }
+                self.toolbar(viewport_ctx, secondary_mode);
+                egui::TopBottomPanel::bottom("status").show(viewport_ctx, |ui| {
+                    ui.label(RichText::new(&self.message).small());
+                });
+                if self.pending.is_none() { self.keyboard(viewport_ctx); }
+                if secondary_mode == ViewMode::Plot {
+                    egui::CentralPanel::default().show(viewport_ctx, |ui| { self.graph_contents(ui); });
+                } else {
+                    self.statistics_panel(viewport_ctx);
+                    self.sheet(viewport_ctx);
+                }
+            },
+        );
+        if close_requested { self.secondary_window_open = false; }
     }
 
     fn sheet(&mut self, ctx: &egui::Context) {
@@ -1882,7 +1931,7 @@ impl eframe::App for TableApp {
         if self.pending.is_none() {
             self.keyboard(ctx);
         }
-        self.toolbar(ctx);
+        self.toolbar(ctx, self.view_mode);
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&self.message).small());
@@ -1890,6 +1939,7 @@ impl eframe::App for TableApp {
         });
         self.main_panels(ctx);
         self.dialogs(ctx);
+        self.auxiliary_window(ctx);
     }
 }
 
@@ -1927,37 +1977,6 @@ fn dark_theme(ctx: &egui::Context) {
     visuals.widgets.open.weak_bg_fill = Color32::from_gray(30);
     visuals.widgets.open.bg_stroke = egui::Stroke::new(1.5, Color32::from_gray(190));
     ctx.set_visuals(visuals);
-}
-
-fn statistics_grid(ui: &mut egui::Ui, id: usize, s: &Statistics) {
-    egui::Grid::new(("column_statistics", id))
-        .num_columns(2)
-        .striped(true)
-        .min_col_width(110.0)
-        .show(ui, |ui| {
-            for (name, value) in [
-                ("Numeric N", s.count.to_string()),
-                ("Missing / nonnumeric", s.missing.to_string()),
-                ("Sum", display(s.sum)),
-                ("Mean", display(s.mean)),
-                ("Median", display(s.median)),
-                (
-                    "Sample stddev",
-                    s.sample_stddev.map(display).unwrap_or_else(|| "—".into()),
-                ),
-                (
-                    "Standard error",
-                    s.standard_error.map(display).unwrap_or_else(|| "—".into()),
-                ),
-                ("Minimum", display(s.min)),
-                ("Maximum", display(s.max)),
-                ("RMS", display(s.rms)),
-            ] {
-                ui.label(name);
-                ui.label(RichText::new(value).monospace());
-                ui.end_row();
-            }
-        });
 }
 
 #[cfg(test)]
@@ -2016,6 +2035,7 @@ mod tests {
     #[test]
     fn selected_statistics_and_all_plot_modes_render_without_a_display() {
         let mut app = app();
+        assert_eq!(app.view_mode, ViewMode::Spreadsheet);
         app.select(Cell { row: 0, column: 1 }, false);
         app.statistics_selected = true;
         app.refresh_statistics();
@@ -2029,6 +2049,7 @@ mod tests {
             ctx.style().visuals.override_text_color,
             Some(Color32::WHITE)
         );
+        app.set_view_mode(ViewMode::Plot);
         for mode in [PlotMode::Series, PlotMode::Histogram, PlotMode::Sources] {
             app.plot.mode = mode;
             let output = ctx.run(
@@ -2040,7 +2061,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    app.toolbar(ctx);
+                    app.toolbar(ctx, app.view_mode);
                     let graph = app.main_panels(ctx);
                     assert!(
                         graph.width() >= 1000.0 && graph.height() >= 250.0,
@@ -2060,7 +2081,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                app.toolbar(ctx);
+                app.toolbar(ctx, app.view_mode);
                 let graph = app.main_panels(ctx);
                 assert!(
                     graph.width() >= 1400.0 && graph.height() >= 700.0,
@@ -2078,7 +2099,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                app.toolbar(ctx);
+                app.toolbar(ctx, app.view_mode);
                 app.main_panels(ctx);
             },
         );

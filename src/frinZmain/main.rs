@@ -15,6 +15,7 @@ use frinZ::earth_rotation_imaging::{
 };
 use frinZ::folding::run_folding_analysis;
 use frinZ::frmap::run_fringe_rate_map_analysis;
+use frinZ::history::{append_history, print_history};
 use frinZ::inband::run_inband_analysis;
 use frinZ::inbeam_vlbi::run_inbeam_vlbi_analysis;
 use frinZ::input_support::{open_input_data, read_input_prefix};
@@ -112,6 +113,7 @@ Other:
   --flagging SPEC ...       flag data by time ranges or sector/pp ranges
   --header                  print parsed .cor header information and exit
   --detail                  print detailed option guide, key:value syntax, examples
+  --history [N]             show commands with YYYYMMDDhhmmss timestamps (0/omitted: all; unknown: all zeroes)
   -h, --help                show this summarized help screen
   -V, --version             print frinZ version number
 "#,
@@ -247,6 +249,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         Ok(args) => args,
         Err(e) => e.exit(),
     };
+
+    if let Some(limit) = args.history {
+        print_history(limit)?;
+        return Ok(());
+    }
+
+    if let Err(error) = append_history(&env_args[1..]) {
+        eprintln!("Warning: could not write frinZ history: {error}");
+    }
+
     args.rayleigh_count = parse_histogram_count(&mut args.rfi)?;
     args.histogram_bins = parse_histogram_bins(&mut args.rfi)?;
 

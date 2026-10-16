@@ -413,6 +413,10 @@ pub struct Args {
     /// Detailed help.
     #[arg(long)]
     pub detail: bool,
+
+    /// Show command history (optionally limit the number of entries).
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "N")]
+    pub history: Option<usize>,
 }
 
 impl Args {
@@ -542,6 +546,7 @@ impl Default for Args {
             uptimeplot: false,
             imaging: None,
             detail: false,
+            history: None,
         }
     }
 }

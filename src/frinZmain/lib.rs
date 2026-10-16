@@ -12,6 +12,7 @@ pub mod fitting;
 pub mod folding;
 pub mod frmap;
 pub mod header;
+pub mod history;
 pub mod inband;
 #[path = "inbeamVLBI.rs"]
 pub mod inbeam_vlbi;

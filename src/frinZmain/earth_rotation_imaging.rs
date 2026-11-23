@@ -4,15 +4,15 @@
 // Earth-rotation synthesis imaging module
 
 use crate::args::Args;
-use crate::bandpass::read_bandpass_file;
-use crate::fft::apply_phase_correction_in_place_at_frequency;
-use crate::header::{parse_header, CorHeader};
+use crate::bandpass::{bandpass_gains, read_bandpass_file};
+use crate::fft::apply_phase_correction_in_place_at_times;
+use crate::header::{available_cor_sectors, parse_header, CorHeader};
 use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::plot::rasterize_rgb_grid;
 use crate::processing::run_analysis_pipeline;
-use crate::read::read_visibility_data;
-use crate::rfi::parse_rfi_ranges;
+use crate::read::{read_sector_metadata, read_visibility_data, sector_epochs};
+use crate::rfi::{flagged_channels, parse_rfi_ranges};
 use crate::search;
 use crate::utils;
 use chrono::{DateTime, Utc};
@@ -66,28 +66,6 @@ fn rebin_complex_rows(
     }
 
     rebinned
-}
-
-fn pad_time_rows_to_power_of_two(
-    data: &mut Vec<C32>,
-    current_rows: usize,
-    row_width: usize,
-) -> usize {
-    if current_rows == 0 || row_width == 0 {
-        return current_rows;
-    }
-    let target_rows = if current_rows <= 1 {
-        1
-    } else {
-        current_rows.next_power_of_two()
-    };
-
-    if target_rows > current_rows {
-        let additional_samples = (target_rows - current_rows) * row_width;
-        data.extend(std::iter::repeat_n(C32::new(0.0, 0.0), additional_samples));
-    }
-
-    target_rows
 }
 
 // Represents a single visibility measurement.
@@ -356,7 +334,7 @@ pub fn perform_imaging_with_config(
     if config.image_size == 0 {
         return Err("Image size must be greater than zero".into());
     }
-    if config.cell_size_arcsec <= 0.0 {
+    if !config.cell_size_arcsec.is_finite() || config.cell_size_arcsec <= 0.0 {
         return Err("Cell size must be positive".into());
     }
 
@@ -364,24 +342,24 @@ pub fn perform_imaging_with_config(
     let gridded = grid_visibilities(visibilities, config)?;
     println!("Gridding complete.");
 
-    let mut dirty_complex = fft_2d_inverse(gridded.vis_grid, config.image_size)?;
-    normalize_complex(&mut dirty_complex, config.image_size);
-    fftshift_inplace(&mut dirty_complex, config.image_size);
-    let dirty_image: Vec<f64> = dirty_complex.iter().map(|c| c.re).collect();
-    drop(dirty_complex);
-    println!("FFT complete. Dirty image created.");
-
     let sampling_complex: Vec<Complex<f64>> = gridded
         .sampling_grid
-        .iter()
-        .map(|&w| Complex::new(w, 0.0))
+        .into_iter()
+        .map(|w| Complex::new(w, 0.0))
         .collect();
-    let mut dirty_beam_complex = fft_2d_inverse(sampling_complex, config.image_size)?;
-    normalize_complex(&mut dirty_beam_complex, config.image_size);
-    fftshift_inplace(&mut dirty_beam_complex, config.image_size);
-    let mut dirty_beam: Vec<f64> = dirty_beam_complex.iter().map(|c| c.re).collect();
-    drop(dirty_beam_complex);
-    normalize_beam_peak(&mut dirty_beam, config.image_size);
+    let size = config.image_size;
+    let center = size / 2;
+    let beam = fft_2d_inverse(sampling_complex, size)?;
+    let normalization = beam[center * size + center].re;
+    if !normalization.is_finite() || normalization <= 0.0 {
+        return Err("No positively weighted visibilities fall inside the UV grid".into());
+    }
+    let dirty_beam: Vec<_> = beam.into_iter().map(|c| c.re / normalization).collect();
+    let dirty_image: Vec<_> = fft_2d_inverse(gridded.vis_grid, size)?
+        .into_iter()
+        .map(|c| c.re / normalization)
+        .collect();
+    println!("FFT complete. Dirty image and beam normalized to the same weights.");
 
     let (clean_image, residual_image, clean_components) = if let Some(clean_cfg) = &config.clean {
         println!("Running lightweight CLEAN (Högbom-style) ...");
@@ -483,65 +461,43 @@ fn grid_visibilities(
 ) -> Result<GriddedData, String> {
     let size = config.image_size;
     let cell_size_rad = config.cell_size_rad();
-    let uv_cell = 1.0 / (size as f64 * cell_size_rad);
+    let uv_scale = size as f64 * cell_size_rad;
+    let nyquist_bin = size as f64 / 2.0;
     let half = (size / 2) as f64;
 
     let mut accum = vec![GridAccum::default(); size * size];
 
     for vis in visibilities {
-        let u_grid = vis.u / uv_cell + half;
-        let v_grid = vis.v / uv_cell + half;
-
-        let u0 = u_grid.floor();
-        let v0 = v_grid.floor();
-        let du = u_grid - u0;
-        let dv = v_grid - v0;
-
-        for (offset_u, weight_u) in [(0isize, 1.0 - du), (1, du)] {
-            for (offset_v, weight_v) in [(0isize, 1.0 - dv), (1, dv)] {
-                let u_idx = u0 as isize + offset_u;
-                let v_idx = v0 as isize + offset_v;
-                if u_idx < 0 || u_idx >= size as isize || v_idx < 0 || v_idx >= size as isize {
-                    continue;
-                }
-                let kernel = weight_u * weight_v;
-                if kernel <= 0.0 {
-                    continue;
-                }
-                let index = (v_idx as usize) * size + (u_idx as usize);
-                let weight = vis.weight * kernel;
-                accum[index].real += vis.real * weight;
-                accum[index].imag += vis.imag * weight;
-                accum[index].weight += weight;
-            }
+        let u = vis.u * uv_scale;
+        // Image rows increase toward decreasing declination.
+        let v = -vis.v * uv_scale;
+        if !(u.abs() <= nyquist_bin && v.abs() <= nyquist_bin)
+            || !vis.weight.is_finite()
+            || vis.weight <= 0.0
+            || !vis.real.is_finite()
+            || !vis.imag.is_finite()
+        {
+            continue;
         }
 
-        // Hermitian symmetry (conjugate point)
-        let u_sym = -vis.u;
-        let v_sym = -vis.v;
-        let u_grid_sym = u_sym / uv_cell + half;
-        let v_grid_sym = v_sym / uv_cell + half;
-        let u0s = u_grid_sym.floor();
-        let v0s = v_grid_sym.floor();
-        let dus = u_grid_sym - u0s;
-        let dvs = v_grid_sym - v0s;
-
-        for (offset_u, weight_u) in [(0isize, 1.0 - dus), (1, dus)] {
-            for (offset_v, weight_v) in [(0isize, 1.0 - dvs), (1, dvs)] {
-                let u_idx = u0s as isize + offset_u;
-                let v_idx = v0s as isize + offset_v;
-                if u_idx < 0 || u_idx >= size as isize || v_idx < 0 || v_idx >= size as isize {
-                    continue;
+        // Include the conjugate point to preserve Hermitian symmetry.
+        for sign in [1.0, -1.0] {
+            let u_grid = sign * u + half;
+            let v_grid = sign * v + half;
+            let u0 = u_grid.floor();
+            let v0 = v_grid.floor();
+            let du = u_grid - u0;
+            let dv = v_grid - v0;
+            for (offset_v, weight_v) in [(0, 1.0 - dv), (1, dv)] {
+                let row = (v0 as isize + offset_v).rem_euclid(size as isize) as usize;
+                for (offset_u, weight_u) in [(0, 1.0 - du), (1, du)] {
+                    let col = (u0 as isize + offset_u).rem_euclid(size as isize) as usize;
+                    let weight = vis.weight * weight_u * weight_v;
+                    let cell = &mut accum[row * size + col];
+                    cell.real += vis.real * weight;
+                    cell.imag += sign * vis.imag * weight;
+                    cell.weight += weight;
                 }
-                let kernel = weight_u * weight_v;
-                if kernel <= 0.0 {
-                    continue;
-                }
-                let index = (v_idx as usize) * size + (u_idx as usize);
-                let weight = vis.weight * kernel;
-                accum[index].real += vis.real * weight;
-                accum[index].imag -= vis.imag * weight;
-                accum[index].weight += weight;
             }
         }
     }
@@ -549,14 +505,7 @@ fn grid_visibilities(
     let mut vis_grid = Vec::with_capacity(size * size);
     let mut sampling_grid = Vec::with_capacity(size * size);
     for cell in accum {
-        if cell.weight > 1e-12 {
-            vis_grid.push(Complex::new(
-                cell.real / cell.weight,
-                cell.imag / cell.weight,
-            ));
-        } else {
-            vis_grid.push(Complex::new(0.0, 0.0));
-        }
+        vis_grid.push(Complex::new(cell.real, cell.imag));
         sampling_grid.push(cell.weight);
     }
 
@@ -575,7 +524,10 @@ fn fft_2d_inverse(mut grid: Vec<Complex<f64>>, size: usize) -> Result<Vec<Comple
     let fft = planner.plan_fft_inverse(size);
     let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
 
+    let half = size / 2;
+    grid.rotate_left(half * size);
     for row in grid.chunks_mut(size) {
+        row.rotate_left(half);
         fft.process_with_scratch(row, &mut scratch);
     }
     transpose_square_inplace(&mut grid, size);
@@ -583,6 +535,10 @@ fn fft_2d_inverse(mut grid: Vec<Complex<f64>>, size: usize) -> Result<Vec<Comple
         fft.process_with_scratch(row, &mut scratch);
     }
     transpose_square_inplace(&mut grid, size);
+    for row in grid.chunks_mut(size) {
+        row.rotate_right(half);
+    }
+    grid.rotate_right(half * size);
     Ok(grid)
 }
 
@@ -596,38 +552,6 @@ fn transpose_square_inplace(data: &mut [Complex<f64>], size: usize) {
                     data.swap(r * size + c, c * size + r);
                 }
             }
-        }
-    }
-}
-
-fn normalize_complex(data: &mut [Complex<f64>], size: usize) {
-    let norm = (size * size) as f64;
-    for value in data.iter_mut() {
-        *value /= norm;
-    }
-}
-
-fn fftshift_inplace(data: &mut [Complex<f64>], size: usize) {
-    if size == 0 {
-        return;
-    }
-    let half = size / 2;
-    for row in data.chunks_exact_mut(size) {
-        row.rotate_right(half);
-    }
-    data.rotate_right(half * size);
-}
-
-fn normalize_beam_peak(beam: &mut [f64], size: usize) {
-    let center = (size / 2) * size + size / 2;
-    let peak = beam
-        .get(center)
-        .copied()
-        .filter(|p| p.abs() > 0.0)
-        .unwrap_or_else(|| beam.iter().fold(0.0, |acc, &v| acc.max(v.abs())));
-    if peak.abs() > 0.0 {
-        for value in beam.iter_mut() {
-            *value /= peak;
         }
     }
 }
@@ -822,7 +746,7 @@ pub fn run_earth_rotation_imaging(
         .and_then(|s| s.to_str())
         .unwrap_or("imaging");
 
-    let center = result.image_size as f64 / 2.0;
+    let center = (result.image_size / 2) as f64;
     let ra_axis: Vec<f64> = (0..result.image_size)
         .map(|index| (index as f64 - center) * result.cell_size_arcsec)
         .collect();
@@ -965,451 +889,341 @@ fn collect_visibilities_from_cor(
 ) -> Result<(Vec<Visibility>, CorHeader, f64), Box<dyn Error>> {
     let input_data = open_input_data(input_path)?;
     let mut cursor = Cursor::new(input_data.as_slice());
-
     let header = parse_header(&mut cursor)?;
-
-    let original_fft_point = header.fft_point;
-    let mut effective_fft_point = original_fft_point;
-
-    if let Some(requested_fft) = args.fft_rebin {
-        if requested_fft <= 0 {
-            return Err("Error: --fft-rebin には正の値を指定してください。".into());
-        }
-        if requested_fft % 2 != 0 {
-            return Err("Error: --fft-rebin は偶数である必要があります。".into());
-        }
-        if requested_fft > original_fft_point {
-            return Err(format!(
-                "Error: --fft-rebin ({}) はヘッダーの FFT 点数 ({}) を超えています。",
-                requested_fft, original_fft_point
-            )
-            .into());
-        }
-        let original_half = (original_fft_point / 2) as usize;
-        let requested_half = (requested_fft / 2) as usize;
-        if requested_half == 0 || !original_half.is_multiple_of(requested_half) {
-            return Err(format!(
-                "Error: --fft-rebin ({}) は元のチャンネル数 ({}) を整数分割できません。",
-                requested_fft, original_fft_point
-            )
-            .into());
-        }
-        effective_fft_point = requested_fft;
-        println!(
-            "#IMAGING FFT rebinning: {} → {} channels per polarization",
-            original_half, requested_half
-        );
+    let available = available_cor_sectors(&header, input_data.as_slice().len())?;
+    let skip = args.skip;
+    if skip >= available {
+        return Err("No complete imaging sectors remain after --skip".into());
     }
 
-    let bandwidth_mhz = header.sampling_speed as f32 / 2.0 / 1_000_000.0;
-    let rbw_mhz = bandwidth_mhz / effective_fft_point as f32 * 2.0;
-    let rfi_ranges = parse_rfi_ranges(&args.rfi, rbw_mhz)?;
-    let mut bandpass_data = if let Some(bp_path) = &args.bandpass {
-        Some(read_bandpass_file(bp_path)?)
-    } else {
-        None
-    };
-    if effective_fft_point != original_fft_point {
-        let original_half = (original_fft_point / 2) as usize;
-        let target_half = (effective_fft_point / 2) as usize;
-        if let Some(bp) = bandpass_data.as_mut() {
-            if bp.len() == original_half {
-                let rebinned = rebin_complex_rows(bp, 1, original_half, target_half);
-                *bp = rebinned;
-            } else if bp.len() != target_half {
-                eprintln!(
-                    "#WARN: バンドパスデータのチャンネル数 ({}) が FFT リビン後のチャンネル数 ({}) と一致しません。補正をスキップします。",
-                    bp.len(),
-                    target_half
-                );
-                *bp = Vec::new();
-            }
+    let (file_epoch, cadence) = read_sector_metadata(&mut cursor, &header, 0)?;
+    let cadence_seconds = f64::from(cadence);
+    let integration_ns = (1.0e9 * cadence_seconds).round() as i64;
+    let native_fft = header.fft_point;
+    let effective_fft = args.fft_rebin.unwrap_or(native_fft);
+    if effective_fft < 2 || effective_fft % 2 != 0 || native_fft % effective_fft != 0 {
+        return Err("--fft-rebin must evenly divide the original FFT with an even size".into());
+    }
+    let channels = (native_fft / 2) as usize;
+    let group = (native_fft / effective_fft) as usize;
+    let channel_hz = f64::from(header.sampling_speed) / f64::from(native_fft);
+    let rfi_ranges = parse_rfi_ranges(&args.rfi, (channel_hz * 1.0e-6) as f32)?;
+    let mut flagged = flagged_channels(channels, &rfi_ranges);
+    if let Some(mask) = args.rfi_npz_mask.as_deref() {
+        for (flag, imported) in flagged.iter_mut().zip(mask.frequency_channel_mask(
+            channels,
+            header.sampling_speed,
+            native_fft,
+        )) {
+            *flag |= imported;
         }
     }
 
-    cursor.set_position(0);
-    let (_, obs_time, effective_integ_time) =
-        read_visibility_data(&mut cursor, &header, 1, 0, 0, false, pp_flag_ranges)?;
-    cursor.set_position(256);
-
-    let pp = header.number_of_sector;
-    let mut length = if args.length == 0 { pp } else { args.length };
-    if args.length != 0 && args.length > pp {
-        length = pp;
-    }
-
-    if length <= 0 {
-        return Err("Invalid integration length derived from arguments.".into());
-    }
-
-    let skip = args.skip.max(0);
-    if skip >= pp {
-        return Err(format!(
-            "Skip value {} exceeds the available sectors ({}) in the input data.",
-            skip, pp
-        )
-        .into());
-    }
-
-    let mut loop_count = if (pp - skip) / length <= 0 {
+    let bandpass = args
+        .bandpass
+        .as_deref()
+        .map(read_bandpass_file)
+        .transpose()?;
+    let gains = bandpass
+        .as_deref()
+        .map(bandpass_gains)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let gain_group = if gains.len() == channels / group {
+        group
+    } else if gains.is_empty() || gains.len() == channels {
         1
-    } else if (pp - skip) / length <= args.loop_ {
-        (pp - skip) / length
     } else {
-        args.loop_
+        return Err("Bandpass channel count does not match the native or rebinned FFT".into());
     };
-
-    if args.cumulate != 0 {
-        let available = pp.saturating_sub(skip);
-        if args.cumulate > available {
-            return Err(format!(
-                "The specified cumulation length, {} s, is more than the observation time, {} s.",
-                args.cumulate, available
-            )
-            .into());
-        }
-        length = args.cumulate;
-        loop_count = available.saturating_add(args.cumulate - 1) / args.cumulate;
+    let spectral_bins: Vec<_> = (0..channels)
+        .step_by(group)
+        .filter_map(|start| {
+            let active: Vec<_> = (start..start + group)
+                .filter(|&channel| !flagged[channel])
+                .collect();
+            if active.is_empty() {
+                return None;
+            }
+            let mean_channel = active.iter().sum::<usize>() as f64 / active.len() as f64;
+            let frequency = header.observing_frequency + channel_hz * mean_channel;
+            (frequency.is_finite() && frequency > 0.0)
+                .then_some((active, frequency / SPEED_OF_LIGHT))
+        })
+        .collect();
+    if spectral_bins.is_empty() {
+        return Err("No usable imaging channels remain after applying the frequency flags".into());
     }
 
-    let mut visibilities = Vec::with_capacity(loop_count as usize);
-    let mut skipped_low_snr = 0usize;
-    let wavelength = SPEED_OF_LIGHT / header.observing_frequency;
-    let search_mode = args.primary_search_mode();
-    let mut prev_deep_solution: Option<(f32, f32)> = None;
-
-    for l1 in 0..loop_count {
-        let mut current_length = if args.cumulate != 0 {
-            ((l1 + 1) * length).min(pp.saturating_sub(skip))
+    let remaining = available - skip;
+    if args.cumulate > remaining {
+        return Err("--cumulate exceeds the number of available imaging sectors".into());
+    }
+    let (segment_length, end_sector) = if args.cumulate > 0 {
+        (args.cumulate, available)
+    } else if args.length > 0 {
+        (
+            args.length,
+            skip + remaining.min(args.length.saturating_mul(args.loop_)),
+        )
+    } else {
+        let default_length = (30.0 / cadence).round().max(1.0) as i32;
+        let end = if args.loop_ == 1 {
+            available
         } else {
-            length
+            skip + remaining.min(default_length.saturating_mul(args.loop_))
         };
+        (default_length, end)
+    };
+    let projection = utils::UvwProjection::new(
+        header.station1_position,
+        header.station2_position,
+        header.source_position_ra,
+        header.source_position_dec,
+        true,
+    );
+    let manual_phase = args.delay_correct != 0.0
+        || args.rate_correct != 0.0
+        || args.acel_correct != 0.0
+        || args.jerk_correct != 0.0
+        || args.snap_correct != 0.0;
+    let search_mode = args.primary_search_mode();
+    let needs_fit = search_mode.is_some() || imaging_opts.vis_snr_min.is_some();
+    let mut fit_args = args.clone();
+    fit_args.plot = false;
+    fit_args.spectrum = false;
+    fit_args.delay_correct = 0.0;
+    fit_args.rate_correct = 0.0;
+    fit_args.acel_correct = 0.0;
+    fit_args.jerk_correct = 0.0;
+    fit_args.snap_correct = 0.0;
+    fit_args.channel_origin_bins = (group - 1) as f64 / (2 * group) as f64;
 
-        let (mut complex_vec, current_obs_time, segment_integ_time) = match read_visibility_data(
-            &mut cursor,
-            &header,
-            current_length,
-            args.skip,
-            l1,
-            args.cumulate != 0,
-            pp_flag_ranges,
-        ) {
-            Ok(data) => data,
-            Err(_) => break,
-        };
-
-        if is_time_flagged(current_obs_time, time_flag_ranges) {
-            println!(
-                "#INFO: Skipping data at {} due to --flagging time range.",
-                current_obs_time.format("%Y-%m-%d %H:%M:%S")
-            );
+    let mut visibilities = Vec::new();
+    let mut skipped_low_snr = 0usize;
+    let mut spectrum = vec![Complex::new(0.0, 0.0); channels];
+    for first in (skip..end_sector).step_by(segment_length as usize) {
+        let end = first.saturating_add(segment_length).min(end_sector);
+        let epochs = sector_epochs(input_data.as_slice(), &header, first as usize, end as usize)?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let use_row: Vec<_> = epochs
+            .iter()
+            .enumerate()
+            .map(|(i, &epoch)| {
+                let pp = first as u32 + i as u32;
+                !pp_flag_ranges
+                    .iter()
+                    .any(|&(start, end)| (start..=end).contains(&pp))
+                    && !is_time_flagged(epoch, time_flag_ranges)
+            })
+            .collect();
+        if !use_row.iter().any(|&valid| valid) {
             continue;
         }
 
-        if complex_vec.is_empty() {
-            continue;
-        }
-
-        let original_fft_half = (original_fft_point / 2) as usize;
-        if original_fft_half == 0 {
-            eprintln!("#ERROR: FFT point が不正です (0)。");
-            continue;
-        }
-        if complex_vec.len() % original_fft_half != 0 {
-            eprintln!(
-                "#ERROR: 読み込んだデータ長 ({}) が元の FFT チャンネル数 ({}) の整数倍ではありません。",
-                complex_vec.len(),
-                original_fft_half
-            );
-            continue;
-        }
-
-        let mut actual_length = complex_vec.len() / original_fft_half;
-        let physical_length = actual_length as i32;
-        if effective_fft_point != original_fft_point {
-            let target_half = (effective_fft_point / 2) as usize;
-            complex_vec =
-                rebin_complex_rows(&complex_vec, actual_length, original_fft_half, target_half);
-            if target_half == 0 || complex_vec.len() % target_half != 0 {
-                eprintln!(
-                    "#ERROR: FFT リビン後のデータ長 ({}) が期待値 ({}×{}) と一致しません。",
-                    complex_vec.len(),
-                    actual_length,
-                    target_half
-                );
-                continue;
+        let rows = end - first;
+        let (mut samples, segment_start, _) =
+            read_visibility_data(&mut cursor, &header, rows, first, 0, false, pp_flag_ranges)?;
+        for (row, &valid) in samples.chunks_exact_mut(channels).zip(&use_row) {
+            if !valid {
+                row.fill(C32::default());
+            } else if needs_fit || !gains.is_empty() {
+                for (channel, value) in row.iter_mut().enumerate() {
+                    if flagged[channel] {
+                        *value = C32::default();
+                    } else if let Some(&gain) = gains.get(channel / gain_group) {
+                        *value *= C32::new(gain.re as f32, gain.im as f32);
+                    }
+                }
             }
-            actual_length = complex_vec.len() / target_half;
         }
-
-        if actual_length == 0 {
-            continue;
+        if manual_phase {
+            let times: Vec<_> = epochs
+                .iter()
+                .map(|&epoch| utils::seconds_between(epoch, file_epoch))
+                .collect();
+            apply_phase_correction_in_place_at_times(
+                &mut samples,
+                channels,
+                args.rate_correct,
+                args.delay_correct,
+                args.acel_correct,
+                args.jerk_correct,
+                args.snap_correct,
+                header.sampling_speed as u32,
+                native_fft as u32,
+                &times,
+                header.observing_frequency,
+                0.0,
+            );
         }
-
-        let fft_point_half_used = (effective_fft_point / 2) as usize;
-        actual_length =
-            pad_time_rows_to_power_of_two(&mut complex_vec, actual_length, fft_point_half_used);
-
-        if current_length != actual_length as i32 {
-            current_length = actual_length as i32;
-        }
-
-        let correction = determine_segment_correction(
-            &complex_vec,
-            &header,
-            args,
-            current_length,
-            physical_length,
-            segment_integ_time,
-            &current_obs_time,
-            &obs_time,
-            &rfi_ranges,
-            &bandpass_data,
-            search_mode,
-            &mut prev_deep_solution,
-        )?;
-
-        if let Some(min_snr) = imaging_opts.vis_snr_min {
-            if correction.snr < min_snr {
+        if needs_fit {
+            let times: Vec<_> = epochs
+                .iter()
+                .map(|&epoch| utils::seconds_between(epoch, segment_start))
+                .collect();
+            let rebinned;
+            let fit_data = if group == 1 {
+                samples.as_slice()
+            } else {
+                rebinned = rebin_complex_rows(&samples, rows as usize, channels, channels / group);
+                rebinned.as_slice()
+            };
+            let (delay, rate, snr) = fit_imaging_segment(
+                fit_data,
+                &header,
+                &fit_args,
+                search_mode,
+                rows,
+                cadence,
+                segment_start,
+                file_epoch,
+                &times,
+                effective_fft,
+            )?;
+            if imaging_opts
+                .vis_snr_min
+                .is_some_and(|minimum| !snr.is_finite() || snr < minimum)
+            {
                 skipped_low_snr += 1;
                 continue;
             }
+            if delay != 0.0 || rate != 0.0 {
+                apply_phase_correction_in_place_at_times(
+                    &mut samples,
+                    channels,
+                    rate,
+                    delay,
+                    0.0,
+                    0.0,
+                    0.0,
+                    header.sampling_speed as u32,
+                    native_fft as u32,
+                    &times,
+                    header.observing_frequency,
+                    0.0,
+                );
+            }
         }
 
-        let start_time_offset_sec = 0.0;
-
-        let mut corrected = complex_vec.clone();
-        apply_phase_correction_in_place_at_frequency(
-            &mut corrected,
-            fft_point_half_used,
-            correction.rate,
-            correction.delay,
-            correction.acel,
-            args.jerk_correct,
-            args.snap_correct,
-            segment_integ_time,
-            header.sampling_speed as u32,
-            effective_fft_point as u32,
-            start_time_offset_sec,
-            header.observing_frequency,
-        );
-
-        let averaged = average_complex_slice(&corrected);
-        let amplitude = averaged.norm();
-        if amplitude < 1e-10 {
-            continue;
+        // Each average uses only adjacent unflagged exposures. A gap
+        // changes the UV coordinate without contributing sample weight.
+        let mut start = 0;
+        while start < epochs.len() {
+            if !use_row[start] {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < epochs.len()
+                && use_row[end]
+                && (utils::seconds_between(epochs[end], epochs[end - 1]) - cadence_seconds).abs()
+                    <= cadence_seconds * 1.0e-3
+            {
+                end += 1;
+            }
+            spectrum.fill(Complex::new(0.0, 0.0));
+            for row in samples[start * channels..end * channels].chunks_exact(channels) {
+                for (sum, value) in spectrum.iter_mut().zip(row) {
+                    *sum += Complex::new(f64::from(value.re), f64::from(value.im));
+                }
+            }
+            let epoch = epochs[start]
+                + (epochs[end - 1] - epochs[start]) / 2
+                + chrono::Duration::nanoseconds(integration_ns / 2);
+            let (u, v, w, _, _) = projection.project(utils::greenwich_sidereal_angle(epoch));
+            let time = utils::seconds_between(epoch, file_epoch);
+            for (active, inv_wavelength) in &spectral_bins {
+                let sum: Complex<f64> = active.iter().map(|&channel| spectrum[channel]).sum();
+                let sample_count = (end - start) as f64 * active.len() as f64;
+                let average = sum / sample_count;
+                visibilities.push(Visibility {
+                    u: u * inv_wavelength,
+                    v: v * inv_wavelength,
+                    w: w * inv_wavelength,
+                    real: average.re,
+                    // .cor phase increases with positive geometric delay.
+                    imag: -average.im,
+                    weight: cadence_seconds * sample_count,
+                    time,
+                });
+            }
+            start = end;
         }
-
-        println!(
-            "#IMAGING segment {:03}: {} delay={:.3} samp rate={:.6} Hz SNR={:.2}",
-            l1,
-            current_obs_time.format("%Y-%m-%d %H:%M:%S"),
-            correction.residual_delay,
-            correction.residual_rate,
-            correction.snr
-        );
-
-        let (u_m, v_m, w_m, _, _) = utils::uvw_cal(
-            header.station1_position,
-            header.station2_position,
-            current_obs_time,
-            header.source_position_ra,
-            header.source_position_dec,
-            true,
-        );
-
-        let time_seconds = current_obs_time.timestamp() as f64
-            + f64::from(current_obs_time.timestamp_subsec_nanos()) * 1e-9;
-
-        visibilities.push(Visibility {
-            u: u_m / wavelength,
-            v: v_m / wavelength,
-            w: w_m / wavelength,
-            real: averaged.re,
-            imag: averaged.im,
-            weight: correction.snr.max(1.0),
-            time: time_seconds,
-        });
     }
-
     if skipped_low_snr > 0 {
-        println!(
-            "Visibility SNR filter removed {} segment(s) below threshold.",
-            skipped_low_snr
-        );
+        println!("Visibility SNR filter removed {skipped_low_snr} segment(s) below threshold.");
     }
-
-    Ok((visibilities, header, effective_integ_time as f64))
+    Ok((visibilities, header, cadence_seconds))
 }
 
-struct SegmentCorrection {
-    delay: f32,
-    rate: f32,
-    acel: f32,
-    weight: f64,
-    snr: f64,
-    residual_delay: f32,
-    residual_rate: f32,
-}
-
-fn determine_segment_correction(
-    complex_vec: &[C32],
+fn fit_imaging_segment(
+    data: &[C32],
     header: &CorHeader,
     args: &Args,
-    current_length: i32,
-    physical_length: i32,
-    segment_integ_time: f32,
-    current_obs_time: &DateTime<Utc>,
-    obs_time: &DateTime<Utc>,
-    rfi_ranges: &[(usize, usize)],
-    bandpass_data: &Option<Vec<C32>>,
-    search_mode: Option<&str>,
-    prev_deep_solution: &mut Option<(f32, f32)>,
-) -> Result<SegmentCorrection, Box<dyn Error>> {
-    if current_length <= 0 {
-        return Err("セグメント長が無効です (0 以下)".into());
-    }
-    let fft_point_half = complex_vec.len() / current_length as usize;
-    if fft_point_half == 0 {
-        return Err("FFT チャンネル数が 0 です (earth-rotation imaging)".into());
-    }
-    let effective_fft_point = (fft_point_half * 2) as i32;
-
-    match search_mode {
-        Some("deep") | Some("deep2") => {
-            let run_deep = if search_mode == Some("deep2") {
-                search::run_peak_search
-            } else {
-                search::run_deep_search
-            };
-            let deep = run_deep(
-                complex_vec,
-                header,
-                current_length,
-                physical_length,
-                segment_integ_time,
-                current_obs_time,
-                obs_time,
-                rfi_ranges,
-                bandpass_data,
-                args,
-                header.number_of_sector,
-                args.cpu,
-                *prev_deep_solution,
-            )?;
-            *prev_deep_solution = Some((
-                deep.analysis_results.residual_delay,
-                deep.analysis_results.residual_rate,
-            ));
-            Ok(SegmentCorrection {
-                delay: deep.analysis_results.residual_delay,
-                rate: deep.analysis_results.residual_rate,
-                acel: args.acel_correct,
-                weight: deep.analysis_results.delay_snr as f64,
-                snr: deep.analysis_results.delay_snr as f64,
-                residual_delay: deep.analysis_results.residual_delay,
-                residual_rate: deep.analysis_results.residual_rate,
-            })
-        }
-        Some("peak") => {
-            let iterations = args.iter.max(1) as usize;
-            let mut total_delay = args.delay_correct;
-            let mut total_rate = args.rate_correct;
-
-            for _ in 0..iterations {
-                let (results, _, _, _) = run_analysis_pipeline(
-                    complex_vec,
-                    header,
-                    args,
-                    Some("peak"),
-                    total_delay,
-                    total_rate,
-                    args.acel_correct,
-                    current_length,
-                    physical_length,
-                    segment_integ_time,
-                    current_obs_time,
-                    obs_time,
-                    rfi_ranges,
-                    bandpass_data,
-                    false,
-                    effective_fft_point,
-                )?;
-                total_delay += results.delay_offset;
-                total_rate += results.rate_offset;
-            }
-
-            let (final_results, _, _, _) = run_analysis_pipeline(
-                complex_vec,
-                header,
-                args,
-                Some("peak"),
-                total_delay,
-                total_rate,
-                args.acel_correct,
-                current_length,
-                physical_length,
-                segment_integ_time,
-                current_obs_time,
-                obs_time,
-                rfi_ranges,
-                bandpass_data,
-                false,
-                effective_fft_point,
-            )?;
-
-            Ok(SegmentCorrection {
-                delay: total_delay,
-                rate: total_rate,
-                acel: args.acel_correct,
-                weight: final_results.delay_snr as f64,
-                snr: final_results.delay_snr as f64,
-                residual_delay: final_results.residual_delay,
-                residual_rate: final_results.residual_rate,
-            })
-        }
-        _ => {
-            let (results, _, _, _) = run_analysis_pipeline(
-                complex_vec,
+    mode: Option<&str>,
+    rows: i32,
+    cadence: f32,
+    start: DateTime<Utc>,
+    file_epoch: DateTime<Utc>,
+    times: &[f64],
+    effective_fft: i32,
+) -> Result<(f64, f64, f64), Box<dyn Error>> {
+    let fitter = match mode {
+        Some("deep") => search::run_deep_search_with_phase_times,
+        Some("coherent") => search::run_coherent_search_with_phase_times,
+        Some(_) => search::run_peak_search_with_phase_times,
+        None => {
+            let (result, _, _, _) = run_analysis_pipeline(
+                data,
                 header,
                 args,
                 None,
-                args.delay_correct,
-                args.rate_correct,
-                args.acel_correct,
-                current_length,
-                physical_length,
-                segment_integ_time,
-                current_obs_time,
-                obs_time,
-                rfi_ranges,
-                bandpass_data,
+                0.0,
+                0.0,
+                0.0,
+                rows,
+                rows,
+                cadence,
+                &start,
+                &file_epoch,
+                &[],
+                &None,
                 false,
-                effective_fft_point,
+                effective_fft,
             )?;
-            Ok(SegmentCorrection {
-                delay: args.delay_correct,
-                rate: args.rate_correct,
-                acel: args.acel_correct,
-                weight: results.delay_snr as f64,
-                snr: results.delay_snr as f64,
-                residual_delay: results.residual_delay,
-                residual_rate: results.residual_rate,
-            })
+            return Ok((0.0, 0.0, f64::from(result.delay_snr)));
         }
-    }
-}
-
-fn average_complex_slice(data: &[C32]) -> Complex<f64> {
-    let mut sum = Complex::new(0.0, 0.0);
-    for value in data {
-        sum += Complex::new(value.re as f64, value.im as f64);
-    }
-    if data.is_empty() {
-        Complex::new(0.0, 0.0)
-    } else {
-        sum / data.len() as f64
-    }
+    };
+    let result = fitter(
+        data,
+        header,
+        rows,
+        rows,
+        cadence,
+        &start,
+        &file_epoch,
+        &[],
+        &None,
+        args,
+        header.number_of_sector,
+        args.cpu,
+        None,
+        times,
+    )?
+    .analysis_results;
+    let (delay, rate) = match result.group_delay {
+        Some(Ok(fit)) => (fit.delay_samples, fit.rate_hz),
+        Some(Err(reason)) => {
+            return Err(format!("Imaging fringe fit failed at {start}: {reason}").into())
+        }
+        None => (
+            f64::from(result.residual_delay),
+            f64::from(result.residual_rate),
+        ),
+    };
+    Ok((delay, rate, f64::from(result.delay_snr)))
 }
 
 #[derive(Serialize)]
@@ -1427,7 +1241,7 @@ struct CleanComponentRecord {
 fn is_time_flagged(time: DateTime<Utc>, ranges: &[(DateTime<Utc>, DateTime<Utc>)]) -> bool {
     ranges
         .iter()
-        .any(|(start, end)| time >= *start && time <= *end)
+        .any(|&(start, end)| (start..end).contains(&time))
 }
 
 fn prepare_imaging_output_dir(input_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -1449,7 +1263,7 @@ fn save_clean_components(
         return Ok(());
     }
 
-    let center = (size as f64) / 2.0;
+    let center = (size / 2) as f64;
     let cell_arcsec = cell_size_arcsec;
 
     let records: Vec<CleanComponentRecord> = components
@@ -1776,4 +1590,44 @@ fn jet_colormap(t: f64) -> RGBColor {
     let g = (1.5 - (four_t - 2.0).abs()).clamp(0.0, 1.0);
     let b = (1.5 - (four_t - 3.5)).clamp(0.0, 1.0);
     RGBColor((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_center_source_matches_the_weighted_psf() {
+        let amplitude = 0.04;
+        let visibilities = [
+            Visibility {
+                u: 96_000.0,
+                v: -52_000.0,
+                w: 0.0,
+                real: amplitude,
+                imag: 0.0,
+                weight: 1.0,
+                time: 0.0,
+            },
+            Visibility {
+                u: -71_000.0,
+                v: 95_000.0,
+                w: 0.0,
+                real: amplitude,
+                imag: 0.0,
+                weight: 5.0,
+                time: 1.0,
+            },
+        ];
+        for size in [31, 32] {
+            let result =
+                perform_imaging_with_config(&visibilities, &ImagingConfig::new(size, 0.5)).unwrap();
+            let center = (size / 2) * size + size / 2;
+            assert!((result.dirty_image[center] - amplitude).abs() < 1.0e-12);
+            assert!((result.dirty_beam[center] - 1.0).abs() < 1.0e-12);
+            for (dirty, beam) in result.dirty_image.iter().zip(&result.dirty_beam) {
+                assert!((dirty - amplitude * beam).abs() < 1.0e-12);
+            }
+        }
+    }
 }

@@ -109,7 +109,10 @@ fn refine_peak_3x3_quadratic(
     let refined_delay = refined_delay as f32;
     let refined_rate = refined_rate as f32;
 
-    if !in_window(refined_delay, delay_bounds) || !in_window(refined_rate, rate_bounds) {
+    if !in_window(refined_delay, delay_bounds)
+        || !in_window(refined_rate, rate_bounds)
+        || in_delay_rate_mask(refined_delay, refined_rate, mask)
+    {
         return None;
     }
 
@@ -136,11 +139,14 @@ pub struct AnalysisResults {
     /// Exact complex value at the delay/rate cell used for the reported
     /// time-domain fringe result.
     pub delay_peak_complex: C32,
+    pub(crate) delay_peak_cell: (f32, f32),
     pub delay_max_amp: f32,
     pub delay_phase: f32,
     pub delay_snr: f32,
     pub delay_noise: f32,
     pub residual_delay: f32,
+    /// Continuous residual at the first sector epoch, or the reason the fit failed.
+    pub group_delay: Option<Result<crate::search::GroupDelayEstimate, &'static str>>,
     pub corrected_delay: f32,
     pub delay_offset: f32,
     // Frequency
@@ -173,6 +179,17 @@ pub struct AnalysisResults {
     pub m_coord: f64,
 }
 
+impl AnalysisResults {
+    /// Residuals in the same frame as the input to the search. A rejected
+    /// continuous fit must not become a correction for subsequent data.
+    pub fn fitted_delay_rate(&self) -> Result<(f64, f64), &'static str> {
+        match self.group_delay {
+            Some(fit) => fit.map(|f| (f.delay_samples, f.rate_hz)),
+            None => Ok((self.residual_delay.into(), self.residual_rate.into())),
+        }
+    }
+}
+
 pub fn analyze_results(
     freq_rate_array: &Array2<C32>,
     delay_rate_array: &Array2<C32>,
@@ -200,11 +217,15 @@ pub fn analyze_results(
     let freq_step_mhz = (header.sampling_speed as f32 / header.fft_point as f32) / 1_000_000.0;
     let freq_range = Array1::from_iter((0..fft_point_half).map(|i| i as f32 * freq_step_mhz));
     let rate_range = rate_cal(padding_length as f32, effective_integ_time);
+    let delay_window = window_bounds(&args.drange);
+    let rate_window = window_bounds(&args.rrange);
+    let freq_window = window_bounds(&args.frange);
     let keep_delay_profiles = args.plot && !args.frequency;
     let keep_freq_profiles = args.plot && args.frequency;
     let keep_freq_spectrum =
         args.frequency || args.spectrum || args.bandpass_table || !args.multi_sideband.is_empty();
-    let skip_delay_plane_analysis = args.frequency && args.drange.is_empty();
+    let skip_delay_plane_analysis =
+        args.frequency && args.drange.is_empty() && args.contamination.is_none();
     // --- Delay Analysis ---
     let delay_array_mean = if skip_delay_plane_analysis {
         C32::new(0.0, 0.0)
@@ -222,30 +243,15 @@ pub fn analyze_results(
 
     let (peak_rate_idx, peak_delay_idx) = if skip_delay_plane_analysis {
         (padding_length_half, fft_point_half - 1)
-    } else if !args.drange.is_empty() || !args.rrange.is_empty() {
-        // Case 3: Window options are specified (either/both), search within them.
-        let (delay_win_low, delay_win_high) = if !args.drange.is_empty() {
-            (args.drange[0], args.drange[1])
-        } else {
-            (
-                delay_range[0],
-                *delay_range.last().unwrap_or(&delay_range[0]),
-            )
-        };
-        let (rate_win_low, rate_win_high) = if !args.rrange.is_empty() {
-            (args.rrange[0], args.rrange[1])
-        } else {
-            (rate_range[0], *rate_range.last().unwrap_or(&rate_range[0]))
-        };
-
-        let mut max_power_in_window = 0.0f32;
+    } else if delay_window.is_some() || rate_window.is_some() {
+        let mut max_power_in_window = -1.0f32;
         let mut temp_peak_rate_idx = padding_length_half;
-        let mut temp_peak_delay_idx = fft_point_half;
+        let mut temp_peak_delay_idx = fft_point_half - 1;
 
         for (r_idx, &rate) in rate_range.iter().enumerate() {
-            if rate >= rate_win_low && rate <= rate_win_high {
+            if in_window(rate, rate_window) {
                 for d_idx in 0..delay_range.len() {
-                    if delay_range[d_idx] >= delay_win_low && delay_range[d_idx] <= delay_win_high {
+                    if in_window(delay_range[d_idx], delay_window) {
                         if in_delay_rate_mask(delay_range[d_idx], rate, delay_rate_mask) {
                             continue;
                         }
@@ -412,28 +418,16 @@ pub fn analyze_results(
     let (peak_freq_row_idx, peak_rate_col_idx) = if !args.frequency {
         let peak_rate_col_idx = peak_rate_idx.min(freq_rate_array.shape()[1].saturating_sub(1));
         (0, peak_rate_col_idx)
-    } else if !args.rrange.is_empty() || !args.frange.is_empty() {
-        // Case 3: Window option is specified.
-        let (rate_win_low, rate_win_high) = if !args.rrange.is_empty() {
-            (args.rrange[0], args.rrange[1])
-        } else {
-            (rate_range[0], *rate_range.last().unwrap_or(&rate_range[0]))
-        };
-        let (freq_win_low, freq_win_high) = if args.frange.len() == 2 {
-            (args.frange[0], args.frange[1])
-        } else {
-            (freq_range[0], *freq_range.last().unwrap_or(&freq_range[0]))
-        };
-
-        let mut max_power_in_window = 0.0f32;
+    } else if rate_window.is_some() || freq_window.is_some() {
+        let mut max_power_in_window = -1.0f32;
         let mut temp_peak_freq_row_idx = 0;
         let mut temp_peak_rate_col_idx = padding_length_half;
 
         for (r_idx, &rate) in rate_range.iter().enumerate() {
-            if rate >= rate_win_low && rate <= rate_win_high {
+            if in_window(rate, rate_window) {
                 for f_idx in 0..freq_range.len() {
                     let freq_mhz = freq_range[f_idx];
-                    if freq_mhz < freq_win_low || freq_mhz > freq_win_high {
+                    if !in_window(freq_mhz, freq_window) {
                         continue;
                     }
                     let current_power = norm_sqr_at(freq_rate_array, f_idx, r_idx);
@@ -449,16 +443,7 @@ pub fn analyze_results(
     } else if matches!(search_mode, Some("peak") | Some("deep") | Some("deep2")) {
         // Case 2: --search or --search_deep is specified, no window. Find the global maximum.
         let (mut max_power, mut max_f_idx, mut max_r_idx) = (0.0f32, 0, 0);
-        let (freq_win_low, freq_win_high) = if args.frange.len() == 2 {
-            (args.frange[0], args.frange[1])
-        } else {
-            (freq_range[0], *freq_range.last().unwrap_or(&freq_range[0]))
-        };
         for f_idx in 0..freq_rate_array.shape()[0] {
-            let freq_mhz = freq_range[f_idx];
-            if freq_mhz < freq_win_low || freq_mhz > freq_win_high {
-                continue;
-            }
             for r_idx in 0..freq_rate_array.shape()[1] {
                 let current_power = norm_sqr_at(freq_rate_array, f_idx, r_idx);
                 if current_power > max_power {
@@ -565,7 +550,10 @@ pub fn analyze_results(
                 if let Ok(fit_result) = fitting::fit_quadratic_least_squares(&x_coords, &y_values) {
                     let x_min = x_coords[0].min(x_coords[2]);
                     let x_max = x_coords[0].max(x_coords[2]);
-                    if fit_result.peak_x >= x_min && fit_result.peak_x <= x_max {
+                    if fit_result.peak_x >= x_min
+                        && fit_result.peak_x <= x_max
+                        && in_window(fit_result.peak_x as f32, freq_window)
+                    {
                         freq_freq = fit_result.peak_x as f32;
                     }
                 }
@@ -714,7 +702,7 @@ pub fn analyze_results(
     );
 
     AnalysisResults {
-        yyyydddhhmmss1: obs_time.format("%Y/%j %H:%M:%S").to_string(),
+        yyyydddhhmmss1: obs_time.format("%Y/%j %H:%M:%S%.f").to_string(),
         source_name: header.source_name.clone(),
         length_f32,
         ant1_az,
@@ -724,6 +712,7 @@ pub fn analyze_results(
         ant2_el,
         ant2_hgt,
         mjd: mjd_cal(*obs_time),
+        delay_peak_cell: (delay_range[peak_delay_idx], rate_range[peak_rate_idx]),
         delay_range,
         visibility,
         delay_rate: delay_rate_slice,
@@ -733,6 +722,7 @@ pub fn analyze_results(
         delay_snr,
         delay_noise,
         residual_delay: residual_delay_val,
+        group_delay: None,
         corrected_delay: args.delay_correct,
         delay_offset,
         freq_max_amp,

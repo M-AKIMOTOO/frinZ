@@ -31,7 +31,7 @@ git clone https://github.com/M-AKIMOTOO/frinZ.git
 cd frinZ
 
 # Install to ~/.cargo/bin
-cargo install --path . --bin frinZ
+cargo install --locked --path . --bin frinZ
 ```
 
 ### Development Build
@@ -88,7 +88,7 @@ cargo build -p frinZ --bin frinZtable
 ./target/debug/frinZtable '/home/akimoto/collaboration_共同研究/XRISM/4U1755-338/YI/I26283X/i26283x_frinZ_len0s_c_time.tsv'
 
 # インストールする場合
-cargo install --bin frinZtable --path .
+cargo install --locked --bin frinZtable --path .
 # Linuxのアプリ一覧・TSVの「別のアプリケーションで開く」に登録
 frinZtable --install-desktop
 
@@ -195,6 +195,55 @@ frinZ --input data.cor --length 30 --loop 5
 frinZ --input data.cor --skip 10
 ```
 
+#### Precision group delay on a single baseline
+
+```bash
+frinZ --input target.cor --search group-delay --length 60 --loop 24 --output
+```
+
+For native `.cor` cross-correlations, `group-delay` finds a delay/rate peak and
+jointly refines both parameters in double precision on the complex visibilities.
+An arbitrary constant phase is fitted. The residual delay refers to the first
+recorded sector of each window, after any manual correction. The fringe rate
+is referenced to the observing frequency in the header. Actual timestamp gaps,
+bandpass gains, channel flags and the wideband phase drift enter the fit.
+`--length` counts sectors. The example gives 60-second windows for 1-second sectors.
+`--drange` (samples) and `--rrange` (Hz) can select a fringe lobe with prior information.
+`--iter` controls the seed grid (one refinement by default in this mode).
+
+The terminal and `*_group_delay*.tsv` report these additional fields.
+
+| Field | Meaning |
+| --- | --- |
+| `GroupDelay` | Residual group delay in seconds. `Res-Delay` gives the same estimate in samples. |
+| `SigmaDelay` | Formal 1σ error in ps, from independent per-visibility phase-quadrature residuals and the joint fit curvature. |
+| `SNRq` | Coherent amplitude divided by the estimated noise in one quadrature. |
+| `B_rms` | RMS frequency spread in MHz, counting each contributing visibility. |
+| `Ambiguity` | Exact repetition interval in ns at fixed rate, from the common spacing of the retained channels. Gaps can also produce strong sidelobes inside this interval. |
+| `Nvis` | Number of contributing time–frequency samples after flags and DC exclusion. |
+| `Fit` | `ok` for an interior local maximum, `delay_only` for a fixed rate or a single epoch, `no_noise_dof` if there are too few independent samples to estimate an error. Failed fits carry a reason and NaN estimates. |
+
+`SigmaDelay` assumes a detected fringe on the correct lobe and independent noise.
+At high S/N, with a flat spectrum and uniform noise, the thermal error is approximately
+`1 / (2π B_rms SNRq)` with bandwidth in Hz. The reported covariance also accounts for
+the fitted phase, rate and channel-dependent noise. A histogram RFI mask derived
+during the run acts on the diagnostic planes after the search. Load a saved mask
+with `--rfi MASK.npz` to use its flagged channels in the fit.
+[VLBA Scientific Memo 33](https://science.nrao.edu/facilities/vlba/publications/memos/sci/sci33memo.pdf)
+
+A single baseline measures the sum of the geometric residual and differential
+clock, signal-path and propagation delays, with possible source-structure bias.
+Nearby calibrator scans bracketing the target can transfer the common baseline
+term through `--phase-reference`. Absolute accuracy also depends on differential
+atmosphere, instrumental stability and the reference-source model. Use independent
+check-source scans to measure the accuracy of that transfer.
+[Schwab & Cotton (1983)](https://adsabs.harvard.edu/pdf/1983AJ.....88..688S)
+
+In Rust, choose `SearchMode::GroupDelay` and read `analysis.group_delay`.
+`search_cor_bytes` uses the recorded sector epochs. For an in-memory `CorData`
+buffer with gaps, pass its sector times to `delay_search_at_times`. The plain
+`delay_search` helper assumes uniform sector spacing.
+
 #### Phase Reference Analysis
 ```bash
 # 110 m baseline: global quadratic phase model
@@ -203,10 +252,67 @@ frinZ --phase-reference poly2 cal.cor target.cor
 frinZ --phsref poly2 cal.cor target.cor
 
 # VLBI: quadratic trend plus locally interpolated atmospheric residual
-frinZ --phase-reference hybrid cal.cor target.cor 60 120 3
+frinZ --phase-reference hybrid cal.cor target.cor 60 120 3 --search peak
+# Interpolate phase/delay values and the measured fringe-rate derivatives
+frinZ --phase-reference hermite cal.cor target.cor 120 360 10000 --search peak --npz
 # Arguments: mode calibrator target cal_length target_length loop
-# Modes: poly2, linear, nearest, hybrid
+# Modes: poly2, linear, nearest, hybrid, hermite
 ```
+
+Phase referencing connects calibrator phases using the measured fringe rate and
+the actual time between windows (including scan gaps). Phase-reference analysis uses
+`--search peak` by default for both inputs and retains phase/delay/rate samples without requiring
+`--plot`. Choose integration lengths short enough to measure each scan, and a
+loop count large enough to cover the data; one sample cannot define a quadratic.
+`--search peak` can also be specified explicitly.
+The first valid calibrator window start is the common time origin for the fit,
+target correction, and both NPZ time axes. The fitted phase intercept is retained.
+With `--npz`, `reference_epoch_unix_s`, `calibrator_rate_hz`, and the f64
+`calibrator_connected_phase_deg` are saved for checking the phase connection.
+Rate prediction across a gap must be accurate to within half a turn to select
+the correct branch; a smooth fit alone does not prove that the connection is unique.
+
+The transferred model is `phase(t, f) = phase_at_band_edge(t) + 2*pi*f*delay(t)`,
+where `f = channel * sampling_speed / FFT` is the offset from the observing
+frequency in the header and delay is in seconds. The selected mode fits or
+interpolates both the connected phase and delay at the same window-start epochs.
+Rate selects the phase turns and is already represented by the phase's time
+evolution; it is not added a second time. Manual delay/rate/acceleration/jerk/snap
+corrections are restored to the original input frame before transferring the model.
+`hermite` matches phase and delay at each solution epoch and uses `360*rate`
+(degrees/s) and `rate/reference_frequency` (s/s) as their derivatives, matching
+the non-dispersive wideband rate convention of the fringe search. It propagates
+endpoint solutions using their rates outside the sampled range. Other modes keep
+their existing polynomial/interpolation behavior for both phase and delay.
+`--frequency`, `--scan-correct`, and `--spike34` are not supported in this mode.
+NPZ diagnostics also include `reference_frequency_hz`, `calibrator_delay_s`,
+`calibrator_fit_delay_s`, `target_model_phase_deg`, and `target_model_delay_s`.
+
+For independent single-baseline measurements rather than cumulative integration:
+
+```bash
+python3 tools/phase_reference_measurements.py \
+  --original target.cor --corrected target_phsref.cor \
+  --frinz target/release/frinZ --output analysis/phase-reference \
+  --bin-seconds 1800 3600
+```
+
+This tool requires NumPy and Matplotlib. It creates disjoint wall-clock bins
+anchored at the first target timestamp and searches delay/rate independently in
+each bin. `--length` counts sectors in frinZ, so a 3600-second wall-clock bin
+containing scan gaps generally has less than 3600 seconds of exposure. Empty
+bins and partial end bins are retained and flagged. Inputs must have matching
+epochs and constant, known sector integration durations.
+
+Outputs include `measurements.csv`, vector SVG/PNG figures, per-bin logs and
+complex-fringe diagnostics, and a manifest with input/binary/script hashes.
+Amplitudes remain in frinZ's uncalibrated percent convention, not Jy. Error bars
+use real/imaginary off-delay noise estimates and are high-S/N statistical
+approximations; gain and phase-transfer systematics are not included. The
+legacy frinZ S/N convention is preserved separately. A noise-debiased long/60-s
+power ratio provides a coherence diagnostic, also affected by amplitude
+variability; it is not a calibrated correction factor. Non-overlapping data
+bins may still share calibration errors.
 
 ### Analysis Options
 
@@ -527,6 +633,10 @@ frinZ --input YAMAGU34_HITACH32_yyyydddhhmmss.cor \
 
 fluxへ渡すglobにはtargetとgain天体の両方を含めます。fluxは前後gainの実測raw複素スペクトルを時間補間し、既知座標の幾何位相と `flux:`/gain flux比からtarget grid上のコンタミ配列を作ります。model v5はC/X別ファイルで、direct arrayを保持せず、gain複素スペクトル、各sectorの時刻・幾何遅延、周波数軸、フラックス比、窓ごとの複素規格化係数だけを小容量テーブルとして保持します。frinZ `--contamisubt` は元 `.cor` のcopy-on-writeビュー上で同じ補正量を再構成して減算します。このv5経路では別bandpass表は必須ではありません。v4以前のhandoffだけの場合はscalar逆投影へフォールバックし、flat complex bandpassならdelay面残差のWARNを出します。
 
+handoff は欠測を含む実セクター時刻と元のFFTチャネル軸を保存します。`--fft-rebin` 指定時も生データ配列は元の幅です。`peak_delay_sample` と `peak_rate_hz` は補正済み平面で実際に選んだセルの座標で、探索で適用した遅延とレートは `metadata_json.phase_correction` に入ります。複数窓を `output:NAME.npz` で指定した場合は `NAME_sector<N>.npz` に保存します。
+
+減算時は元 `.cor` のFFTサイズ、サンプリング周波数、補正窓のセクター時刻を照合します。旧版が欠測区間の時刻を等間隔で補ったテーブルは、元観測から handoff と補正モデルを再生成してください。
+
 `flux --contamination` の `c:`/`x:` はこの `*_contamination.npz`（複数・ワイルドカード可）、`ra:HHMMSS`/`dec:DDMMSS` は位相中心基準の J2000 絶対座標、`flux:mJy` は基準周波数のフラックス、`alpha` は `S_nu ∝ nu^alpha` です。方向余弦は `l=cos(dec)*sin(ra-ra0)`、`m=sin(dec)*cos(dec0)-cos(dec)*sin(dec0)*cos(ra-ra0)` です。
 
 帯域 `b` の座標位相を `G_b(t)=phase_sign*2*pi*uv_sign*(u*l+v*m)` とすると、flux は全時刻を `V_i=A_i exp(i theta_target)+S_contam exp(i(G_i+theta_contam))+N_i` で複素fitします。`A_i>=0` は時刻ごとに自由で、C/X の `theta_target` と `theta_contam` は独立です。最初の観測位相への強制整列やdelay/rateの再探索は行いません。二天体fitは複素scalarで行い、補正テーブルの生成と適用には正確な生UVW・時刻・周波数グリッドを使用します。`fit:off` は外部座標を固定し、`fit:on` は同じ複素残差で位置も推定します。
@@ -552,6 +662,8 @@ frinZ --input ant1_ant2_yyyydddhhmmss_c.cor \
 同じdelay/rateセルのfrinZ複素値へ同じtarget−gain位相回転を適用すると、fluxのclean scalarと一致します。raw `.cor` はgain-reference前なので、未回転の位相角は直接比較しません。既知の位相中心天体は補正後の `(delay,rate)=(0,0)` 固定セルで評価します。全平面 `--search` の最大SNRはtrial factorを含み、SNR 5--6だけでは検出ではありません。非ゼロセルは未モデル成分、RFI、雑音最大点として別途検証します。定数位相オフセットは複素平面を一様回転するだけでdelay/rate座標を変えません。delayずれは周波数位相傾斜、rateずれは時間位相傾斜です。
 
 ## Output Files
+
+`--uv --npz` の `observed_u_m` と `observed_v_m` は倍精度の投影座標です。`observed_elapsed_s` は最初に選んだセクターからの実経過時間、`observed_utc_hour` は日内のUTC時刻を表します。軌跡は観測の空白と日付の境界で分割されます。UVWは地心直交座標の基線を、UTCから計算したグリニッジ平均恒星時で投影しています。
 
 With `--npz`, analysis/plot modes also write compressed self-describing NumPy sidecars (`*.npz`) containing a primitive `complex64` `data` array plus `flag`, coordinate axes and units, `fft_point`, `pp`, and array shape. Inspect or export one file with:
 

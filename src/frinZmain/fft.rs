@@ -39,8 +39,8 @@ pub(crate) fn cached_fft_plan(len: usize, inverse: bool) -> Arc<dyn Fft<f32>> {
 
 #[derive(Clone, Copy)]
 struct PhaseCorrection {
-    rate_hz: f32,
-    delay_samples: f32,
+    rate_hz: f64,
+    delay_samples: f64,
     acel_hz: f32,
     jerk_hz_per_s2: f32,
     snap_hz_per_s3: f32,
@@ -141,8 +141,8 @@ pub fn process_fft_with_phase_correction_at_frequency(
     reference_frequency_hz: f64,
 ) -> (Array2<C32>, usize) {
     let phase = PhaseCorrection {
-        rate_hz: rate_hz_for_correction,
-        delay_samples: delay_samples_for_correction,
+        rate_hz: rate_hz_for_correction.into(),
+        delay_samples: delay_samples_for_correction.into(),
         acel_hz: acel_hz_for_correction,
         jerk_hz_per_s2: jerk_hz_per_s2_for_correction,
         snap_hz_per_s3: snap_hz_per_s3_for_correction,
@@ -279,7 +279,7 @@ fn build_phase_factors(
         row_idx as f64 * phase.effective_integration_length as f64
             + phase.start_time_offset_sec as f64
     });
-    build_phase_factors_at_times(phase, sampling_speed, fft_point, times_sec)
+    build_phase_factors_at_times(phase, sampling_speed, fft_point, times_sec, 0.0)
 }
 
 fn build_phase_factors_at_times(
@@ -287,6 +287,7 @@ fn build_phase_factors_at_times(
     sampling_speed: u32,
     fft_point: u32,
     times_sec: impl ExactSizeIterator<Item = f64>,
+    channel_origin_bins: f64,
 ) -> Option<(Vec<C64>, Vec<C64>, Vec<C32>)> {
     if !phase.is_valid_for(sampling_speed, fft_point) {
         return None;
@@ -294,12 +295,12 @@ fn build_phase_factors_at_times(
 
     let rows = times_sec.len();
     let freq_resolution_hz = sampling_speed as f64 / fft_point as f64;
-    let delay_seconds = phase.delay_samples as f64 / sampling_speed as f64;
+    let delay_seconds = phase.delay_samples / sampling_speed as f64;
     let use_wideband_rate = phase.reference_frequency_hz.is_finite()
         && phase.reference_frequency_hz.abs() > f64::EPSILON;
     let temporal_cycles: Vec<f64> = times_sec
         .map(|time_sec| {
-            phase.rate_hz as f64 * time_sec
+            phase.rate_hz * time_sec
                 + 0.5 * phase.acel_hz as f64 * time_sec.powi(2)
                 + (phase.jerk_hz_per_s2 as f64 / 6.0) * time_sec.powi(3)
                 + (phase.snap_hz_per_s3 as f64 / 24.0) * time_sec.powi(4)
@@ -326,10 +327,16 @@ fn build_phase_factors_at_times(
         })
         .collect();
 
+    let origin_hz = channel_origin_bins * freq_resolution_hz;
+    let origin_fraction = if use_wideband_rate {
+        origin_hz / phase.reference_frequency_hz
+    } else {
+        0.0
+    };
     let row_factors = temporal_cycles
         .iter()
         .map(|&cycles| {
-            let angle = -2.0 * PI * cycles;
+            let angle = -2.0 * PI * (cycles + origin_hz * delay_seconds + cycles * origin_fraction);
             C32::new(angle.cos() as f32, angle.sin() as f32)
         })
         .collect();
@@ -357,69 +364,64 @@ pub fn process_ifft_with_delay_padding(
     padding_length: usize,
     delay_padding: usize,
 ) -> Array2<C32> {
-    let fft_point_usize = fft_point as usize;
-    let delay_padding = delay_padding.max(1);
-    let padded_fft_point = fft_point_usize.saturating_mul(delay_padding);
-    let mut delay_rate_array = Array2::<C32>::zeros((padding_length, padded_fft_point));
-    let ifft = cached_fft_plan(padded_fft_point, true);
-    let mut ifft_exe = vec![C32::new(0.0, 0.0); padded_fft_point];
-    let mut ifft_scratch = vec![C32::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
-    let freq_bins = freq_rate_array.dim().0.min(padded_fft_point);
-    let scale = fft_point_usize as f32;
-
-    for i in 0..freq_rate_array.dim().1 {
-        for (dst, src) in ifft_exe[..freq_bins]
-            .iter_mut()
-            .zip(freq_rate_array.column(i).iter().take(freq_bins))
-        {
-            *dst = *src;
-        }
-        ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
-
-        ifft.process_with_scratch(&mut ifft_exe, &mut ifft_scratch);
-
-        let half = padded_fft_point / 2;
-        let (first_half, second_half) = ifft_exe.split_at(half);
-        let mut row = delay_rate_array.row_mut(i);
-        for (dst, src) in row.iter_mut().take(half).zip(first_half.iter().rev()) {
-            *dst = *src / scale;
-        }
-        for (dst, src) in row.iter_mut().skip(half).zip(second_half.iter().rev()) {
-            *dst = *src / scale;
+    let mut transform = DelayTransform::new(fft_point as usize, delay_padding);
+    let mut delay_rate_array = Array2::<C32>::zeros((padding_length, transform.buffer.len()));
+    for (rate, column) in freq_rate_array.columns().into_iter().enumerate() {
+        let mut row = delay_rate_array.row_mut(rate);
+        for (dst, value) in row.iter_mut().zip(transform.delay_bins(column)) {
+            *dst = value;
         }
     }
-
     delay_rate_array
 }
 
+/// Reuse one rate column's IFFT workspace. Both the peak scan and the full
+/// delay plane read bins in the physical order [-N/2 + 1, ..., N/2].
+pub(crate) struct DelayTransform {
+    ifft: Arc<dyn Fft<f32>>,
+    buffer: Vec<C32>,
+    scratch: Vec<C32>,
+    scale: f32,
+}
+
+impl DelayTransform {
+    pub(crate) fn new(fft_point: usize, delay_padding: usize) -> Self {
+        let len = fft_point.saturating_mul(delay_padding.max(1));
+        let ifft = cached_fft_plan(len, true);
+        Self {
+            scratch: vec![C32::default(); ifft.get_inplace_scratch_len()],
+            ifft,
+            buffer: vec![C32::default(); len],
+            scale: fft_point as f32,
+        }
+    }
+
+    pub(crate) fn delay_bins(
+        &mut self,
+        column: ArrayView1<'_, C32>,
+    ) -> impl Iterator<Item = C32> + '_ {
+        let count = column.len().min(self.buffer.len());
+        for (dst, &value) in self.buffer[..count].iter_mut().zip(column) {
+            *dst = value;
+        }
+        self.buffer[count..].fill(C32::default());
+        self.ifft
+            .process_with_scratch(&mut self.buffer, &mut self.scratch);
+        let (first, second) = self.buffer.split_at(self.buffer.len() / 2);
+        let scale = self.scale;
+        first
+            .iter()
+            .rev()
+            .chain(second.iter().rev())
+            .map(move |&v| v / scale)
+    }
+}
+
 pub fn perform_ifft_on_vec(input: &[C32], ifft_size: usize) -> Vec<C32> {
-    let ifft = cached_fft_plan(ifft_size, true);
-
-    let mut ifft_exe = vec![C32::new(0.0, 0.0); ifft_size];
-    ifft_exe[..input.len()].copy_from_slice(input);
-
-    ifft.process(&mut ifft_exe);
-
-    let mut shifted_out = vec![C32::new(0.0, 0.0); ifft_size];
-    let half = ifft_size / 2;
-    let (first_half, second_half) = ifft_exe.split_at(half);
-    let scale = ifft_size as f32;
-    for (dst, src) in shifted_out
-        .iter_mut()
-        .take(first_half.len())
-        .zip(first_half.iter().rev())
-    {
-        *dst = *src / scale;
-    }
-    for (dst, src) in shifted_out
-        .iter_mut()
-        .skip(first_half.len())
-        .zip(second_half.iter().rev())
-    {
-        *dst = *src / scale;
-    }
-
-    shifted_out
+    assert!(input.len() <= ifft_size);
+    DelayTransform::new(ifft_size, 1)
+        .delay_bins(ArrayView1::from(input))
+        .collect()
 }
 
 /// Backward-compatible narrow-band correction. Prefer
@@ -475,8 +477,8 @@ pub fn apply_phase_correction_in_place_at_frequency(
 
     let rows = data.len() / fft_point_half;
     let phase = PhaseCorrection {
-        rate_hz: rate_hz_for_correction,
-        delay_samples: delay_samples_for_correction,
+        rate_hz: rate_hz_for_correction.into(),
+        delay_samples: delay_samples_for_correction.into(),
         acel_hz: acel_hz_for_correction,
         jerk_hz_per_s2: jerk_hz_per_s2_for_correction,
         snap_hz_per_s3: snap_hz_per_s3_for_correction,
@@ -498,8 +500,8 @@ pub fn apply_phase_correction_in_place_at_frequency(
 pub(crate) fn apply_phase_correction_in_place_at_times(
     data: &mut [C32],
     fft_point_half: usize,
-    rate_hz_for_correction: f32,
-    delay_samples_for_correction: f32,
+    rate_hz_for_correction: impl Into<f64>,
+    delay_samples_for_correction: impl Into<f64>,
     acel_hz_for_correction: f32,
     jerk_hz_per_s2_for_correction: f32,
     snap_hz_per_s3_for_correction: f32,
@@ -507,6 +509,7 @@ pub(crate) fn apply_phase_correction_in_place_at_times(
     fft_point: u32,
     times_sec: &[f64],
     reference_frequency_hz: f64,
+    channel_origin_bins: f64,
 ) {
     if data.is_empty()
         || fft_point_half == 0
@@ -517,8 +520,8 @@ pub(crate) fn apply_phase_correction_in_place_at_times(
     }
 
     let phase = PhaseCorrection {
-        rate_hz: rate_hz_for_correction,
-        delay_samples: delay_samples_for_correction,
+        rate_hz: rate_hz_for_correction.into(),
+        delay_samples: delay_samples_for_correction.into(),
         acel_hz: acel_hz_for_correction,
         jerk_hz_per_s2: jerk_hz_per_s2_for_correction,
         snap_hz_per_s3: snap_hz_per_s3_for_correction,
@@ -526,9 +529,13 @@ pub(crate) fn apply_phase_correction_in_place_at_times(
         start_time_offset_sec: 0.0,
         reference_frequency_hz,
     };
-    let Some((channel_steps, _, row_factors)) =
-        build_phase_factors_at_times(phase, sampling_speed, fft_point, times_sec.iter().copied())
-    else {
+    let Some((channel_steps, _, row_factors)) = build_phase_factors_at_times(
+        phase,
+        sampling_speed,
+        fft_point,
+        times_sec.iter().copied(),
+        channel_origin_bins,
+    ) else {
         return;
     };
 

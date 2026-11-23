@@ -118,8 +118,8 @@ fn write_f64_le(bytes: &mut [u8], offset: usize, value: f64) -> Result<(), Box<d
 fn apply_correction_to_cor_bytes(
     bytes: &mut [u8],
     header: &CorHeader,
-    delay_samples: f32,
-    rate_hz: f32,
+    delay_samples: f64,
+    rate_hz: f64,
     acel_hz_per_s: f32,
     jerk_hz_per_s2: f32,
     snap_hz_per_s3: f32,
@@ -166,6 +166,7 @@ fn apply_correction_to_cor_bytes(
             header.fft_point as u32,
             &[time_sec],
             header.observing_frequency,
+            0.0,
         );
         for (channel, value) in spectra.iter().enumerate() {
             let offset = visibility_start + channel * 8;
@@ -179,8 +180,8 @@ fn apply_correction_to_cor_bytes(
 fn update_station2_clock_header(
     bytes: &mut [u8],
     header: &CorHeader,
-    delay_samples: f32,
-    rate_hz: f32,
+    delay_samples: f64,
+    rate_hz: f64,
     acel_hz_per_s: f32,
     jerk_hz_per_s2: f32,
     snap_hz_per_s3: f32,
@@ -200,12 +201,12 @@ fn update_station2_clock_header(
     write_f64_le(
         bytes,
         STATION2_CLOCK_DELAY_OFFSET,
-        header.station2_clock_delay + delay_samples as f64 / sample_rate_hz,
+        header.station2_clock_delay + delay_samples / sample_rate_hz,
     )?;
     write_f64_le(
         bytes,
         STATION2_CLOCK_RATE_OFFSET,
-        header.station2_clock_rate + rate_hz as f64 / reference_frequency_hz,
+        header.station2_clock_rate + rate_hz / reference_frequency_hz,
     )?;
     write_f64_le(
         bytes,
@@ -262,13 +263,13 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
 
     // Match the ordinary processing order exactly: supplied Taylor terms are
     // removed before the residual delay/rate search.
+    let time_offsets = read_sector_time_offsets(&bytes, &header, 0, physical_rows as usize)?;
     if args.delay_correct != 0.0
         || args.rate_correct != 0.0
         || args.acel_correct != 0.0
         || args.jerk_correct != 0.0
         || args.snap_correct != 0.0
     {
-        let time_offsets = read_sector_time_offsets(&bytes, &header, 0, physical_rows as usize)?;
         apply_phase_correction_in_place_at_times(
             &mut search_data,
             width,
@@ -281,6 +282,7 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
             header.fft_point as u32,
             &time_offsets,
             header.observing_frequency,
+            0.0,
         );
     }
 
@@ -301,62 +303,32 @@ pub fn run_mkcor(args: &Args) -> Result<(), Box<dyn Error>> {
         search_args.acel_correct = 0.0;
         search_args.jerk_correct = 0.0;
         search_args.snap_correct = 0.0;
-        let result = match args.primary_search_mode() {
-            Some("deep") => search::run_deep_search(
-                &search_data,
-                &header,
-                padded_rows,
-                physical_rows,
-                effective_integ_time,
-                &obs_time,
-                &obs_time,
-                &rfi_ranges,
-                &bandpass_data,
-                &search_args,
-                header.number_of_sector,
-                search_args.cpu,
-                None,
-            )?,
-            Some("coherent") => search::run_coherent_search(
-                &search_data,
-                &header,
-                padded_rows,
-                physical_rows,
-                effective_integ_time,
-                &obs_time,
-                &obs_time,
-                &rfi_ranges,
-                &bandpass_data,
-                &search_args,
-                header.number_of_sector,
-                search_args.cpu,
-                None,
-            )?,
-            _ => search::run_peak_search(
-                &search_data,
-                &header,
-                padded_rows,
-                physical_rows,
-                effective_integ_time,
-                &obs_time,
-                &obs_time,
-                &rfi_ranges,
-                &bandpass_data,
-                &search_args,
-                header.number_of_sector,
-                search_args.cpu,
-                None,
-            )?,
+        let search = match args.primary_search_mode() {
+            Some("deep") => search::run_deep_search_with_phase_times,
+            _ => search::run_peak_search_with_phase_times,
         };
-        (
-            result.analysis_results.residual_delay,
-            result.analysis_results.residual_rate,
-            Some(result.analysis_results.delay_snr),
-        )
+        let result = search(
+            &search_data,
+            &header,
+            padded_rows,
+            physical_rows,
+            effective_integ_time,
+            &obs_time,
+            &obs_time,
+            &rfi_ranges,
+            &bandpass_data,
+            &search_args,
+            header.number_of_sector,
+            search_args.cpu,
+            None,
+            &time_offsets,
+        )?;
+        let (delay, rate) = result.analysis_results.fitted_delay_rate()?;
+        (delay, rate, Some(result.analysis_results.delay_snr))
     };
 
-    let total_delay = args.delay_correct + residual_delay;
-    let total_rate = args.rate_correct + residual_rate;
+    let total_delay = f64::from(args.delay_correct) + residual_delay;
+    let total_rate = f64::from(args.rate_correct) + residual_rate;
     let total_acel = args.acel_correct;
     apply_correction_to_cor_bytes(
         &mut bytes,
@@ -456,8 +428,8 @@ mod tests {
         let original = sample_cor(&times);
         let header = parse_header(&mut Cursor::new(original.as_slice())).unwrap();
         let mut corrected = original.clone();
-        let delay = 1.25f32;
-        let rate = -0.002f32;
+        let delay = 1.25f64;
+        let rate = -0.002f64;
         apply_correction_to_cor_bytes(&mut corrected, &header, delay, rate, 0.0, 0.0, 0.0).unwrap();
 
         assert_eq!(&corrected[..256], &original[..256]);

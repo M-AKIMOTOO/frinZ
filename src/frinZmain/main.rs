@@ -53,6 +53,7 @@ Basic:
   --skip SEC                skip this many seconds from the file start
   --loop N                  number of consecutive windows/scans to analyze
   --search [MODE]           run fringe search; peak is default, coherent uses direct sums
+  --search group-delay      fit single-baseline .cor group delay and rate, report formal delay error
   --iter N                  number of refinement iterations for peak/deep search
   --frequency               use frequency-rate plane instead of delay-rate plane
   --plot                    save diagnostic plots for the selected analysis mode
@@ -201,6 +202,9 @@ fn apply_runtime_defaults(args: &mut Args, iter_explicit: bool, rate_padding_exp
 
     if has_primary_search && !iter_explicit {
         args.iter = 4;
+    }
+    if args.primary_search_mode() == Some("group-delay") && !iter_explicit {
+        args.iter = 1; // The continuous fit follows the first grid refinement.
     }
 }
 

@@ -2,9 +2,10 @@
 #![allow(clippy::too_many_arguments)]
 pub use acel::run_acel_search_analysis;
 pub use deep::{
-    run_coherent_search, run_coherent_search_with_phase_times, run_deep2_search, run_deep_search,
-    run_deep_search_with_phase_times, run_peak_search, run_peak_search_with_phase_times,
-    DeepSearchParams, DeepSearchResult,
+    run_deep2_search, run_deep_search, run_deep_search_with_phase_times, run_peak_search,
+    run_peak_search as run_coherent_search, run_peak_search_with_phase_times,
+    run_peak_search_with_phase_times as run_coherent_search_with_phase_times, DeepSearchParams,
+    DeepSearchResult, GroupDelayEstimate,
 };
 
 mod acel {
@@ -595,32 +596,30 @@ mod acel {
 }
 
 mod deep {
+    mod group_delay;
     use chrono::{DateTime, Utc};
+    pub use group_delay::GroupDelayEstimate;
     use ndarray::prelude::*;
     use num_complex::Complex;
     use rayon::prelude::*;
+    use std::borrow::Cow;
     use std::error::Error;
     use std::f64::consts::PI;
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::analysis::{analyze_results, AnalysisResults};
     use crate::args::Args;
-    use crate::bandpass::apply_bandpass_correction;
+    use crate::bandpass::{apply_bandpass_gains, bandpass_gains};
     use crate::fft::{
-        apply_phase_correction_in_place_at_times, cached_fft_plan, process_fft, process_ifft,
+        apply_phase_correction_in_place_at_times, process_fft, process_ifft, DelayTransform,
     };
     use crate::header::CorHeader;
     use crate::rfi::has_histogram_mode;
-    use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, positive_or_epsilon, rate_cal};
+    use crate::utils::{
+        delay_rate_mask_bounds, in_delay_rate_mask, in_window, rate_cal, window_bounds,
+    };
 
     type C32 = Complex<f32>;
-    type DeepAnalysis = (
-        AnalysisResults,
-        Option<Array2<C32>>,
-        Array2<C32>,
-        Option<AnalysisResults>,
-    );
-
     fn search_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, Box<dyn Error>> {
         type PoolCache = Option<(usize, Arc<rayon::ThreadPool>)>;
         static POOL: OnceLock<Mutex<PoolCache>> = OnceLock::new();
@@ -647,26 +646,14 @@ mod deep {
         FullGrid,
         AxisThenLocal,
         PeakPolish,
-        Coherent,
     }
 
-    #[allow(dead_code)]
     impl DeepSearchAlgorithm {
         fn mode_name(self) -> &'static str {
             match self {
                 Self::FullGrid => "deep",
                 Self::AxisThenLocal => "deep2",
                 Self::PeakPolish => "peak",
-                Self::Coherent => "peak",
-            }
-        }
-
-        fn log_name(self) -> &'static str {
-            match self {
-                Self::FullGrid => "DEEP SEARCH",
-                Self::AxisThenLocal => "DEEP2 SEARCH",
-                Self::PeakPolish => "PEAK SEARCH",
-                Self::Coherent => "COHERENT SEARCH",
             }
         }
     }
@@ -719,13 +706,31 @@ mod deep {
         effective_integ_time: f32,
         current_obs_time: &'a DateTime<Utc>,
         rfi_ranges: &'a [(usize, usize)],
-        bandpass_data: &'a Option<Vec<C32>>,
         args: &'a Args,
         effective_fft_point: i32,
         rfi_mask: Vec<bool>,
-        bandpass_gains: Option<Vec<C32>>,
-        phase_times: Vec<f64>,
+        bandpass_gains: Option<Vec<Complex<f64>>>,
+        phase_times: &'a [f64],
         static_phase_cycles: Vec<f64>,
+    }
+
+    // A continuous search window can fall entirely between FFT bins. Use the
+    // closest bin as its coarse seed; fine trials still obey the exact window.
+    fn coarse_window(axis: impl Iterator<Item = f32>, window: &[f32]) -> Option<(f32, f32)> {
+        let (low, high) = window_bounds(window)?;
+        let mut nearest = None;
+        let mut distance = f32::INFINITY;
+        for value in axis {
+            if (low..=high).contains(&value) {
+                return Some((low, high));
+            }
+            let gap = (low - value).max(value - high);
+            if gap < distance {
+                distance = gap;
+                nearest = Some((value, value));
+            }
+        }
+        nearest
     }
 
     fn build_rfi_mask(channel_count: usize, rfi_ranges: &[(usize, usize)]) -> Vec<bool> {
@@ -742,23 +747,37 @@ mod deep {
         mask
     }
 
-    fn build_bandpass_gains(channel_count: usize, bandpass_data: &[C32]) -> Option<Vec<C32>> {
-        if bandpass_data.is_empty() {
-            return None;
-        }
-        const EPSILON: f32 = 1.0e-9;
-        let mean = bandpass_data.iter().copied().sum::<C32>() / bandpass_data.len() as f32;
-        let mut gains = vec![C32::new(1.0, 0.0); channel_count];
-        for (channel, &value) in bandpass_data.iter().take(channel_count).enumerate() {
-            if value.norm() > EPSILON {
-                gains[channel] = mean / value;
+    /// Advance four independent channel phases so the coherent sum does not
+    /// serialize an entire spectrum on one complex multiplication chain.
+    fn add_rotated_channels(
+        sums: &mut [Complex<f64>],
+        samples: &[C32],
+        first_phase: Complex<f64>,
+        step: Complex<f64>,
+    ) {
+        let step2 = step * step;
+        let step4 = step2 * step2;
+        let mut phases = [
+            first_phase,
+            first_phase * step,
+            first_phase * step2,
+            first_phase * step2 * step,
+        ];
+        let (sample_groups, tail) = samples.as_chunks::<4>();
+        let (sum_groups, sum_tail) = sums.as_chunks_mut::<4>();
+        for (group, sums) in sample_groups.iter().zip(sum_groups) {
+            for i in 0..4 {
+                sums[i] += Complex::new(f64::from(group[i].re), f64::from(group[i].im)) * phases[i];
+                phases[i] *= step4;
             }
         }
-        Some(gains)
+        for ((&sample, sum), phase) in tail.iter().zip(sum_tail).zip(phases) {
+            *sum += Complex::new(f64::from(sample.re), f64::from(sample.im)) * phase;
+        }
     }
 
     impl<'a> DeepSearchContext<'a> {
-        fn fft_for_correction(&self, delay: f32, rate: f32) -> (Array2<C32>, usize) {
+        fn fft_for_correction(&self, delay: f64, rate: f64) -> (Array2<C32>, usize) {
             const RATE_PADDING: u32 = 1;
             let (mut freq_rate_array, padding_length) = if rate == 0.0
                 && delay == 0.0
@@ -776,8 +795,13 @@ mod deep {
                 )
             } else {
                 let mut corrected = self.complex_vec.to_vec();
+                // Library callers may append zero-padding rows. Only the
+                // physical rows have epochs; including padding makes the
+                // correction helper reject the entire phase model.
+                let physical_samples =
+                    self.phase_times.len() * (self.effective_fft_point / 2) as usize;
                 apply_phase_correction_in_place_at_times(
-                    &mut corrected,
+                    &mut corrected[..physical_samples],
                     (self.effective_fft_point / 2) as usize,
                     rate,
                     delay,
@@ -786,8 +810,9 @@ mod deep {
                     self.args.snap_correct,
                     self.header.sampling_speed as u32,
                     self.effective_fft_point as u32,
-                    &self.phase_times,
+                    self.phase_times,
                     self.header.observing_frequency,
+                    self.args.channel_origin_bins,
                 );
                 process_fft(
                     &corrected,
@@ -815,136 +840,54 @@ mod deep {
         }
 
         fn apply_bandpass(&self, freq_rate_array: &mut Array2<C32>) {
-            if let Some(bp_data) = self.bandpass_data {
-                apply_bandpass_correction(freq_rate_array, bp_data);
+            if let Some(gains) = &self.bandpass_gains {
+                apply_bandpass_gains(freq_rate_array, gains.iter().copied());
             }
         }
 
-        fn coarse_estimates_streaming(
+        fn coarse_delay_peak(
             &self,
-            freq_rate_array: &Array2<C32>,
+            frequencies: &Array2<C32>,
             padding_length: usize,
-            search_args: &Args,
-        ) -> (f32, f32, AnalysisResults) {
-            let fft_point = self.effective_fft_point.max(1) as usize;
-            let freq_bins = freq_rate_array.dim().0.min(fft_point);
-            let scale = fft_point as f32;
-            let rate_range = rate_cal(padding_length as f32, self.effective_integ_time);
-            let half = fft_point / 2;
-            let delay_at = |index: usize| index as f32 - half as f32 + 1.0;
-            let delay_mask = if search_args.frequency {
-                None
-            } else {
-                delay_rate_mask_bounds(&search_args.mask)
-            };
-            let in_window = |value: f32, bounds: &[f32]| {
-                bounds.len() != 2 || (value >= bounds[0] && value <= bounds[1])
-            };
-            let mut ifft_exe = vec![C32::new(0.0, 0.0); fft_point];
-            let ifft = cached_fft_plan(fft_point, true);
-            let mut ifft_scratch = vec![C32::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
+        ) -> (f32, f32) {
+            let fft_point = self.effective_fft_point as usize;
+            let half = (fft_point / 2) as f32;
+            let rate_axis = rate_cal(padding_length as f32, self.effective_integ_time);
+            let delay_at = |index: usize| index as f32 - half + 1.0;
+            let delay_window = coarse_window((0..fft_point).map(delay_at), &self.args.drange);
+            let rate_window = coarse_window(rate_axis.iter().copied(), &self.args.rrange);
+            let mask = delay_rate_mask_bounds(&self.args.mask);
+            let mut transform = DelayTransform::new(fft_point, 1);
+            let mut max_power = -1.0;
+            let mut peak = (0.0, 0.0);
 
-            let mut scan =
-                |mean: Option<(f64, f64)>| {
-                    let mut sum_re = 0.0f64;
-                    let mut sum_im = 0.0f64;
-                    let mut noise_sum = 0.0f64;
-                    let mut count = 0usize;
-                    let mut max_power = -1.0f32;
-                    let mut max_delay = 0.0f32;
-                    let mut max_rate = 0.0f32;
-                    let mut max_value = C32::new(0.0, 0.0);
-
-                    for (rate_index, &rate_value) in rate_range.iter().enumerate() {
-                        for (dst, src) in ifft_exe[..freq_bins]
-                            .iter_mut()
-                            .zip(freq_rate_array.column(rate_index).iter().take(freq_bins))
-                        {
-                            *dst = *src;
-                        }
-                        ifft_exe[freq_bins..].fill(C32::new(0.0, 0.0));
-                        ifft.process_with_scratch(&mut ifft_exe, &mut ifft_scratch);
-
-                        for delay_index in 0..fft_point {
-                            let source_index = if delay_index < half {
-                                half.saturating_sub(1 + delay_index)
-                            } else {
-                                fft_point - 1 - (delay_index - half)
-                            };
-                            let value = ifft_exe[source_index] / scale;
-                            let delay_value = delay_at(delay_index);
-                            if self.args.rfi_npz_mask.as_deref().is_some_and(|mask| {
-                                mask.contains_delay_rate(delay_value, rate_value)
-                            }) {
-                                continue;
-                            }
-                            count += 1;
-
-                            if let Some((mean_re, mean_im)) = mean {
-                                noise_sum += ((value.re as f64 - mean_re).powi(2)
-                                    + (value.im as f64 - mean_im).powi(2))
-                                .sqrt();
-                            } else {
-                                sum_re += value.re as f64;
-                                sum_im += value.im as f64;
-                                if in_window(delay_value, &search_args.drange)
-                                    && in_window(rate_value, &search_args.rrange)
-                                    && !in_delay_rate_mask(delay_value, rate_value, delay_mask)
-                                {
-                                    let power = value.norm_sqr();
-                                    if power > max_power {
-                                        max_power = power;
-                                        max_delay = delay_value;
-                                        max_rate = rate_value;
-                                        max_value = value;
-                                    }
-                                }
-                            }
-                        }
+            // Only the seed is needed here. Noise and phase are measured on
+            // the final, fringe-corrected plane.
+            for (rate_index, rate) in rate_axis.into_iter().enumerate() {
+                if !in_window(rate, rate_window) {
+                    continue;
+                }
+                for (index, value) in transform
+                    .delay_bins(frequencies.column(rate_index))
+                    .enumerate()
+                {
+                    let delay = delay_at(index);
+                    let power = value.norm_sqr();
+                    if power > max_power
+                        && in_window(delay, delay_window)
+                        && !in_delay_rate_mask(delay, rate, mask)
+                        && !self
+                            .args
+                            .rfi_npz_mask
+                            .as_deref()
+                            .is_some_and(|mask| mask.contains_delay_rate(delay, rate))
+                    {
+                        max_power = power;
+                        peak = (delay, rate);
                     }
-
-                    (
-                        sum_re, sum_im, noise_sum, count, max_delay, max_rate, max_value,
-                    )
-                };
-
-            let (sum_re, sum_im, _, count, coarse_delay, coarse_rate, coarse_value) = scan(None);
-            let mean = if count > 0 {
-                (sum_re / count as f64, sum_im / count as f64)
-            } else {
-                (0.0, 0.0)
-            };
-            let (_, _, noise_sum, noise_count, _, _, _) = scan(Some(mean));
-            let delay_noise = positive_or_epsilon(if noise_count > 0 {
-                (noise_sum / noise_count as f64) as f32
-            } else {
-                0.0
-            });
-
-            let fake_freq_rate = Array2::<C32>::zeros((1, 1));
-            let fake_delay_rate = Array2::<C32>::zeros((1, 2));
-            let mut analysis = analyze_results(
-                &fake_freq_rate,
-                &fake_delay_rate,
-                self.header,
-                self.current_length,
-                self.effective_integ_time,
-                self.current_obs_time,
-                1,
-                search_args,
-                search_args.primary_search_mode(),
-            );
-            analysis.delay_peak_complex = coarse_value;
-            analysis.delay_max_amp = coarse_value.norm();
-            analysis.delay_phase = coarse_value.arg().to_degrees();
-            analysis.delay_noise = delay_noise;
-            analysis.delay_snr = analysis.delay_max_amp / delay_noise;
-            analysis.residual_delay = coarse_delay;
-            analysis.residual_rate = coarse_rate;
-            analysis.length_f32 = self.physical_length as f32 * self.effective_integ_time;
-            analysis.delay_range = Array1::from_iter((0..fft_point).map(delay_at));
-            analysis.rate_range = rate_range;
-            (coarse_delay, coarse_rate, analysis)
+                }
+            }
+            peak
         }
 
         fn apply_delay_rate_mask(&self, values: &mut Array2<C32>) {
@@ -969,7 +912,11 @@ mod deep {
             padding_length: usize,
             args: &Args,
         ) -> Array2<C32> {
-            if args.frequency && args.drange.is_empty() && !has_histogram_mode(&args.rfi) {
+            if args.frequency
+                && args.drange.is_empty()
+                && args.contamination.is_none()
+                && !has_histogram_mode(&args.rfi)
+            {
                 // analyze_results does not inspect delay pixels in this mode.
                 return Array2::zeros((1, 1));
             }
@@ -978,222 +925,97 @@ mod deep {
             values
         }
 
-        fn coarse_estimates(
-            &self,
-            algorithm: DeepSearchAlgorithm,
-        ) -> Result<(f32, f32, AnalysisResults), Box<dyn Error>> {
-            // drange/rrange が指定されている場合は、その範囲で探索
-            if !self.args.drange.is_empty() || !self.args.rrange.is_empty() {
-                /*
-                println!(
-                    "[{}] Using specified delay/rate windows for coarse estimation",
-                    algorithm.log_name()
-                );
-                */
-                let search_args = self.args;
-                let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
-                self.apply_bandpass(&mut freq_rate_array);
-                if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
-                    return Ok(self.coarse_estimates_streaming(
-                        &freq_rate_array,
-                        padding_length,
-                        search_args,
-                    ));
-                }
-                let delay_rate_2d_data_comp =
-                    self.delay_plane_for_analysis(&freq_rate_array, padding_length, &search_args);
-                let analysis_results = analyze_results(
-                    &freq_rate_array,
-                    &delay_rate_2d_data_comp,
-                    self.header,
-                    self.current_length,
-                    self.effective_integ_time,
-                    self.current_obs_time,
-                    padding_length,
-                    search_args,
-                    search_args.primary_search_mode(),
-                );
-                Ok((
-                    analysis_results.residual_delay,
-                    analysis_results.residual_rate,
-                    analysis_results,
-                ))
+        fn coarse_estimates(&self, algorithm: DeepSearchAlgorithm) -> (f32, f32) {
+            let (mut frequencies, padding_length) = self.fft_for_correction(0.0, 0.0);
+            self.apply_bandpass(&mut frequencies);
+            if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
+                return self.coarse_delay_peak(&frequencies, padding_length);
+            }
+
+            let delays = self.delay_plane_for_analysis(&frequencies, padding_length, self.args);
+            let mode = if self.args.drange.is_empty() && self.args.rrange.is_empty() {
+                Some(algorithm.mode_name())
             } else {
-                /*
-                println!(
-                    "[{}] No windows specified, running coarse search (no fitting) for initial estimates",
-                    algorithm.log_name()
-                );
-                */
-                let mut search_args = self.args.clone();
-                search_args.search = vec![algorithm.mode_name().to_string()];
-                let (mut freq_rate_array, padding_length) = self.fft_for_correction(0.0, 0.0);
-                self.apply_bandpass(&mut freq_rate_array);
-                if !needs_frequency_domain_coarse_search(self.args) && self.current_length > 2 {
-                    return Ok(self.coarse_estimates_streaming(
-                        &freq_rate_array,
-                        padding_length,
-                        &search_args,
-                    ));
-                }
-                let delay_rate_2d_data_comp =
-                    self.delay_plane_for_analysis(&freq_rate_array, padding_length, &search_args);
-                let analysis_results = analyze_results(
-                    &freq_rate_array,
-                    &delay_rate_2d_data_comp,
-                    self.header,
-                    self.current_length,
-                    self.effective_integ_time,
-                    self.current_obs_time,
-                    padding_length,
-                    &search_args,
-                    search_args.primary_search_mode(),
-                );
-                Ok((
-                    analysis_results.residual_delay,
-                    analysis_results.residual_rate,
-                    analysis_results,
-                ))
-            }
-        }
-
-        fn evaluate_coherent_sum(&self, delay: f32, rate: f32) -> (f64, f64) {
-            let fft_point = self.effective_fft_point as usize;
-            let channel_count = fft_point / 2;
-            let sampling_speed = self.header.sampling_speed;
-            let row_count = (self.complex_vec.len() / channel_count.max(1))
-                .min(self.physical_length.max(0) as usize);
-            if fft_point == 0 || channel_count <= 1 || sampling_speed <= 0 || row_count == 0 {
-                return (0.0, 0.0);
-            }
-
-            let sampling_speed_f64 = sampling_speed as f64;
-            let delay_seconds = delay as f64 / sampling_speed_f64;
-            let frequency_step_hz = sampling_speed_f64 / fft_point as f64;
-            let reference_frequency = self.header.observing_frequency;
-            let use_wideband_rate =
-                reference_frequency.is_finite() && reference_frequency.abs() > f64::EPSILON;
-            let rate_f64 = rate as f64;
-            let mut sum_re = 0.0f64;
-            let mut sum_im = 0.0f64;
-
-            for (row_index, row) in self
-                .complex_vec
-                .chunks_exact(channel_count)
-                .take(row_count)
-                .enumerate()
-            {
-                let cycles =
-                    rate_f64 * self.phase_times[row_index] + self.static_phase_cycles[row_index];
-                let row_angle = -2.0 * PI * cycles;
-                let (row_re, row_im) = (row_angle.cos(), row_angle.sin());
-                let time_varying_delay = if use_wideband_rate {
-                    cycles / reference_frequency
-                } else {
-                    0.0
-                };
-                let step_angle =
-                    -2.0 * PI * (delay_seconds + time_varying_delay) * frequency_step_hz;
-                let (step_re, step_im) = (step_angle.cos(), step_angle.sin());
-                let mut channel_re = step_re;
-                let mut channel_im = step_im;
-
-                for channel in 1..channel_count {
-                    if self.rfi_mask[channel] {
-                        let next_re = channel_re * step_re - channel_im * step_im;
-                        let next_im = channel_re * step_im + channel_im * step_re;
-                        channel_re = next_re;
-                        channel_im = next_im;
-                        continue;
-                    }
-
-                    let mut sample = row[channel];
-                    if let Some(gains) = &self.bandpass_gains {
-                        sample *= gains[channel];
-                    }
-                    let sample_re = sample.re as f64 * row_re - sample.im as f64 * row_im;
-                    let sample_im = sample.re as f64 * row_im + sample.im as f64 * row_re;
-                    sum_re += sample_re * channel_re - sample_im * channel_im;
-                    sum_im += sample_re * channel_im + sample_im * channel_re;
-
-                    let next_re = channel_re * step_re - channel_im * step_im;
-                    let next_im = channel_re * step_im + channel_im * step_re;
-                    channel_re = next_re;
-                    channel_im = next_im;
-                }
-            }
-            (sum_re, sum_im)
-        }
-
-        fn coherent_sum_scale(&self) -> f64 {
-            let bandwidth_mhz = self.header.sampling_speed as f64 / 2.0e6;
-            let power_scale = if bandwidth_mhz > 0.0 {
-                512.0 / bandwidth_mhz
-            } else {
-                1.0
+                self.args.primary_search_mode()
             };
-            power_scale / self.physical_length.max(1) as f64
+            let result = analyze_results(
+                &frequencies,
+                &delays,
+                self.header,
+                self.current_length,
+                self.effective_integ_time,
+                self.current_obs_time,
+                padding_length,
+                self.args,
+                mode,
+            );
+            (result.residual_delay, result.residual_rate)
+        }
+
+        fn channel_rf_increment(&self) -> f64 {
+            let reference = self.header.observing_frequency;
+            if reference.is_finite() && reference.abs() > f64::EPSILON {
+                self.header.sampling_speed as f64 / self.effective_fft_point as f64 / reference
+            } else {
+                0.0
+            }
+        }
+
+        // First retained channel (k=1) and phase increment to the next channel.
+        fn row_rotation(
+            &self,
+            row: usize,
+            delay: f64,
+            rate: f64,
+            rf_increment: f64,
+        ) -> (Complex<f64>, Complex<f64>) {
+            let cycles = rate * self.phase_times[row] + self.static_phase_cycles[row];
+            let slope = delay / self.effective_fft_point as f64 + cycles * rf_increment;
+            let step = Complex::from_polar(1.0, -2.0 * PI * slope);
+            let origin = cycles + self.args.channel_origin_bins * slope;
+            (Complex::from_polar(1.0, -2.0 * PI * origin) * step, step)
         }
 
         fn coherent_spectrum_at_rate(&self, rate: f32, spectrum: &mut [Complex<f64>]) {
             spectrum.fill(Complex::new(0.0, 0.0));
             let channel_count = spectrum.len();
-            let frequency_step =
-                self.header.sampling_speed as f64 / self.effective_fft_point as f64;
-            let reference_frequency = self.header.observing_frequency;
-            let wideband =
-                reference_frequency.is_finite() && reference_frequency.abs() > f64::EPSILON;
+            let rf_increment = self.channel_rf_increment();
             for (row_index, row) in self
                 .complex_vec
                 .chunks_exact(channel_count)
                 .take(self.phase_times.len())
                 .enumerate()
             {
-                let cycles =
-                    rate as f64 * self.phase_times[row_index] + self.static_phase_cycles[row_index];
-                let angle = -2.0 * PI * cycles;
-                let row_factor = Complex::new(angle.cos(), angle.sin());
-                let drift = if wideband {
-                    cycles / reference_frequency
-                } else {
-                    0.0
-                };
-                let step_angle = -2.0 * PI * drift * frequency_step;
-                let step = Complex::new(step_angle.cos(), step_angle.sin());
-                let mut channel_factor = step;
-                for channel in 1..channel_count {
-                    if !self.rfi_mask[channel] {
-                        let mut sample = row[channel];
-                        if let Some(gains) = &self.bandpass_gains {
-                            sample *= gains[channel];
-                        }
-                        spectrum[channel] += Complex::new(sample.re as f64, sample.im as f64)
-                            * row_factor
-                            * channel_factor;
-                    }
-                    channel_factor *= step;
+                let (first_phase, step) =
+                    self.row_rotation(row_index, 0.0, rate.into(), rf_increment);
+                add_rotated_channels(&mut spectrum[1..], &row[1..], first_phase, step);
+            }
+
+            // Both the channel flags and bandpass gains are constant in time.
+            if let Some(gains) = &self.bandpass_gains {
+                for (sum, gain) in spectrum.iter_mut().zip(gains) {
+                    *sum *= *gain;
+                }
+            }
+            for (sum, &masked) in spectrum.iter_mut().zip(&self.rfi_mask) {
+                if masked {
+                    *sum = Complex::default();
                 }
             }
         }
 
-        fn evaluate_spectrum_snr(&self, spectrum: &[Complex<f64>], delay: f32, rate: f32) -> f32 {
-            if self.candidate_is_masked(delay, rate) {
-                return 0.0;
-            }
+        fn spectrum_power(&self, spectrum: &[Complex<f64>], delay: f32) -> f64 {
             let angle = -2.0 * PI * delay as f64 / self.effective_fft_point as f64;
-            let step = Complex::new(angle.cos(), angle.sin());
+            let step = Complex::from_polar(1.0, angle);
             let mut factor = step;
-            let mut sum = Complex::<f64>::new(0.0, 0.0);
+            let mut sum = Complex::<f64>::default();
             for &sample in spectrum.iter().skip(1) {
                 sum += sample * factor;
                 factor *= step;
             }
-            (sum.re.hypot(sum.im) * self.coherent_sum_scale()) as f32
-        }
-
-        fn evaluate_coherent_amplitude(&self, delay: f32, rate: f32) -> f32 {
-            let (sum_re, sum_im) = self.evaluate_coherent_sum(delay, rate);
-            (sum_re.hypot(sum_im) * self.coherent_sum_scale()) as f32
+            // All candidates share the same amplitude normalization. Compare
+            // squared magnitudes before rounding the final reported result.
+            sum.norm_sqr()
         }
 
         fn candidate_is_masked(&self, delay: f32, rate: f32) -> bool {
@@ -1206,29 +1028,137 @@ mod deep {
                         .is_some_and(|mask| mask.contains_delay_rate(delay, rate)))
         }
 
-        fn evaluate_candidate_snr(&self, delay: f32, rate: f32) -> f32 {
-            if self.candidate_is_masked(delay, rate) {
-                return 0.0;
-            }
-            // Evaluate it directly from the visibility rows so candidate scans
-            // do not allocate a padded frequency-rate plane per worker.
-            self.evaluate_coherent_amplitude(delay, rate)
+        fn best_on_grid(
+            &self,
+            delays: &[f32],
+            rates: &[f32],
+            pool: &rayon::ThreadPool,
+        ) -> Option<(f32, f32)> {
+            let delay_bounds = window_bounds(&self.args.drange);
+            let rate_bounds = rate_search_bounds(self.effective_integ_time, &self.args.rrange);
+            let channel_count = self.effective_fft_point as usize / 2;
+            pool.install(|| {
+                rates
+                    .par_iter()
+                    .enumerate()
+                    .filter(|(_, rate)| in_window(**rate, Some(rate_bounds)))
+                    .map_init(
+                        || vec![Complex::<f64>::default(); channel_count],
+                        |spectrum, (r, &rate)| {
+                            self.coherent_spectrum_at_rate(rate, spectrum);
+                            delays
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, delay)| {
+                                    in_window(**delay, delay_bounds)
+                                        && !self.candidate_is_masked(**delay, rate)
+                                })
+                                .filter_map(|(d, &delay)| {
+                                    let power = self.spectrum_power(spectrum, delay);
+                                    power.is_finite().then_some((d, r, power))
+                                })
+                                .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.cmp(&a.0)))
+                        },
+                    )
+                    .flatten_iter()
+                    .max_by(|a, b| {
+                        a.2.total_cmp(&b.2)
+                            .then_with(|| b.0.cmp(&a.0))
+                            .then_with(|| a.1.cmp(&b.1))
+                    })
+                    .map(|(d, r, _)| (delays[d], rates[r]))
+            })
         }
 
-        fn final_analysis(
+        fn refine_peak(
             &self,
-            final_delay: f32,
-            final_rate: f32,
-            _algorithm: DeepSearchAlgorithm,
-            _coarse_analysis: Option<&AnalysisResults>,
-        ) -> Result<DeepAnalysis, Box<dyn Error>> {
+            algorithm: DeepSearchAlgorithm,
+            cpu_count: u32,
+        ) -> Result<(f32, f32), Box<dyn Error>> {
+            let (mut delay, mut rate) = self.coarse_estimates(algorithm);
+            for (seed, window) in [
+                (&mut delay, &self.args.drange),
+                (&mut rate, &self.args.rrange),
+            ] {
+                if let Some((low, high)) = window_bounds(window) {
+                    if !(low..=high).contains(seed) {
+                        *seed = low.midpoint(high);
+                    }
+                }
+            }
+            if self.physical_length <= 1 {
+                rate = 0.0;
+            }
+            let seed = (delay, rate);
+            let params = DeepSearchParams {
+                max_iterations: self.args.iter.max(1) as usize,
+                ..DeepSearchParams::default()
+            };
+            let duration =
+                self.physical_length.max(1) as f32 * self.effective_integ_time.abs().max(1.0e-9);
+            let rate_range = 10.0 * params.rate_search_range_factor / (2.0 * duration);
+            let delay_range = delay_search_range_for_rate(
+                rate,
+                duration,
+                self.header.sampling_speed,
+                self.header.observing_frequency,
+                rate_range,
+                params.delay_search_range,
+            );
+            let pool = search_pool(determine_effective_cpu_count(cpu_count))?;
+            let rate_grid = |center, range, step| {
+                if self.physical_length <= 1 {
+                    vec![0.0]
+                } else {
+                    generate_search_points(center, range, step)
+                }
+            };
+            let mut best = None;
+            let mut delay_step = params.delay_fine_step;
+            let mut rate_step = params.rate_fine_step_factor / (10.0 * duration);
+            for iteration in 0..params.max_iterations {
+                let (delay, rate) = best.unwrap_or(seed);
+                let scale = 10.0_f32.powi(iteration as i32);
+                delay_step = params.delay_fine_step / scale;
+                rate_step = params.rate_fine_step_factor / (10.0 * duration) / scale;
+                let delays = generate_search_points(delay, delay_range / scale, delay_step);
+                let rates = rate_grid(rate, rate_range / scale, rate_step);
+                if best.is_some() && delays.as_slice() == [delay] && rates.as_slice() == [rate] {
+                    break;
+                }
+                let candidate = if iteration == 0 || algorithm == DeepSearchAlgorithm::FullGrid {
+                    self.best_on_grid(&delays, &rates, &pool)
+                } else {
+                    let along_rate = self.best_on_grid(&[delay], &rates, &pool);
+                    let best_rate = along_rate.map_or(rate, |(_, rate)| rate);
+                    self.best_on_grid(&delays, &[best_rate], &pool)
+                        .or(along_rate)
+                };
+                best = candidate.or(best);
+            }
+
+            if algorithm != DeepSearchAlgorithm::FullGrid {
+                let (delay, rate) = best.unwrap_or(seed);
+                let delays = generate_search_points(delay, delay_step, delay_step);
+                let rates = rate_grid(rate, rate_step, rate_step);
+                best = self.best_on_grid(&delays, &rates, &pool).or(best);
+            }
+            best.ok_or_else(|| {
+                "no finite, unmasked fringe candidate in the requested search windows".into()
+            })
+        }
+
+        fn final_analysis(&self, final_delay: f64, final_rate: f64) -> DeepSearchResult {
             // Always evaluate the final candidate on the fully corrected FFT plane.
             // The reported noise/SNR must describe the same corrected data whether or
             // not diagnostic plots were requested. The former no-plot shortcut reused
             // the coarse streaming noise estimate and made `--plot` change SNR.
             let (mut final_freq_rate_array, padding_length) =
                 self.fft_for_correction(final_delay, final_rate);
-            let mut final_args = create_corrected_args(self.args, final_delay, final_rate);
+            let mut final_args = self.args.clone();
+            final_args.delay_correct = final_delay as f32;
+            final_args.rate_correct = final_rate as f32;
+            final_args.search.clear();
             // The final candidate has already applied the full correction. Measure
             // amplitude and phase at residual delay=rate=0, independent of the
             // absolute search windows or masks used to select the candidate.
@@ -1236,7 +1166,7 @@ mod deep {
             final_args.rrange.clear();
             final_args.mask.clear();
 
-            let pre_bandpass_analysis_results = if self.args.plot && self.bandpass_data.is_some() {
+            let pre_bandpass_analysis_results = if self.args.plot && self.bandpass_gains.is_some() {
                 let pre_bandpass_delay_rate_2d_data_comp = self.delay_plane_for_analysis(
                     &final_freq_rate_array,
                     padding_length,
@@ -1272,23 +1202,21 @@ mod deep {
                 None,
             );
 
-            analysis_results.residual_delay = final_delay;
+            analysis_results.residual_delay = final_delay as f32;
             analysis_results.residual_rate = if self.physical_length <= 1 {
                 0.0
             } else {
-                final_rate
+                final_rate as f32
             };
             analysis_results.length_f32 = self.physical_length as f32 * self.effective_integ_time;
 
-            Ok((
+            DeepSearchResult {
                 analysis_results,
-                (self.args.frequency
-                    || self.args.contamination.is_some()
-                    || crate::rfi::has_histogram_mode(&self.args.rfi))
-                .then_some(final_freq_rate_array),
-                final_delay_rate_2d_data_comp,
+                freq_rate_array: (self.args.frequency || has_histogram_mode(&self.args.rfi))
+                    .then_some(final_freq_rate_array),
+                delay_rate_2d_data: final_delay_rate_2d_data_comp,
                 pre_bandpass_analysis_results,
-            ))
+            }
         }
     }
 
@@ -1431,75 +1359,6 @@ mod deep {
         )
     }
 
-    pub fn run_coherent_search(
-        complex_vec: &[C32],
-        header: &CorHeader,
-        current_length: i32,
-        physical_length: i32,
-        effective_integ_time: f32,
-        current_obs_time: &DateTime<Utc>,
-        obs_time: &DateTime<Utc>,
-        rfi_ranges: &[(usize, usize)],
-        bandpass_data: &Option<Vec<C32>>,
-        args: &Args,
-        pp: i32,
-        cpu_count_arg: u32,
-        previous_solution: Option<(f32, f32)>,
-    ) -> Result<DeepSearchResult, Box<dyn Error>> {
-        run_deep_search_impl(
-            complex_vec,
-            header,
-            current_length,
-            physical_length,
-            effective_integ_time,
-            current_obs_time,
-            obs_time,
-            rfi_ranges,
-            bandpass_data,
-            args,
-            pp,
-            cpu_count_arg,
-            previous_solution,
-            DeepSearchAlgorithm::Coherent,
-            None,
-        )
-    }
-
-    pub fn run_coherent_search_with_phase_times(
-        complex_vec: &[C32],
-        header: &CorHeader,
-        current_length: i32,
-        physical_length: i32,
-        effective_integ_time: f32,
-        current_obs_time: &DateTime<Utc>,
-        obs_time: &DateTime<Utc>,
-        rfi_ranges: &[(usize, usize)],
-        bandpass_data: &Option<Vec<C32>>,
-        args: &Args,
-        pp: i32,
-        cpu_count_arg: u32,
-        previous_solution: Option<(f32, f32)>,
-        phase_times: &[f64],
-    ) -> Result<DeepSearchResult, Box<dyn Error>> {
-        run_deep_search_impl(
-            complex_vec,
-            header,
-            current_length,
-            physical_length,
-            effective_integ_time,
-            current_obs_time,
-            obs_time,
-            rfi_ranges,
-            bandpass_data,
-            args,
-            pp,
-            cpu_count_arg,
-            previous_solution,
-            DeepSearchAlgorithm::Coherent,
-            Some(phase_times),
-        )
-    }
-
     // Deprecated internal compatibility path.
     // Keep this around for a while as a comparison target, but the public
     // --search peak mode now uses the same AxisThenLocal + final local polish
@@ -1556,19 +1415,12 @@ mod deep {
         algorithm: DeepSearchAlgorithm,
         recorded_phase_times: Option<&[f64]>,
     ) -> Result<DeepSearchResult, Box<dyn Error>> {
-        /*
-        println!(
-            "[{}] Starting {} hierarchical search algorithm",
-            algorithm.log_name(),
-            algorithm.mode_name()
-        );
-        */
-
-        // Use the first sample of each analyzed segment as the phase reference
-        // for residual rate correction. When provided, recorded sector times
-        // preserve timestamp gaps; legacy callers use a uniform row grid.
-        let start_time_offset_sec = 0.0;
-
+        // Recorded offsets preserve gaps. Residual phase is referenced to
+        // the first physical sample of the analyzed segment.
+        let measure_group_delay = args.primary_search_mode() == Some("group-delay");
+        if measure_group_delay && args.frequency {
+            return Err("group delay requires full-band delay-rate analysis".into());
+        }
         if current_length <= 0 {
             return Err("有効なセクター長が 0 以下です".into());
         }
@@ -1604,9 +1456,9 @@ mod deep {
         }
         let bandpass_gains = bandpass_data
             .as_deref()
-            .and_then(|data| build_bandpass_gains(fft_point_half, data));
+            .map(|data| bandpass_gains(data).take(fft_point_half).collect());
         let phase_row_count = rows.min(physical_length.max(0) as usize);
-        let phase_times: Vec<f64> = if let Some(times) = recorded_phase_times {
+        let phase_times: Cow<'_, [f64]> = if let Some(times) = recorded_phase_times {
             if times.len() != phase_row_count {
                 return Err(format!(
                     "記録時刻数 ({}) と解析行数 ({}) が一致しません",
@@ -1616,13 +1468,17 @@ mod deep {
                 .into());
             }
             let phase_epoch = times.first().copied().unwrap_or(0.0);
-            times.iter().map(|time| *time - phase_epoch).collect()
+            if phase_epoch == 0.0 {
+                Cow::Borrowed(times)
+            } else {
+                Cow::Owned(times.iter().map(|time| *time - phase_epoch).collect())
+            }
         } else {
-            (0..phase_row_count)
-                .map(|row_idx| {
-                    row_idx as f64 * effective_integ_time as f64 + start_time_offset_sec as f64
-                })
-                .collect()
+            Cow::Owned(
+                (0..phase_row_count)
+                    .map(|row_idx| row_idx as f64 * effective_integ_time as f64)
+                    .collect(),
+            )
         };
         let static_phase_cycles: Vec<f64> = phase_times
             .iter()
@@ -1641,233 +1497,56 @@ mod deep {
             effective_integ_time,
             current_obs_time,
             rfi_ranges,
-            bandpass_data,
             args,
             effective_fft_point,
             rfi_mask,
             bandpass_gains,
-            phase_times,
+            phase_times: &phase_times,
             static_phase_cycles,
         };
 
-        let is_autocorrelation = is_autocorrelation_header(header);
-
-        // Step 1: Reacquire a coarse solution for every segment. A previous
-        // segment is not a safe sole seed when acceleration or atmospheric
-        // fluctuations move the fringe by more than the fine-search window.
-        //
-        // For auto-correlation the physical delay and fringe rate are exactly
-        // zero. Optimizing the delay/rate plane can otherwise fit tiny spectral
-        // amplitude asymmetries or numerical interpolation noise and report a
-        // non-physical offset. Keep the search path active, but make its
-        // candidate solution the exact auto-correlation solution.
-        let (coarse_delay, coarse_rate, coarse_analysis) = if is_autocorrelation {
-            (0.0, 0.0, None)
+        // Auto-correlations have exactly zero physical delay and fringe rate.
+        // Cross-correlations reacquire a coarse peak for each segment.
+        let autocorrelation = is_autocorrelation_header(header);
+        let (delay, rate) = if autocorrelation {
+            (0.0, 0.0)
         } else {
-            let (delay, rate, analysis) = context.coarse_estimates(algorithm)?;
-            (delay, rate, Some(analysis))
+            context.refine_peak(algorithm, cpu_count_arg)?
         };
-
-        /*
-        println!(
-            "[{}] Coarse estimates - Delay: {:.6} samples, Rate: {:.6} Hz",
-            algorithm.log_name(),
-            coarse_delay,
-            coarse_rate
-        );
-        */
-
-        // Step 2: 階層的探索
-        let search_params = DeepSearchParams {
-            max_iterations: args.iter.max(1) as usize,
-            ..DeepSearchParams::default()
+        let group_delay = if measure_group_delay {
+            let fit = if autocorrelation {
+                Err("autocorrelation")
+            } else {
+                context.fit_group_delay(delay.into(), rate.into())
+            };
+            Some(fit)
+        } else {
+            None
         };
-        let mut current_delay = coarse_delay;
-        let mut current_rate = coarse_rate;
-        let rate_denominator =
-            physical_length.max(1) as f32 * effective_integ_time.abs().max(1.0e-9);
-        // The wideband rate correction produces a delay drift across the
-        // sampled band. Size the initial delay basin from that physical drift.
-        let initial_rate_range =
-            10.0 * search_params.rate_search_range_factor / (2.0 * rate_denominator);
-        let search_duration_sec =
-            physical_length.max(1) as f32 * effective_integ_time.abs().max(1.0e-9);
-        let dynamic_delay_range = delay_search_range_for_rate(
-            coarse_rate,
-            search_duration_sec,
-            header.sampling_speed,
-            header.observing_frequency,
-            initial_rate_range,
-            search_params.delay_search_range,
-        );
-        let effective_cpu_count = determine_effective_cpu_count(cpu_count_arg);
-        let pool = search_pool(effective_cpu_count)?;
-
-        if !is_autocorrelation {
-            for iteration in 0..search_params.max_iterations {
-                /*
-                println!(
-                    "[{}] Iteration {} starting",
-                    algorithm.log_name(),
-                    iteration + 1
-                );
-                */
-
-                // 現在の階層での探索範囲とステップサイズを計算
-                let scale_factor = 10.0_f32.powi(iteration as i32);
-                let delay_range = dynamic_delay_range / scale_factor;
-                let rate_range = initial_rate_range / scale_factor;
-                let delay_step = search_params.delay_fine_step / scale_factor;
-                let rate_step =
-                    search_params.rate_fine_step_factor / (10.0 * rate_denominator) / scale_factor;
-
-                /*
-                println!(
-                    "[{}]   Delay range: +/- {:.6} samples, step: {:.6}",
-                    algorithm.log_name(),
-                    delay_range,
-                    delay_step
-                );
-                println!(
-                    "[{}]   Rate range: +/- {:.6} Hz, step: {:.6}",
-                    algorithm.log_name(),
-                    rate_range,
-                    rate_step
-                );
-                */
-
-                let (best_delay, best_rate, best_snr) = if iteration == 0 {
-                    // The first pass must evaluate delay and rate together;
-                    // axis-only refinement can miss a coupled maximum.
-                    parallel_grid_search(
-                        &context,
-                        current_delay,
-                        current_rate,
-                        delay_range,
-                        rate_range,
-                        delay_step,
-                        rate_step,
-                        &pool,
-                    )?
-                } else {
-                    match algorithm {
-                        DeepSearchAlgorithm::FullGrid => parallel_grid_search(
-                            &context,
-                            current_delay,
-                            current_rate,
-                            delay_range,
-                            rate_range,
-                            delay_step,
-                            rate_step,
-                            &pool,
-                        )?,
-                        DeepSearchAlgorithm::AxisThenLocal
-                        | DeepSearchAlgorithm::PeakPolish
-                        | DeepSearchAlgorithm::Coherent => parallel_axis_search(
-                            &context,
-                            current_delay,
-                            current_rate,
-                            delay_range,
-                            rate_range,
-                            delay_step,
-                            rate_step,
-                            &pool,
-                        )?,
-                    }
-                };
-
-                // 結果を更新
-                current_delay = best_delay;
-                current_rate = best_rate;
-
-                let _ = best_snr;
-                /*
-                println!(
-                    "[{}]   Best result: delay={:.6} samples, rate={:.6} Hz, SNR={:.3}",
-                    algorithm.log_name(),
-                    current_delay,
-                    current_rate,
-                    best_snr
-                );
-                */
-            }
-        }
-
-        if !is_autocorrelation
-            && matches!(
-                algorithm,
-                DeepSearchAlgorithm::AxisThenLocal
-                    | DeepSearchAlgorithm::PeakPolish
-                    | DeepSearchAlgorithm::Coherent
-            )
-        {
-            let final_scale = 10.0_f32.powi(search_params.max_iterations.saturating_sub(1) as i32);
-            let final_delay_step = search_params.delay_fine_step / final_scale;
-            let final_rate_step =
-                search_params.rate_fine_step_factor / (10.0 * rate_denominator) / final_scale;
-            let (best_delay, best_rate, best_snr) = parallel_grid_search(
-                &context,
-                current_delay,
-                current_rate,
-                final_delay_step,
-                final_rate_step,
-                final_delay_step,
-                final_rate_step,
-                &pool,
-            )?;
-            current_delay = best_delay;
-            current_rate = best_rate;
-            let _ = best_snr;
-            /*
-            println!(
-                "[{}]   Final 3x3 local check: delay={:.6} samples, rate={:.6} Hz, SNR={:.3}",
-                algorithm.log_name(),
-                current_delay,
-                current_rate,
-                best_snr
-            );
-            */
-        }
-
-        let final_delay = current_delay;
-        let final_rate = current_rate;
-
-        // Step 3: 最終的な解析を実行
-        /*
-        println!(
-            "[{}] Final result - Delay: {:.6} samples, Rate: {:.6} Hz",
-            algorithm.log_name(),
-            final_delay,
-            final_rate
-        );
-        */
-
-        let (
-            final_analysis_results,
-            final_freq_rate_array,
-            final_delay_rate_2d_data,
-            pre_bandpass_analysis_results,
-        ) = context.final_analysis(final_delay, final_rate, algorithm, coarse_analysis.as_ref())?;
-
-        Ok(DeepSearchResult {
-            analysis_results: final_analysis_results,
-            freq_rate_array: final_freq_rate_array,
-            delay_rate_2d_data: final_delay_rate_2d_data,
-            pre_bandpass_analysis_results,
-        })
+        let (delay, rate) = match &group_delay {
+            Some(Ok(f)) => (f.delay_samples, f.rate_hz),
+            _ => (delay.into(), rate.into()),
+        };
+        let mut output = context.final_analysis(delay, rate);
+        output.analysis_results.group_delay = group_delay;
+        Ok(output)
     }
 
     fn is_autocorrelation_header(header: &CorHeader) -> bool {
         let name1 = header.station1_name.trim();
         let name2 = header.station2_name.trim();
-        if !name1.is_empty() && name1 == name2 {
-            return true;
+        if !name1.is_empty() && !name2.is_empty() {
+            return name1.eq_ignore_ascii_case(name2);
         }
 
-        let code1 = header.station1_code.trim();
-        let code2 = header.station2_code.trim();
-        if !code1.is_empty() && code1 == code2 {
-            return true;
+        let code1 = header
+            .station1_code
+            .trim_matches(|c: char| c == '\0' || c.is_whitespace());
+        let code2 = header
+            .station2_code
+            .trim_matches(|c: char| c == '\0' || c.is_whitespace());
+        if !code1.is_empty() && !code2.is_empty() {
+            return code1.eq_ignore_ascii_case(code2);
         }
 
         header
@@ -1934,244 +1613,22 @@ mod deep {
         range
     }
 
-    /// 並列グリッド探索
-    fn parallel_grid_search(
-        context: &DeepSearchContext<'_>,
-        center_delay: f32,
-        center_rate: f32,
-        delay_range: f32,
-        rate_range: f32,
-        delay_step: f32,
-        rate_step: f32,
-        pool: &rayon::ThreadPool,
-    ) -> Result<(f32, f32, f32), Box<dyn Error>> {
-        // 探索グリッドを生成
-        let delay_points = generate_search_points(center_delay, delay_range, delay_step);
-        let rate_points = generate_search_points(center_rate, rate_range, rate_step);
-
-        /*
-        println!(
-            "[{}]   Grid: {} delay x {} rate = {} combinations",
-            context.args.primary_search_mode().unwrap_or("DEEP SEARCH"),
-            delay_points.len(),
-            rate_points.len(),
-            delay_points.len() * rate_points.len()
-        );
-        */
-
-        let delay_bounds = if context.args.drange.len() == 2 {
-            Some((
-                context.args.drange[0].min(context.args.drange[1]),
-                context.args.drange[0].max(context.args.drange[1]),
-            ))
-        } else {
-            None
-        };
-        let rate_bounds = rate_search_bounds(context.effective_integ_time, &context.args.rrange);
-
-        // For each rate, sum the time rows once into a channel-sized workspace.
-        // All delays then reuse it; no delay-rate plane is retained per worker.
-        let final_result = pool.install(|| {
-            rate_points
-                .par_iter()
-                .enumerate()
-                .map_init(
-                    || {
-                        vec![
-                            Complex::<f64>::new(0.0, 0.0);
-                            context.effective_fft_point as usize / 2
-                        ]
-                    },
-                    |spectrum, (rate_index, &rate)| {
-                        if rate < rate_bounds.0 || rate > rate_bounds.1 {
-                            return None;
-                        }
-                        context.coherent_spectrum_at_rate(rate, spectrum);
-                        delay_points
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(delay_index, &delay)| {
-                                if delay_bounds
-                                    .is_some_and(|(low, high)| delay < low || delay > high)
-                                {
-                                    return None;
-                                }
-                                Some((
-                                    delay_index,
-                                    rate_index,
-                                    delay,
-                                    rate,
-                                    context.evaluate_spectrum_snr(spectrum, delay, rate),
-                                ))
-                            })
-                            .max_by(|a, b| a.4.total_cmp(&b.4).then_with(|| b.0.cmp(&a.0)))
-                    },
-                )
-                .filter_map(|candidate| candidate)
-                .max_by(|a, b| {
-                    a.4.total_cmp(&b.4)
-                        .then_with(|| b.0.cmp(&a.0))
-                        .then_with(|| a.1.cmp(&b.1))
-                })
-                .map(|(_, _, delay, rate, amplitude)| (delay, rate, amplitude))
-                .unwrap_or((center_delay, center_rate, 0.0f32))
-        });
-
-        Ok(final_result)
-    }
-
-    fn parallel_axis_search(
-        context: &DeepSearchContext<'_>,
-        center_delay: f32,
-        center_rate: f32,
-        delay_range: f32,
-        rate_range: f32,
-        delay_step: f32,
-        rate_step: f32,
-        pool: &rayon::ThreadPool,
-    ) -> Result<(f32, f32, f32), Box<dyn Error>> {
-        let rate_points = generate_search_points(center_rate, rate_range, rate_step);
-        /*
-        println!(
-            "[DEEP2 SEARCH]   Axis grid: {} rate + delay axis",
-            rate_points.len()
-        );
-        */
-
-        let rate_bounds = rate_search_bounds(context.effective_integ_time, &context.args.rrange);
-
-        let best_rate_result = pool.install(|| {
-            rate_points
-                .par_iter()
-                .filter_map(|&rate| {
-                    if rate < rate_bounds.0 || rate > rate_bounds.1 {
-                        return None;
-                    }
-                    Some((
-                        center_delay,
-                        rate,
-                        context.evaluate_candidate_snr(center_delay, rate),
-                    ))
-                })
-                .reduce_with(|best, candidate| {
-                    if candidate.2 > best.2 {
-                        candidate
-                    } else {
-                        best
-                    }
-                })
-                .unwrap_or((center_delay, center_rate, 0.0f32))
-        });
-
-        let delay_points = generate_search_points(center_delay, delay_range, delay_step);
-        /*
-        println!(
-            "[DEEP2 SEARCH]   Axis grid: {} delay at rate={:.6}",
-            delay_points.len(),
-            best_rate_result.1
-        );
-        */
-
-        let delay_bounds = if context.args.drange.len() == 2 {
-            Some((
-                context.args.drange[0].min(context.args.drange[1]),
-                context.args.drange[0].max(context.args.drange[1]),
-            ))
-        } else {
-            None
-        };
-
-        let mut spectrum =
-            vec![Complex::<f64>::new(0.0, 0.0); context.effective_fft_point as usize / 2];
-        context.coherent_spectrum_at_rate(best_rate_result.1, &mut spectrum);
-        let best_delay_result = pool.install(|| {
-            delay_points
-                .par_iter()
-                .filter_map(|&delay| {
-                    if let Some((low, high)) = delay_bounds {
-                        if delay < low || delay > high {
-                            return None;
-                        }
-                    }
-                    Some((
-                        delay,
-                        best_rate_result.1,
-                        context.evaluate_spectrum_snr(&spectrum, delay, best_rate_result.1),
-                    ))
-                })
-                .reduce_with(|best, candidate| {
-                    if candidate.2 > best.2 {
-                        candidate
-                    } else {
-                        best
-                    }
-                })
-                .unwrap_or(best_rate_result)
-        });
-
-        Ok(best_delay_result)
-    }
-
-    /// 探索点を生成
+    /// Symmetric trial grid including the center. Cap the grid before
+    /// allocation even when a large delay drift spans many nominal steps.
     fn generate_search_points(center: f32, range: f32, step: f32) -> Vec<f32> {
-        // Use f64 for precision-critical calculations to avoid floating point errors
-        // with very small steps, which can cause inconsistent point counts or infinite loops.
-        let center64 = center as f64;
-        let range64 = range as f64;
-        let step64 = step as f64;
-
-        // Invalid or non-positive steps used to make the loop below run
-        // forever. A zero-width fallback is deterministic and safe.
-        if !center64.is_finite()
-            || !range64.is_finite()
-            || range64 < 0.0
-            || !step64.is_finite()
-            || step64 <= 0.0
-        {
-            return center64.is_finite().then_some(center).into_iter().collect();
+        if !center.is_finite() {
+            return Vec::new();
         }
-
-        let start = center64 - range64;
-        let end = center64 + range64;
-
-        let mut points = Vec::new();
-        let mut current = start;
-        // Add a small tolerance to the end condition to handle floating point inaccuracies
-        while current <= end + step64 * 0.5 {
-            points.push(current as f32);
-            current += step64;
+        if !range.is_finite() || range <= 0.0 || !step.is_finite() || step <= 0.0 {
+            return vec![center];
         }
-
-        // Keep a symmetric 11-point grid so the center and both bounds are
-        // represented even when the physical search range is wide.
-        if points.len() > 11 {
-            let start = points.first().copied().unwrap_or(center);
-            let end = points.last().copied().unwrap_or(center);
-            points = (0..11)
-                .map(|index| start + (end - start) * index as f32 / 10.0)
-                .collect();
-        }
-
+        let range = f64::from(range);
+        let half_steps = (range / f64::from(step)).round().clamp(1.0, 5.0) as i32;
+        let mut points: Vec<_> = (-half_steps..=half_steps)
+            .map(|i| (f64::from(center) + range * f64::from(i) / f64::from(half_steps)) as f32)
+            .collect();
+        points.dedup();
         points
-    }
-
-    /// 補正された引数を作成
-    fn create_corrected_args(args: &Args, delay: f32, rate: f32) -> Args {
-        let mut corrected_args = args.clone();
-        corrected_args.delay_correct = delay;
-        corrected_args.rate_correct = rate;
-        // Keep window semantics in absolute coordinates by converting
-        // to residual windows for already-corrected data.
-        if corrected_args.drange.len() == 2 {
-            corrected_args.drange[0] -= delay;
-            corrected_args.drange[1] -= delay;
-        }
-        if corrected_args.rrange.len() == 2 {
-            corrected_args.rrange[0] -= rate;
-            corrected_args.rrange[1] -= rate;
-        }
-        corrected_args.search.clear(); // Prevent infinite loops
-        corrected_args
     }
 
     #[cfg(test)]

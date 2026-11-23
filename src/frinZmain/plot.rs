@@ -1912,7 +1912,7 @@ pub fn phase_reference_plot(
         .x_label_area_size(60)
         .y_label_area_size(100)
         .build_cartesian_2d(
-            x_min.timestamp() as f32..x_max.timestamp() as f32,
+            x_min.timestamp_millis() as f64 / 1000.0..x_max.timestamp_millis() as f64 / 1000.0,
             (y_min - y_range_padding)..(y_max + y_range_padding),
         )?;
 
@@ -1941,7 +1941,7 @@ pub fn phase_reference_plot(
             cal_times
                 .iter()
                 .zip(original_cal_phases.iter())
-                .map(|(x, y)| (x.timestamp() as f32, *y)),
+                .map(|(x, y)| (x.timestamp_millis() as f64 / 1000.0, *y)),
             5,
             &RED,
             &|c, s, st| Circle::new(c, s, st.filled()),
@@ -1956,7 +1956,7 @@ pub fn phase_reference_plot(
                 cal_times
                     .iter()
                     .zip(fitted_cal_phases.iter())
-                    .map(|(x, y)| (x.timestamp() as f32, *y)),
+                    .map(|(x, y)| (x.timestamp_millis() as f64 / 1000.0, *y)),
                 &BLUE,
             ))?
             .label("Calibrator (Fitted)")
@@ -1969,7 +1969,7 @@ pub fn phase_reference_plot(
             target_times
                 .iter()
                 .zip(original_target_phases.iter())
-                .map(|(x, y)| (x.timestamp() as f32, *y)),
+                .map(|(x, y)| (x.timestamp_millis() as f64 / 1000.0, *y)),
             5,
             &GREEN,
             &|c, s, st| Circle::new(c, s, st.filled()),
@@ -1983,7 +1983,7 @@ pub fn phase_reference_plot(
             target_times
                 .iter()
                 .zip(residual_target_phases.iter())
-                .map(|(x, y)| (x.timestamp() as f32, *y)),
+                .map(|(x, y)| (x.timestamp_millis() as f64 / 1000.0, *y)),
             5,
             &BLACK,
             &|c, s, st| Circle::new(c, s, st.filled()),
@@ -3482,10 +3482,45 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
     center_frequency_hz: f64,
     uv_mode: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = BitMapBackend::new(output_path.as_ref(), (1500, 600)).into_drawing_area();
+    const SIZE: (u32, u32) = (1500, 600);
+    let mut pixels = vec![0; (SIZE.0 * SIZE.1 * 3) as usize];
+    draw_uv_tracks(
+        BitMapBackend::with_buffer(&mut pixels, SIZE).into_drawing_area(),
+        accessible,
+        observed,
+        accessible_baseline,
+        observed_baseline,
+        center_frequency_hz,
+        uv_mode,
+    )?;
+    let output = std::io::BufWriter::new(std::fs::File::create(output_path)?);
+    let mut encoder = png::Encoder::new(output, SIZE.0, SIZE.1);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    // Coverage plots have long solid-color runs. The lossless fast encoder
+    // avoids applying adaptive filters to every scanline.
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_filter(png::FilterType::NoFilter);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&pixels)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn draw_uv_tracks(
+    root: DrawingArea<BitMapBackend<'_>, plotters::coord::Shift>,
+    accessible: &[(f32, f32)],
+    observed: &[(f32, f32)],
+    accessible_baseline: &[(f32, f32)],
+    observed_baseline: &[(f32, f32)],
+    center_frequency_hz: f64,
+    uv_mode: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
     root.fill(&WHITE)?;
 
     let (left_area, right_area) = root.split_horizontally(700);
+    let finite = |&(x, y): &(f32, f32)| x.is_finite() && y.is_finite();
+    let gap = |point: &(f32, f32)| !finite(point);
 
     let max_uv_value = accessible
         .iter()
@@ -3531,67 +3566,52 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
         .draw()?;
 
     let accessible_style = ShapeStyle::from(&BLACK).stroke_width(2);
-    if scaled_accessible.len() >= 2 {
-        for (idx, segment) in scaled_accessible.windows(2).enumerate() {
-            if idx % 2 == 0 {
-                uv_chart.draw_series(std::iter::once(PathElement::new(
-                    vec![segment[0], segment[1]],
-                    accessible_style,
-                )))?;
-            }
-        }
-
-        let mirrored: Vec<(f32, f32)> = scaled_accessible
-            .iter()
-            .rev()
-            .map(|(u, v)| (-*u, -*v))
-            .collect();
-        for (idx, segment) in mirrored.windows(2).enumerate() {
-            if idx % 2 == 0 {
-                uv_chart.draw_series(std::iter::once(PathElement::new(
-                    vec![segment[0], segment[1]],
-                    accessible_style,
-                )))?;
-            }
-        }
+    for segment in scaled_accessible.split(gap) {
+        uv_chart.draw_series(segment.windows(2).step_by(2).flat_map(|pair| {
+            let [(u, v), (u_next, v_next)] = [pair[0], pair[1]];
+            [
+                PathElement::new([(u, v), (u_next, v_next)], accessible_style),
+                PathElement::new([(-u, -v), (-u_next, -v_next)], accessible_style),
+            ]
+        }))?;
     }
 
-    if scaled_observed.len() >= 2 {
-        let observed_style = ShapeStyle::from(&RED).stroke_width(2);
+    let observed_style = ShapeStyle::from(&RED).stroke_width(2);
+    for segment in scaled_observed
+        .split(gap)
+        .filter(|points| points.len() >= 2)
+    {
+        uv_chart.draw_series(LineSeries::new(segment.iter().copied(), observed_style))?;
         uv_chart.draw_series(LineSeries::new(
-            scaled_observed.iter().cloned(),
+            segment.iter().rev().map(|&(u, v)| (-u, -v)),
             observed_style,
         ))?;
-        let mirrored: Vec<(f32, f32)> = scaled_observed
-            .iter()
-            .rev()
-            .map(|(u, v)| (-*u, -*v))
-            .collect();
-        if mirrored.len() >= 2 {
-            uv_chart.draw_series(LineSeries::new(mirrored, observed_style))?;
-        }
     }
 
     if !scaled_accessible.is_empty() {
-        let accessible_points: Vec<(f32, f32)> = scaled_accessible
+        let accessible_points = scaled_accessible
             .iter()
-            .flat_map(|(u, v)| [(*u, *v), (-*u, -*v)])
-            .collect();
+            .filter(|point| finite(point))
+            .flat_map(|&(u, v)| [(u, v), (-u, -v)]);
         uv_chart
             .draw_series(PointSeries::of_element(
-                accessible_points.into_iter(),
+                accessible_points,
                 4,
                 ShapeStyle::from(&BLACK),
                 &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
             ))?
-            .label(format!("EL ≥ 5° (uv_3d={})", uv_mode))
+            .label(format!("EL >= 5° (uv_3d={uv_mode})"))
             .legend(|(x, y)| Circle::new((x, y), 5, ShapeStyle::from(&BLACK)));
     }
 
     if !scaled_observed.is_empty() {
-        let observed_points: Vec<(f32, f32)> = scaled_observed
+        // Many high-cadence samples occupy the same pixel. Draw each marker once.
+        let mut pixels = std::collections::HashSet::new();
+        let observed_points: Vec<_> = scaled_observed
             .iter()
-            .flat_map(|(u, v)| [(*u, *v), (-*u, -*v)])
+            .filter(|point| finite(point))
+            .flat_map(|&(u, v)| [(u, v), (-u, -v)])
+            .filter(|point| pixels.insert(uv_chart.backend_coord(point)))
             .collect();
         let red_style = ShapeStyle::from(&RED).filled();
         uv_chart
@@ -3687,45 +3707,49 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
     baseline_chart
         .configure_secondary_axes()
         .y_desc(spatial_label)
-        .y_label_formatter(&|y| format!("{:.0}", y))
+        .y_label_formatter(&|y| format!("{y:.1}"))
         .draw()?;
 
-    if scaled_accessible_baseline.len() >= 2 {
-        let accessible_line_style = ShapeStyle::from(&BLACK).stroke_width(2);
-        for (idx, segment) in scaled_accessible_baseline.windows(2).enumerate() {
-            if idx % 2 == 0 {
-                baseline_chart.draw_series(std::iter::once(PathElement::new(
-                    vec![segment[0], segment[1]],
-                    accessible_line_style,
-                )))?;
-            }
-        }
+    let accessible_line_style = ShapeStyle::from(&BLACK).stroke_width(2);
+    for segment in scaled_accessible_baseline.split(gap) {
+        baseline_chart.draw_series(
+            segment
+                .windows(2)
+                .step_by(2)
+                .map(|pair| PathElement::new([pair[0], pair[1]], accessible_line_style)),
+        )?;
     }
-    if scaled_observed_baseline.len() >= 2 {
-        let observed_line_style = ShapeStyle::from(&RED).stroke_width(2);
-        baseline_chart.draw_series(LineSeries::new(
-            scaled_observed_baseline.iter().cloned(),
-            observed_line_style,
-        ))?;
+    for segment in scaled_observed_baseline
+        .split(gap)
+        .filter(|points| points.len() >= 2)
+    {
+        baseline_chart.draw_series(LineSeries::new(segment.iter().copied(), observed_style))?;
     }
 
     if !scaled_accessible_baseline.is_empty() {
         baseline_chart
             .draw_series(PointSeries::of_element(
-                scaled_accessible_baseline.iter().cloned(),
+                scaled_accessible_baseline.iter().copied().filter(finite),
                 4,
                 ShapeStyle::from(&BLACK),
                 &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
             ))?
-            .label(format!("EL ≥ 5° (uv_3d={})", uv_mode))
+            .label(format!("EL >= 5° (uv_3d={uv_mode})"))
             .legend(|(x, y)| Circle::new((x, y), 5, ShapeStyle::from(&BLACK)));
     }
 
     if !scaled_observed_baseline.is_empty() {
         let filled_style = ShapeStyle::from(&RED).filled();
+        let mut pixels = std::collections::HashSet::new();
+        let observed_points: Vec<_> = scaled_observed_baseline
+            .iter()
+            .copied()
+            .filter(finite)
+            .filter(|point| pixels.insert(baseline_chart.backend_coord(point)))
+            .collect();
         baseline_chart
             .draw_series(PointSeries::of_element(
-                scaled_observed_baseline.iter().cloned(),
+                observed_points,
                 4,
                 filled_style,
                 &|coord, size, style| EmptyElement::at(coord) + Circle::new((0, 0), size, style),
@@ -3740,7 +3764,6 @@ pub fn plot_uv_tracks<P: AsRef<Path>>(
         .background_style(WHITE.mix(0.8))
         .draw()?;
 
-    root.present()?;
     Ok(())
 }
 

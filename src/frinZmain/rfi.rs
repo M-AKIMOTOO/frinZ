@@ -702,6 +702,19 @@ fn map_delay_index(
     (index >= 0 && (index as usize) < target_count).then_some(index as usize)
 }
 
+pub(crate) fn flagged_channels(
+    channel_count: usize,
+    channel_ranges: &[(usize, usize)],
+) -> Vec<bool> {
+    let mut flagged = vec![false; channel_count];
+    for &(first, last) in channel_ranges {
+        if first < channel_count && first <= last {
+            flagged[first..=last.min(channel_count - 1)].fill(true);
+        }
+    }
+    flagged
+}
+
 pub fn parse_rfi_ranges(rfi_args: &[String], rbw: f32) -> io::Result<Vec<(usize, usize)>> {
     if rfi_args.is_empty() {
         return Ok(vec![]);
@@ -1462,7 +1475,7 @@ pub fn write_histogram_products(
     output_dir: &Path,
     basename: &str,
     result: &HistogramRfiResult,
-) -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir)?;
     let stem = format!("{basename}_hist");
     let png_path = output_dir.join(format!("{stem}.png"));
@@ -1613,6 +1626,8 @@ pub fn write_histogram_products(
         result,
         true,
     )?;
+    let delay_rate_marginal_path = output_dir.join(format!("{basename}_hist_delay_rate.png"));
+    write_histogram_delay_rate_marginals(&delay_rate_marginal_path, result)?;
 
     let mut file = File::create(&tsv_path)?;
     writeln!(file, "# RFI histogram analysis")?;
@@ -1793,7 +1808,7 @@ pub fn write_histogram_products(
         result.frequency_mask.iter().map(|value| *value as u8),
     )?;
     npz.write(&npz_path)?;
-    Ok((png_path, tsv_path, npz_path))
+    Ok((png_path, tsv_path, npz_path, delay_rate_marginal_path))
 }
 
 fn write_histogram_png(
@@ -2075,6 +2090,276 @@ fn write_histogram_heatmap(
     }
     root.present()?;
     drop(chart);
+    drop(root);
+    crate::png_compress::compress_png_with_mode(path, crate::png_compress::CompressQuality::High);
+    Ok(())
+}
+
+/// Write a validation view with the delay-rate plane and amplitude-weighted
+/// delay/rate marginal histograms. Known celestial fringe cells are excluded
+/// from the marginal histograms so they do not dominate the RFI inspection.
+fn write_histogram_delay_rate_marginals(
+    path: &Path,
+    result: &HistogramRfiResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (rows, cols) = result.delay_shape;
+    let total = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || result.delay_amplitudes.len() != total
+        || result.delay_mask.len() != total
+        || result.celestial_mask.len() != total
+    {
+        return Ok(());
+    }
+
+    let x_axis = if result.delay_axis.len() == cols {
+        result.delay_axis.clone()
+    } else {
+        (0..cols).map(|index| index as f64).collect()
+    };
+    let y_axis = if result.rate_axis.len() == rows {
+        result.rate_axis.clone()
+    } else {
+        (0..rows).map(|index| index as f64).collect()
+    };
+    let x_min = x_axis.iter().copied().fold(f64::INFINITY, f64::min);
+    let x_max = x_axis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y_min = y_axis.iter().copied().fold(f64::INFINITY, f64::min);
+    let y_max = y_axis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !x_min.is_finite() || !x_max.is_finite() || !y_min.is_finite() || !y_max.is_finite() {
+        return Ok(());
+    }
+    let x_pad = if (x_max - x_min).abs() > f64::EPSILON {
+        (x_max - x_min).abs() * 0.01
+    } else {
+        0.5
+    };
+    let y_pad = if (y_max - y_min).abs() > f64::EPSILON {
+        (y_max - y_min).abs() * 0.01
+    } else {
+        0.5
+    };
+    let x_range = (x_min - x_pad)..(x_max + x_pad);
+    let y_range = (y_min - y_pad)..(y_max + y_pad);
+
+    // Marginal histograms: sum the delay-rate amplitudes along the orthogonal
+    // axis. Do not plot RFI-mask occupancy here; the heatmap already shows the
+    // classification, while these bars should represent the underlying data.
+    let mut delay_amplitude_sum = vec![0.0f64; cols];
+    for delay in 0..cols {
+        for rate in 0..rows {
+            let index = rate * cols + delay;
+            if result.celestial_mask[index] || !result.delay_amplitudes[index].is_finite() {
+                continue;
+            }
+            delay_amplitude_sum[delay] += result.delay_amplitudes[index] as f64;
+        }
+    }
+    let mut rate_amplitude_sum = vec![0.0f64; rows];
+    for rate in 0..rows {
+        for delay in 0..cols {
+            let index = rate * cols + delay;
+            if result.celestial_mask[index] || !result.delay_amplitudes[index].is_finite() {
+                continue;
+            }
+            rate_amplitude_sum[rate] += result.delay_amplitudes[index] as f64;
+        }
+    }
+    let delay_plot_max =
+        (delay_amplitude_sum.iter().copied().fold(0.0f64, f64::max) * 1.08).max(f64::MIN_POSITIVE);
+    let rate_plot_max =
+        (rate_amplitude_sum.iter().copied().fold(0.0f64, f64::max) * 1.08).max(f64::MIN_POSITIVE);
+
+    let mut log_min = f32::INFINITY;
+    let mut log_max = f32::NEG_INFINITY;
+    for &amplitude in &result.delay_amplitudes {
+        if amplitude.is_finite() && amplitude > 0.0 {
+            let value = amplitude.log10();
+            log_min = log_min.min(value);
+            log_max = log_max.max(value);
+        }
+    }
+    if !log_min.is_finite() || !log_max.is_finite() {
+        log_min = -12.0;
+        log_max = 0.0;
+    }
+    if (log_max - log_min).abs() < f32::EPSILON {
+        log_min -= 0.5;
+        log_max += 0.5;
+    }
+
+    let root = BitMapBackend::new(path, (1850, 1300)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let (top_row, bottom_row) = root.split_vertically(270);
+    let (delay_area, blank_area) = top_row.split_horizontally(1400);
+    let (plane_area, rate_area) = bottom_row.split_horizontally(1400);
+    blank_area.fill(&WHITE)?;
+
+    let mut delay_chart = ChartBuilder::on(&delay_area)
+        .margin(10)
+        .caption(
+            "Delay marginal histogram: sum of amplitude",
+            ("sans-serif", 22),
+        )
+        .x_label_area_size(40)
+        .y_label_area_size(90)
+        .build_cartesian_2d(x_range.clone(), 0.0..delay_plot_max)?;
+    delay_chart
+        .configure_mesh()
+        .x_desc("Delay")
+        .y_desc("Σ amplitude (non-celestial)")
+        .label_style(("sans-serif", 16))
+        .axis_desc_style(("sans-serif", 18))
+        .draw()?;
+    for (delay, amplitude_sum) in delay_amplitude_sum.iter().copied().enumerate() {
+        let (left, right) = histogram_cell_bounds(&x_axis, delay);
+        delay_chart.draw_series(std::iter::once(Rectangle::new(
+            [(left, 0.0), (right, amplitude_sum)],
+            BLUE.mix(0.65).filled(),
+        )))?;
+    }
+
+    let mut rate_chart = ChartBuilder::on(&rate_area)
+        .margin(10)
+        .caption(
+            "Rate marginal histogram: sum of amplitude",
+            ("sans-serif", 22),
+        )
+        .x_label_area_size(65)
+        .y_label_area_size(80)
+        .build_cartesian_2d(0.0..rate_plot_max, y_range.clone())?;
+    rate_chart
+        .configure_mesh()
+        .x_desc("Σ amplitude (non-celestial)")
+        .y_desc("Rate [Hz]")
+        .label_style(("sans-serif", 16))
+        .axis_desc_style(("sans-serif", 18))
+        .draw()?;
+    for (rate, amplitude_sum) in rate_amplitude_sum.iter().copied().enumerate() {
+        let (bottom, top) = histogram_cell_bounds(&y_axis, rate);
+        rate_chart.draw_series(std::iter::once(Rectangle::new(
+            [(0.0, bottom), (amplitude_sum, top)],
+            BLUE.mix(0.65).filled(),
+        )))?;
+    }
+
+    let mut plane_chart = ChartBuilder::on(&plane_area)
+        .margin(10)
+        .caption(
+            "Delay-rate amplitude with RFI and celestial classification",
+            ("sans-serif", 26),
+        )
+        .x_label_area_size(65)
+        .y_label_area_size(90)
+        .build_cartesian_2d(x_range.clone(), y_range.clone())?;
+    plane_chart
+        .configure_mesh()
+        .x_desc("Delay")
+        .y_desc("Rate [Hz]")
+        .label_style(("sans-serif", 18))
+        .axis_desc_style(("sans-serif", 22))
+        .draw()?;
+
+    let mut x_edges = Vec::with_capacity(cols + 1);
+    for delay in 0..cols {
+        x_edges.push(histogram_cell_bounds(&x_axis, delay).0);
+    }
+    x_edges.push(histogram_cell_bounds(&x_axis, cols - 1).1);
+    let mut y_edges = Vec::with_capacity(rows + 1);
+    for rate in 0..rows {
+        y_edges.push(histogram_cell_bounds(&y_axis, rate).0);
+    }
+    y_edges.push(histogram_cell_bounds(&y_axis, rows - 1).1);
+    let heatmap_values = result
+        .delay_amplitudes
+        .iter()
+        .map(|&value| value as f64)
+        .collect::<Vec<_>>();
+    let (plot_x, plot_y) = plane_chart.plotting_area().get_pixel_range();
+    let bitmap_width = plot_x.len().max(1) as u32;
+    let bitmap_height = plot_y.len().max(1) as u32;
+    let plot_x_min = x_range.start;
+    let plot_x_max = x_range.end;
+    let plot_y_min = y_range.start;
+    let plot_y_max = y_range.end;
+    let heatmap_buffer = rasterize_rgb_grid_on_axes_with_overlay(
+        bitmap_width,
+        bitmap_height,
+        &x_edges,
+        &y_edges,
+        &heatmap_values,
+        (plot_x_min, plot_x_max),
+        (plot_y_min, plot_y_max),
+        false,
+        &|x_cell, y_cell, px, py, _, _| {
+            let index = y_cell * cols + x_cell;
+            let is_celestial = result.celestial_mask[index];
+            let is_candidate = result.candidate_mask[index] && !is_celestial;
+            if !is_celestial && !is_candidate {
+                return None;
+            }
+            let (left, right) = (x_edges[x_cell], x_edges[x_cell + 1]);
+            let (bottom, top) = (y_edges[y_cell], y_edges[y_cell + 1]);
+            let px_at = |x: f64| {
+                (x - plot_x_min) / (plot_x_max - plot_x_min) * bitmap_width.saturating_sub(1) as f64
+            };
+            let py_at = |y: f64| {
+                (plot_y_max - y) / (plot_y_max - plot_y_min)
+                    * bitmap_height.saturating_sub(1) as f64
+            };
+            let on_border = (px as f64 - px_at(left)).abs() <= 2.0
+                || (px as f64 - px_at(right)).abs() <= 2.0
+                || (py as f64 - py_at(bottom)).abs() <= 2.0
+                || (py as f64 - py_at(top)).abs() <= 2.0;
+            on_border.then(|| if is_celestial { CYAN.rgb() } else { RED.rgb() })
+        },
+        &|value| {
+            let value = (value as f32).max(0.0);
+            let value_log = if value > 0.0 { value.log10() } else { log_min };
+            let normalized = ((value_log - log_min) / (log_max - log_min)).clamp(0.0, 1.0);
+            HSLColor((240.0 - 240.0 * normalized as f64) / 360.0, 1.0, 0.5).rgb()
+        },
+    );
+    let heatmap = BitMapElement::<_, RGBPixel>::with_owned_buffer(
+        (plot_x_min, plot_y_max),
+        (bitmap_width, bitmap_height),
+        heatmap_buffer,
+    )
+    .ok_or("failed to create delay-rate marginal bitmap")?;
+    plane_chart.draw_series(std::iter::once(heatmap))?;
+    plane_chart
+        .configure_mesh()
+        .x_desc("Delay")
+        .y_desc("Rate [Hz]")
+        .label_style(("sans-serif", 18))
+        .axis_desc_style(("sans-serif", 22))
+        .draw()?;
+    plane_chart
+        .draw_series(std::iter::once(PathElement::new(
+            vec![(plot_x_min, plot_y_min), (plot_x_min, plot_y_min)],
+            RED.stroke_width(2),
+        )))?
+        .label("RFI candidates")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], RED.stroke_width(2)));
+    plane_chart
+        .draw_series(std::iter::once(PathElement::new(
+            vec![(plot_x_min, plot_y_min), (plot_x_min, plot_y_min)],
+            CYAN.stroke_width(2),
+        )))?
+        .label("Celestial fringe cross")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 25, y)], CYAN.stroke_width(2)));
+    plane_chart
+        .configure_series_labels()
+        .border_style(BLACK)
+        .background_style(WHITE.mix(0.85))
+        .label_font(("sans-serif", 17))
+        .draw()?;
+
+    root.present()?;
+    drop(delay_chart);
+    drop(rate_chart);
+    drop(plane_chart);
     drop(root);
     crate::png_compress::compress_png_with_mode(path, crate::png_compress::CompressQuality::High);
     Ok(())

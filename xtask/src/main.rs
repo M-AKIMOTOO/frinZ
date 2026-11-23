@@ -119,6 +119,7 @@ fn run_cargo_install(bin_name: &str, path: &Path) -> Result<(), Box<dyn Error>> 
     let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")));
     command
         .arg("install")
+        .arg("--locked")
         .arg("--force")
         .arg("--bin")
         .arg(bin_name)

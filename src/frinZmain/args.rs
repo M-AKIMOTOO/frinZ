@@ -320,6 +320,10 @@ pub struct Args {
     #[arg(long, value_name = "POINTS")]
     pub fft_rebin: Option<i32>,
 
+    /// Center of the first channel in units of the effective channel spacing.
+    #[arg(skip)]
+    pub channel_origin_bins: f64,
+
     /// In-band width [MHz]. Without --search, use the zero-delay/rate cell.
     #[arg(long, value_name = "MHz")]
     pub inband: Option<u32>,
@@ -330,7 +334,7 @@ pub struct Args {
         num_args = 0..=1,
         default_missing_value = "peak",
         value_name = "MODE",
-        value_parser = ["peak", "deep", "deep2", "coherent", "rate", "acel"],
+        value_parser = ["peak", "deep", "deep2", "coherent", "group-delay", "rate", "acel"],
         action = ArgAction::Append
     )]
     pub search: Vec<String>,
@@ -428,12 +432,20 @@ impl Args {
         self.search
             .iter()
             .find(|mode| {
-                *mode == "peak" || *mode == "deep" || *mode == "deep2" || *mode == "coherent"
+                matches!(
+                    mode.as_str(),
+                    "peak" | "deep" | "deep2" | "coherent" | "group-delay"
+                )
             })
             .map(|s| s.as_str())
     }
 
     pub fn validate_runtime(&self) -> Result<(), String> {
+        if self.frequency && self.primary_search_mode() == Some("group-delay") {
+            return Err(
+                "--search group-delay measures the full-band delay in delay-rate mode".into(),
+            );
+        }
         if self.length < 0 {
             return Err("--length must be zero or greater".to_string());
         }
@@ -523,6 +535,7 @@ impl Default for Args {
             wwz: false,
             header: false,
             fft_rebin: None,
+            channel_origin_bins: 0.0,
             inband: None,
             search: Vec::new(),
             in_beam: false,

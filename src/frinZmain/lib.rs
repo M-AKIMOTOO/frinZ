@@ -43,9 +43,9 @@ pub mod uv;
 pub mod wwz;
 
 pub use api::{
-    apply_delay_rate_correction, delay_search, frequency_spectrum, fringe_search, read_bandpass,
-    read_cor, read_cor_with_options, search_cor_bytes, FrequencySpectrum, FringeSearchOutput,
-    LibraryOptions, PhaseCorrection, SearchMode,
+    apply_delay_rate_correction, delay_search, delay_search_at_times, frequency_spectrum,
+    fringe_search, read_bandpass, read_cor, read_cor_with_options, search_cor_bytes,
+    FrequencySpectrum, FringeSearchOutput, LibraryOptions, PhaseCorrection, SearchMode,
 };
 pub use header::CorHeader;
 pub use read::{

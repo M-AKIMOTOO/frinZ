@@ -5,9 +5,18 @@
 [基本モード]
   --in-beam                          in-beam VLBI 用の標準 delay-rate 解析フロー。plot/text/時系列を frinZ/inbeamVLBI/ に自動出力
                                      --plot 時は全面 delay-rate ヒートマップ表示
-  --search [peak|deep|deep2|rate|acel]
+                                     単一入力では基線全体の残差を測る。較正天体を使う場合は --phase-reference に両入力を渡す。
+  --search [peak|deep|deep2|coherent|group-delay|rate|acel]
                                      デフォルト peak（deep2 は coarse 後に rate/delay 軸を交互探索）
   --iter N                           peak/deep/deep2 の反復回数（deep/deep2 は未指定時 4）
+  --search group-delay               .cor の1基線相互相関から群遅延とレートを倍精度で同時推定。
+                                     FFT と格子探索（--iter の既定値 1）で選んだピークを連続最適化する。
+                                     GroupDelay [s] は手動補正後の各窓の先頭時刻での残差。
+                                     SigmaDelay [ps] は正しいピークと独立雑音を仮定した形式 1σ。
+                                     SNRq は直交成分の雑音で測った S/N、B_rms [MHz] は有効周波数の標準偏差。
+                                     Ambiguity [ns] は有効チャネル間隔から求めた群遅延の繰り返し周期。
+                                     --output で *_group_delay*.tsv に保存。Fit 欄に各窓の推定状態を表示。
+                                     例  frinZ --input target.cor --search group-delay --length 60 --loop 24 --output
   --frequency                        周波数ドメイン処理（未指定は時間ドメイン）
   --plot                             グラフ出力（--frequency 併用で周波数グラフ）
   --output                           frinZ/fringe_output/... に保存
@@ -42,8 +51,10 @@
        実際に使用した全セクタの時刻/UVW、元 .cor の全チャネル周波数、および .cor 読み込み直後の
        時間×周波数複素ビジビリティを *_contamination.npz v5 に保存する。
        raw visibilityはACF規格化、rebin、delay/rate補正、padding、bandpass補正より前の値である。
+       欠測を含む各セクタの記録時刻と、rebin 前の FFT チャネル軸で保存する。
        この段階では天体信号を減算しない。
        任意キー: output:<path> または out:<path> で NPZ 出力先を明示できる。
+       複数窓では指定したファイル名に _sector<N> を加えて窓ごとに保存する。
 
   --contamination-subtract <MODEL.npz>
   --contamisubt <MODEL.npz>            上記の短縮別名
@@ -52,6 +63,7 @@
        解析結果は通常解析と同じく元 .cor の親ディレクトリ直下の frinZ/... に保存し、
        名前は `*_<product>_contamisubt.<ext>` とする。親直下に contamisubt/ は作らない。
        モデル内の input_cor と --input を照合し、該当する積分区間だけを減算する。
+       .cor の FFT サイズとサンプリング周波数、および記録されたセクタ時刻を照合する。
        v5 target/gain handoffが揃う場合、flux model v5の小容量gain/geometry補正テーブルから各sector・channelの補正量を再構成する。
        fluxへ渡すglobにはtargetとgainの両方を含める。fluxは前後gainの実測複素スペクトルをtarget時刻へ補間する。
        既知の位相中心天体は補正後の (delay,rate)=(0,0) 固定セルで判定する。全平面 --search のSNR 5--6はtrial factorを含み、単独では検出を意味しない。
@@ -110,7 +122,12 @@
   --closure-phase FILE1 FILE2 FILE3
        第1ファイルの第1アンテナを基準とする3基線クロージャー位相。
   --phase-reference MODE CAL TARGET [cal_len tgt_len loop]
-       MODE: poly2（全体二次）, linear（前後scan線形補間）, nearest（最近傍）, hybrid（二次trend＋残差線形補間）
+       MODE: poly2（全体二次）, linear（前後scan線形補間）, nearest（最近傍）, hybrid（二次trend＋残差線形補間）, hermite（位相・delay・rateを満たす3次補間）
+       両天体を既定でpeak探索し、fringe rateと実時刻差で位相接続する。
+       基準周波数（帯域下端）の位相とdelayを同じ時刻で近似・補間し、チャンネルごとに補償する。
+       rateは接続位相の時間変化に含まれるため、別の時間回転として二重適用しない。
+       共通時間原点は較正天体の最初の有効区間の開始時刻（定数位相も較正）。
+       cal_lenはscan内で解ける長さ、loopは必要な区間数を指定する。
   --maser key:val...（メーザー解析）
        off:<path>           OFF ソース .cor
        off:linear           OFF無し時、band/subt 範囲でロバスト直線ベースライン推定
@@ -124,14 +141,14 @@
        corrfreq:<x>         サンプリング周波数への倍率
        --npz 指定時は frequency_mhz/masked_bool を含む *_maser_baseline_mask.npz を保存。
        他に、出力グラフ/TSV は frinZ/maser/ 配下へ保存。
-  --folding key:val...（可視光度fold）
+  --folding key:val...（複素ビジビリティの位相折り畳み）
        period:<sec>         折り畳み周期（必須）
        pdot:<s/s>           周期微分（任意）
        epoch:<UTC>          スピン位相基準時刻（任意）
        bins:<N>             位相ビン数（既定64）
        on-duty:<0-1>        on-pulse と見なすビン割合（既定0.1）
        phase0:<cycle>       位相原点オフセット（既定0.0）
-       bary:0|1             barycentric 時刻補正（既定0）
+       bary:0|1             太陽系重心への幾何学的 Rømer 補正（既定0）
        orbit:0|1            連星軌道遅延補正（既定0、軌道要素指定時は自動1）
        pb:<sec>             軌道周期
        a1:<lt-sec>          射影半長径 a1/c
@@ -139,7 +156,9 @@
        tp:<UTC>|tp_mjd:<MJD>       楕円軌道の近点通過時刻
        ecc:<0..1), omega_deg:<deg> 楕円軌道パラメータ
        eph:<FILE>           上記キーを key=value or KEY VALUE で書いたエフェメリスファイル
-       --delay/--rate/--acel を適用した複素ビジビリティで fold を実行。
+       各セクターの記録時刻と積分中央を使用し、フラグ済みセクターを除外する。
+       bary:1 の時刻系は UTC + Rømer。地球位置に ERFA EPV00、観測点に基線中点と UT1≈UTC を使用。
+       --delay/--rate/--acel/--jerk/--snap を適用した複素ビジビリティで fold を実行。
        出力は *_folding_profile.png, *_folding_summary.txt。--npz 指定時は pulse_phase_turn/profile/count_sample/on_bin_bool を含む *_folding.npz を保存。
   --multi-sideband C_COR C_BP C_DELAY X_COR X_BP X_DELAY
        BP に -1 を入れると当該バンド BP 無効化。
@@ -148,10 +167,14 @@
        range:auto は最小投影基線に対する ±3λ/B_proj,min を mas 表示。
        delay-padding:1|2|4|8（既定4）/ snr:<f> / max-peaks:<n>。
        cont モードは既定30秒区間の複素delay/rate mapを幾何位相整合して積算。
-       rate 8倍以上・delay 4倍のFFT格子を使用。
+       欠測やフラグで区間を分割。maser モードの位置換算は検出チャンネルの実周波数を使用。
+       cont モードは rate 8倍以上・delay 既定4倍のFFT格子を使用。
   --imaging key[:val]...
        size:<px>(既定 256), cell:<arcsec>, clean:0|1, gain:<f>,
-       threshold:<Jy>, iter:<n>。
+       threshold:<SNR>, iter:<n>。
+       既定約30秒の連続区間を平均し、周波数ごとの u,v を使う狭視野近似。
+       PSF の中心を1に正規化し、dirty image に同じ係数を適用。強度単位は入力のビジビリティに従う。
+       clean:1 は成分と残差の和を出力。復元ビームは別途必要。
   --dynamic-spectrum, --raw-visibility, --uv [0|1], --uptimeplot
        --raw-visibility は元データの heatmap を出力する。--delay/--rate（または高次Taylor補正）を指定した場合は、
        元データ図に加えて *_rawvis_corrected_delay_rate_heatmap_{amp|phase}.png も出力する。 --npz 指定時は *_rawvis.npz に freq、time_sec、phase、visibility を保存する。
@@ -192,3 +215,4 @@
   frinZ --in data.cor --search deep --rfi 100,120
   frinZ --closure-phase b12.cor b23.cor b13.cor
   frinZ --phase-reference hybrid cal.cor tgt.cor 30 30 1 --plot --output
+  frinZ --in-beam --phase-reference hermite cal.cor tgt.cor 30 30 10 --search group-delay

@@ -162,27 +162,38 @@ fn parse_real_npy(npy: &[u8]) -> io::Result<Vec<f32>> {
     }
 }
 
-pub fn apply_bandpass_correction(freq_rate_array: &mut Array2<C32>, bandpass_data: &[C32]) {
-    if bandpass_data.is_empty() {
-        return;
-    }
-    const EPSILON: f32 = 1e-9;
+pub(crate) fn bandpass_gains(bandpass_data: &[C32]) -> impl Iterator<Item = Complex<f64>> + '_ {
+    let mean = bandpass_data
+        .iter()
+        .map(|v| Complex::new(f64::from(v.re), f64::from(v.im)))
+        .sum::<Complex<f64>>()
+        / bandpass_data.len().max(1) as f64;
+    bandpass_data.iter().map(move |v| {
+        let value = Complex::new(f64::from(v.re), f64::from(v.im));
+        if value.norm_sqr() > 1.0e-18 {
+            mean / value
+        } else {
+            Complex::new(1.0, 0.0)
+        }
+    })
+}
 
-    // The complex mean is used to rescale the corrected spectrum to maintain a similar overall power and phase.
-    let bandpass_sum: C32 = bandpass_data.iter().copied().sum();
-    let bandpass_mean = bandpass_sum / bandpass_data.len() as f32;
-
-    for (mut row, &bp_val) in freq_rate_array
-        .rows_mut()
-        .into_iter()
-        .zip(bandpass_data.iter())
-    {
-        // Avoid division by zero or near-zero values
-        if bp_val.norm() > EPSILON {
-            row.iter_mut()
-                .for_each(|elem| *elem = (*elem / bp_val) * bandpass_mean);
+pub(crate) fn apply_bandpass_gains(
+    freq_rate_array: &mut Array2<C32>,
+    gains: impl IntoIterator<Item = Complex<f64>>,
+) {
+    for (mut row, gain) in freq_rate_array.rows_mut().into_iter().zip(gains) {
+        if gain != Complex::new(1.0, 0.0) {
+            for value in &mut row {
+                let corrected = Complex::new(f64::from(value.re), f64::from(value.im)) * gain;
+                *value = C32::new(corrected.re as f32, corrected.im as f32);
+            }
         }
     }
+}
+
+pub fn apply_bandpass_correction(freq_rate_array: &mut Array2<C32>, bandpass_data: &[C32]) {
+    apply_bandpass_gains(freq_rate_array, bandpass_gains(bandpass_data));
 }
 
 pub fn plot_bandpass_spectrum(
@@ -274,4 +285,28 @@ pub fn plot_bandpass_spectrum(
     root.present().map_err(to_io_error)?;
     compress_png_with_mode(&output_file_path, CompressQuality::Low);
     Ok(())
+}
+
+#[cfg(test)]
+mod correction_tests {
+    use super::*;
+
+    #[test]
+    fn finite_high_gain_calibration_handles_zero_and_missing_channels() {
+        let bandpass = [C32::new(1e30, 0.0), C32::new(0.0, 1e30), C32::default()];
+        let input = C32::new(1.0, 0.0);
+        let mut plane = Array2::from_elem((4, 2), input);
+        apply_bandpass_correction(&mut plane, &bandpass);
+
+        let third = 1.0 / 3.0;
+        let expected = [
+            C32::new(third, third),
+            C32::new(third, -third),
+            input,
+            input,
+        ];
+        for (row, gain) in plane.rows().into_iter().zip(expected) {
+            assert!(row.iter().all(|&v| (v - gain).norm() < 1e-6));
+        }
+    }
 }

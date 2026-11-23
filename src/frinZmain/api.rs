@@ -4,6 +4,7 @@
 //! functions: read `.cor`, apply phase correction, run delay/rate fringe search,
 //! and extract complex frequency spectra.
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::path::Path;
 
@@ -14,7 +15,9 @@ use num_complex::Complex;
 use crate::analysis::AnalysisResults;
 use crate::args::{Args, DEFAULT_RATE_PADDING};
 use crate::bandpass;
-use crate::fft::apply_phase_correction_in_place_at_frequency;
+use crate::fft::{
+    apply_phase_correction_in_place_at_frequency, apply_phase_correction_in_place_at_times,
+};
 use crate::header::CorHeader;
 use crate::processing::run_analysis_pipeline;
 use crate::read::{
@@ -39,6 +42,23 @@ pub struct PhaseCorrection {
 }
 
 impl PhaseCorrection {
+    fn apply(self, visibility: &mut [C32], header: &CorHeader, integration_time: f32) {
+        apply_phase_correction_in_place_at_frequency(
+            visibility,
+            (header.fft_point / 2).max(0) as usize,
+            self.rate_hz,
+            self.delay_samples,
+            self.acceleration_hz_per_s,
+            self.jerk_hz_per_s2,
+            self.snap_hz_per_s3,
+            integration_time,
+            header.sampling_speed as u32,
+            header.fft_point as u32,
+            self.start_time_offset_sec,
+            header.observing_frequency,
+        );
+    }
+
     pub fn is_zero(self) -> bool {
         self.delay_samples == 0.0
             && self.rate_hz == 0.0
@@ -54,6 +74,8 @@ pub enum SearchMode {
     Peak,
     Deep,
     Coherent,
+    /// Continuous full-band delay/rate fit with a formal uncertainty at the first row.
+    GroupDelay,
 }
 
 impl SearchMode {
@@ -62,6 +84,7 @@ impl SearchMode {
             SearchMode::Peak => "peak",
             SearchMode::Deep => "deep",
             SearchMode::Coherent => "coherent",
+            SearchMode::GroupDelay => "group-delay",
         }
     }
 }
@@ -69,6 +92,8 @@ impl SearchMode {
 /// Library-side options. These deliberately omit plotting and file-output flags.
 #[derive(Debug, Clone)]
 pub struct LibraryOptions {
+    /// Applied before searching. The result reports these terms in
+    /// `corrected_*` and the measured remaining offsets in `residual_*`.
     pub correction: PhaseCorrection,
     pub search_mode: Option<SearchMode>,
     /// RFI channel ranges, inclusive, in FFT-half channel indices.
@@ -148,20 +173,10 @@ pub fn read_bandpass<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<C32>> {
 
 /// Apply delay/rate/acceleration correction in place to already-read visibility data.
 pub fn apply_delay_rate_correction(data: &mut CorData, correction: PhaseCorrection) {
-    let fft_point_half = (data.header.fft_point / 2).max(0) as usize;
-    apply_phase_correction_in_place_at_frequency(
+    correction.apply(
         &mut data.visibility,
-        fft_point_half,
-        correction.rate_hz,
-        correction.delay_samples,
-        correction.acceleration_hz_per_s,
-        correction.jerk_hz_per_s2,
-        correction.snap_hz_per_s3,
+        &data.header,
         data.effective_integ_time,
-        data.header.sampling_speed as u32,
-        data.header.fft_point as u32,
-        correction.start_time_offset_sec,
-        data.header.observing_frequency,
     );
 }
 
@@ -170,7 +185,7 @@ pub fn fringe_search(
     data: &CorData,
     options: &LibraryOptions,
 ) -> Result<FringeSearchOutput, Box<dyn Error>> {
-    run_delay_rate(data, options, false)
+    run_delay_rate(data, options, options.search_mode, false, None)
 }
 
 /// Convenience wrapper for `--search peak` equivalent.
@@ -178,11 +193,30 @@ pub fn delay_search(
     data: &CorData,
     options: &LibraryOptions,
 ) -> Result<FringeSearchOutput, Box<dyn Error>> {
-    let mut options = options.clone();
-    if options.search_mode.is_none() {
-        options.search_mode = Some(SearchMode::Peak);
-    }
-    run_delay_rate(data, &options, false)
+    run_delay_rate(
+        data,
+        options,
+        options.search_mode.or(Some(SearchMode::Peak)),
+        false,
+        None,
+    )
+}
+
+/// Search a visibility buffer using actual sector times in seconds relative to
+/// a common origin. Both the fit and the manual correction use the first row
+/// as their epoch, with the optional correction start offset applied to the latter.
+pub fn delay_search_at_times(
+    data: &CorData,
+    options: &LibraryOptions,
+    times: &[f64],
+) -> Result<FringeSearchOutput, Box<dyn Error>> {
+    run_delay_rate(
+        data,
+        options,
+        options.search_mode.or(Some(SearchMode::Peak)),
+        false,
+        Some(times),
+    )
 }
 
 /// Compute the complex frequency spectrum without creating plots or files.
@@ -190,7 +224,7 @@ pub fn frequency_spectrum(
     data: &CorData,
     options: &LibraryOptions,
 ) -> Result<FrequencySpectrum, Box<dyn Error>> {
-    let output = run_delay_rate(data, options, true)?;
+    let output = run_delay_rate(data, options, options.search_mode, true, None)?;
     Ok(FrequencySpectrum {
         header: output.header,
         obs_time: output.obs_time,
@@ -200,110 +234,127 @@ pub fn frequency_spectrum(
     })
 }
 
-/// Parse `.cor` bytes and immediately run a peak delay/rate search.
+/// Parse `.cor` bytes and search using the recorded sector epochs (including gaps).
 pub fn search_cor_bytes(
     bytes: &[u8],
     read_options: &CorReadOptions,
     options: &LibraryOptions,
 ) -> Result<FringeSearchOutput, Box<dyn Error>> {
     let data = read_cor_bytes(bytes, read_options)?;
-    delay_search(&data, options)
+    let times = crate::read::read_sector_time_offsets(
+        bytes,
+        &data.header,
+        data.first_sector as usize,
+        data.sectors_read as usize,
+    )?;
+    delay_search_at_times(&data, options, &times)
 }
 
 fn run_delay_rate(
     data: &CorData,
     options: &LibraryOptions,
+    search_mode: Option<SearchMode>,
     frequency_mode: bool,
+    recorded_times: Option<&[f64]>,
 ) -> Result<FringeSearchOutput, Box<dyn Error>> {
-    let mut args = args_from_options(options, frequency_mode);
-    let mut complex_vec = data.visibility.clone();
+    let args = args_from_options(options, search_mode, frequency_mode);
     let fft_point_half = (data.header.fft_point / 2).max(0) as usize;
     if fft_point_half == 0 {
         return Err("FFT point must be >= 2".into());
     }
-    if !complex_vec.len().is_multiple_of(fft_point_half) {
+    if !data.visibility.len().is_multiple_of(fft_point_half) {
         return Err(format!(
             "visibility length ({}) is not divisible by FFT-half channels ({})",
-            complex_vec.len(),
+            data.visibility.len(),
             fft_point_half
         )
         .into());
     }
 
-    if !options.correction.is_zero() {
-        apply_phase_correction_in_place_at_frequency(
-            &mut complex_vec,
-            fft_point_half,
-            options.correction.rate_hz,
-            options.correction.delay_samples,
-            options.correction.acceleration_hz_per_s,
-            options.correction.jerk_hz_per_s2,
-            options.correction.snap_hz_per_s3,
-            data.effective_integ_time,
-            data.header.sampling_speed as u32,
-            data.header.fft_point as u32,
-            options.correction.start_time_offset_sec,
-            data.header.observing_frequency,
-        );
-        args.delay_correct = 0.0;
-        args.rate_correct = 0.0;
-        args.acel_correct = 0.0;
+    let rows = data.visibility.len() / fft_point_half;
+    if rows == 0 {
+        return Err("visibility contains no sectors".into());
     }
+    if let Some(times) = recorded_times {
+        if times.len() != rows || times.iter().any(|t| !t.is_finite()) {
+            return Err("expected one finite timestamp per physical visibility row".into());
+        }
+    }
+    let padded_rows = rows
+        .checked_next_power_of_two()
+        .ok_or("too many visibility rows")?;
+    let current_length = i32::try_from(padded_rows)?;
+    let physical_length = rows as i32;
 
-    let physical_length = (complex_vec.len() / fft_point_half) as i32;
-    let current_length =
-        pad_rows_to_power_of_two(&mut complex_vec, physical_length, fft_point_half);
-    let bandpass = options.bandpass.clone();
-    let file_start_time = data.obs_time;
+    // The public API returns a power-of-two rate axis. Only materialize an
+    // owned buffer when padding or a manual phase rotation actually needs it.
+    let complex_vec = if rows == padded_rows && options.correction.is_zero() {
+        Cow::Borrowed(data.visibility.as_slice())
+    } else {
+        let samples = padded_rows
+            .checked_mul(fft_point_half)
+            .ok_or("visibility size overflow")?;
+        let mut values = Vec::with_capacity(samples);
+        values.extend_from_slice(&data.visibility);
+        if !options.correction.is_zero() {
+            let correction = options.correction;
+            if let Some(times) = recorded_times {
+                let offset = f64::from(correction.start_time_offset_sec);
+                let epochs: Vec<_> = times.iter().map(|t| (t - times[0]) + offset).collect();
+                apply_phase_correction_in_place_at_times(
+                    &mut values,
+                    fft_point_half,
+                    correction.rate_hz,
+                    correction.delay_samples,
+                    correction.acceleration_hz_per_s,
+                    correction.jerk_hz_per_s2,
+                    correction.snap_hz_per_s3,
+                    data.header.sampling_speed as u32,
+                    data.header.fft_point as u32,
+                    &epochs,
+                    data.header.observing_frequency,
+                    0.0,
+                );
+            } else {
+                correction.apply(&mut values, &data.header, data.effective_integ_time);
+            }
+        }
+        values.resize(samples, C32::default());
+        Cow::Owned(values)
+    };
 
-    let (analysis, freq_rate_plane, delay_rate_plane, _) = if let Some(mode) = options.search_mode {
-        let result = match mode {
-            SearchMode::Peak => search::run_peak_search(
-                &complex_vec,
-                &data.header,
-                current_length,
-                physical_length,
-                data.effective_integ_time,
-                &data.obs_time,
-                &file_start_time,
-                &options.rfi_channel_ranges,
-                &bandpass,
-                &args,
-                data.header.number_of_sector,
-                args.cpu,
-                None,
-            )?,
-            SearchMode::Deep => search::run_deep_search(
-                &complex_vec,
-                &data.header,
-                current_length,
-                physical_length,
-                data.effective_integ_time,
-                &data.obs_time,
-                &file_start_time,
-                &options.rfi_channel_ranges,
-                &bandpass,
-                &args,
-                data.header.number_of_sector,
-                args.cpu,
-                None,
-            )?,
-            SearchMode::Coherent => search::run_coherent_search(
-                &complex_vec,
-                &data.header,
-                current_length,
-                physical_length,
-                data.effective_integ_time,
-                &data.obs_time,
-                &file_start_time,
-                &options.rfi_channel_ranges,
-                &bandpass,
-                &args,
-                data.header.number_of_sector,
-                args.cpu,
-                None,
-            )?,
+    let (mut analysis, freq_rate_plane, delay_rate_plane, _) = if let Some(mode) = search_mode {
+        let search = match mode {
+            SearchMode::Deep => search::run_deep_search_with_phase_times,
+            SearchMode::Peak | SearchMode::Coherent | SearchMode::GroupDelay => {
+                search::run_peak_search_with_phase_times
+            }
         };
+        let regular_times;
+        let times = if let Some(times) = recorded_times {
+            times
+        } else {
+            regular_times = (0..rows)
+                .map(|i| i as f64 * f64::from(data.effective_integ_time))
+                .collect::<Vec<_>>();
+            &regular_times
+        };
+        let result = search(
+            &complex_vec,
+            &data.header,
+            current_length,
+            physical_length,
+            data.effective_integ_time,
+            &data.obs_time,
+            &data.obs_time,
+            &options.rfi_channel_ranges,
+            &options.bandpass,
+            &args,
+            data.header.number_of_sector,
+            args.cpu,
+            None,
+            times,
+        )?;
         (
             result.analysis_results,
             result.freq_rate_array,
@@ -323,14 +374,20 @@ fn run_delay_rate(
             physical_length,
             data.effective_integ_time,
             &data.obs_time,
-            &file_start_time,
+            &data.obs_time,
             &options.rfi_channel_ranges,
-            &bandpass,
+            &options.bandpass,
             false,
             data.header.fft_point,
         )?
     };
 
+    analysis.length_f32 = physical_length as f32 * data.effective_integ_time;
+    analysis.corrected_delay = options.correction.delay_samples;
+    analysis.corrected_rate = options.correction.rate_hz;
+    analysis.corrected_acel = options.correction.acceleration_hz_per_s;
+    analysis.corrected_jerk = options.correction.jerk_hz_per_s2;
+    analysis.corrected_snap = options.correction.snap_hz_per_s3;
     Ok(FringeSearchOutput {
         header: data.header.clone(),
         obs_time: data.obs_time,
@@ -342,21 +399,21 @@ fn run_delay_rate(
     })
 }
 
-fn args_from_options(options: &LibraryOptions, frequency_mode: bool) -> Args {
+fn args_from_options(
+    options: &LibraryOptions,
+    search_mode: Option<SearchMode>,
+    frequency_mode: bool,
+) -> Args {
     let mut args = Args {
         frequency: frequency_mode,
         spectrum: frequency_mode,
         rate_padding: options.rate_padding.max(1),
         iter: options.iter,
         cpu: options.cpu,
-        delay_correct: options.correction.delay_samples,
-        rate_correct: options.correction.rate_hz,
-        acel_correct: options.correction.acceleration_hz_per_s,
-        jerk_correct: options.correction.jerk_hz_per_s2,
-        snap_correct: options.correction.snap_hz_per_s3,
+        // All manual Taylor terms have already been applied to the samples.
         ..Args::default()
     };
-    if let Some(mode) = options.search_mode {
+    if let Some(mode) = search_mode {
         args.search = vec![mode.as_str().to_string()];
         if args.rate_padding < 8 {
             args.rate_padding = 8;
@@ -375,24 +432,6 @@ fn args_from_options(options: &LibraryOptions, frequency_mode: bool) -> Args {
         args.frange = vec![lo, hi];
     }
     args
-}
-
-fn pad_rows_to_power_of_two(data: &mut Vec<C32>, current_rows: i32, row_width: usize) -> i32 {
-    if current_rows <= 0 || row_width == 0 {
-        return current_rows;
-    }
-    let target_rows = if current_rows <= 1 {
-        1
-    } else {
-        (current_rows as u32).next_power_of_two() as i32
-    };
-    if target_rows > current_rows {
-        data.extend(std::iter::repeat_n(
-            C32::new(0.0, 0.0),
-            (target_rows - current_rows) as usize * row_width,
-        ));
-    }
-    target_rows
 }
 
 #[cfg(test)]
@@ -459,6 +498,284 @@ mod tests {
             effective_integ_time: 1.0,
             first_sector: 0,
             sectors_read: length as i32,
+        }
+    }
+
+    #[test]
+    fn group_delay_uses_recorded_epochs_bandpass_and_flags() {
+        let times = [51.2, 52.01, 53.5, 54.1, 57.03, 60.1, 61.4, 62.0, 62.9];
+        let delay = -13.246813579;
+        let rate = 0.07123456789;
+        let mut data = synthetic_data(times.len(), 0.0, delay, rate, 1.2);
+        let gains: Vec<_> = (0..32)
+            .map(|k| C32::from_polar(0.7 + k as f32 / 40.0, k as f32 / 17.0))
+            .collect();
+        for (i, row) in data.visibility.chunks_exact_mut(32).enumerate() {
+            for (k, z) in row.iter_mut().enumerate() {
+                let f = k as f64 / 64.0;
+                let phi = 1.2
+                    + 2.0
+                        * PI
+                        * (delay * f + rate * (times[i] - times[0]) * (1.0 + f * 64e6 / 8.4e9));
+                *z = if i == 3 {
+                    C32::default()
+                } else if (13..=19).contains(&k) {
+                    C32::new(500.0, 300.0)
+                } else {
+                    C32::new(phi.cos() as f32, phi.sin() as f32) * gains[k]
+                };
+            }
+        }
+        let options = LibraryOptions {
+            search_mode: Some(SearchMode::GroupDelay),
+            bandpass: Some(gains),
+            rfi_channel_ranges: vec![(13, 19)],
+            delay_window: Some([-14.0, -12.0]),
+            rate_window: Some([0.06, 0.09]),
+            iter: 1,
+            cpu: 1,
+            ..LibraryOptions::default()
+        };
+        let fit = delay_search_at_times(&data, &options, &times)
+            .unwrap()
+            .analysis
+            .group_delay
+            .unwrap()
+            .unwrap();
+        assert!((fit.delay_samples - delay).abs() < 2e-8, "{fit:?}");
+        assert!((fit.rate_hz - rate).abs() < 3e-10, "{fit:?}");
+        assert_eq!(fit.visibilities, 8 * 24);
+        let frequencies: Vec<_> = (1..32)
+            .filter(|k| !(13..=19).contains(k))
+            .map(|k| k as f64 * 1e6)
+            .collect();
+        let mean = frequencies.iter().sum::<f64>() / 24.0;
+        let bandwidth = (frequencies.iter().map(|f| (f - mean).powi(2)).sum::<f64>() / 24.0).sqrt();
+        assert!((fit.bandwidth_rms_hz - bandwidth).abs() < 1e-6);
+    }
+
+    #[test]
+    fn group_delay_requires_frequency_leverage_and_an_interior_peak() {
+        let opts = LibraryOptions {
+            search_mode: Some(SearchMode::GroupDelay),
+            iter: 1,
+            cpu: 1,
+            ..LibraryOptions::default()
+        };
+        let mut data = synthetic_data(1, 0.0, 4.31415926, 0.0, 0.4);
+        // Two named stations can have unfilled positions and station codes.
+        data.header.station1_name = "ANT1".into();
+        data.header.station2_name = "ANT2".into();
+        data.header.station2_position = data.header.station1_position;
+        let run = |opts: &LibraryOptions| {
+            delay_search(&data, opts)
+                .unwrap()
+                .analysis
+                .group_delay
+                .unwrap()
+        };
+        let fit = run(&opts).unwrap();
+        assert!((fit.delay_samples - 4.31415926).abs() < 2e-8 && !fit.rate_fitted);
+        let one_frequency = LibraryOptions {
+            rfi_channel_ranges: vec![(2, 31)],
+            ..opts.clone()
+        };
+        assert_eq!(run(&one_frequency).unwrap_err(), "one_frequency");
+        let two_frequencies = LibraryOptions {
+            rfi_channel_ranges: vec![(3, 31)],
+            ..opts.clone()
+        };
+        assert!(run(&two_frequencies).unwrap().sigma_seconds.is_none());
+        let bounded = LibraryOptions {
+            delay_window: Some([4.0, 4.25]),
+            ..opts
+        };
+        assert!(run(&bounded).is_err());
+        let comb = LibraryOptions {
+            rfi_channel_ranges: (1..32).filter(|k| k % 4 != 3).map(|k| (k, k)).collect(),
+            delay_window: Some([3.9, 4.7]),
+            ..bounded
+        };
+        assert!((run(&comb).unwrap().ambiguity_seconds - 250e-9).abs() < 1e-18);
+    }
+
+    #[test]
+    fn group_delay_formal_error_matches_independent_noise_trials() {
+        let delay = 0.314159265;
+        let rate = -0.037123;
+        let options = LibraryOptions {
+            search_mode: Some(SearchMode::GroupDelay),
+            iter: 1,
+            cpu: 1,
+            delay_window: Some([-0.3, 0.9]),
+            rate_window: Some([-0.055, -0.020]),
+            ..LibraryOptions::default()
+        };
+        let model = synthetic_data(16, 0.0, delay, rate, 0.73);
+        let mut seed = 4935817u64;
+        let mut uniform = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut sum_error = 0.0;
+        let mut squared_errors = 0.0;
+        let mut sum_variance = 0.0;
+        for _ in 0..128 {
+            let mut data = model.clone();
+            for (idx, z) in data.visibility.iter_mut().enumerate() {
+                // Heteroscedastic, independent circular Gaussian channel noise.
+                let sigma = 0.25 + (idx % 32) as f64 / 30.0;
+                let r = sigma * (-2.0 * uniform().ln()).sqrt();
+                let angle = 2.0 * PI * uniform();
+                *z += C32::new((r * angle.cos()) as f32, (r * angle.sin()) as f32);
+            }
+            let fit = delay_search(&data, &options)
+                .unwrap()
+                .analysis
+                .group_delay
+                .unwrap()
+                .unwrap();
+            let error = fit.delay_seconds - delay / 64e6;
+            sum_error += error;
+            squared_errors += error * error;
+            sum_variance += fit.sigma_seconds.unwrap().powi(2);
+        }
+        let rms_ps = 1e12 * (squared_errors / 128.0).sqrt();
+        let predicted_ps = 1e12 * (sum_variance / 128.0).sqrt();
+        eprintln!(
+            "128 independent injections: RMS {rms_ps:.3} ps, formal RMS {predicted_ps:.3} ps"
+        );
+        assert!((0.80..1.20).contains(&(rms_ps / predicted_ps)));
+        assert!(sum_error.abs() < 3.0 * sum_variance.sqrt());
+    }
+
+    #[test]
+    fn fine_search_resolves_nearby_high_snr_candidates() {
+        let delay = 0.31427;
+        let rate = 0.03711;
+        let data = synthetic_data(32, 0.0, delay, rate, 0.4);
+        for mode in [SearchMode::Peak, SearchMode::Deep, SearchMode::Coherent] {
+            let options = LibraryOptions {
+                search_mode: Some(mode),
+                iter: 6,
+                cpu: 2,
+                ..LibraryOptions::default()
+            };
+            let result = delay_search(&data, &options).unwrap().analysis;
+            assert!(
+                (result.residual_delay as f64 - delay).abs() < 2.0e-6,
+                "{mode:?}: delay={}",
+                result.residual_delay
+            );
+            assert!(
+                (result.residual_rate as f64 - rate).abs() < 2.0e-7,
+                "{mode:?}: rate={}",
+                result.residual_rate
+            );
+        }
+    }
+
+    #[test]
+    fn sub_bin_windows_recover_a_fringe_with_bandpass_and_flagged_channels() {
+        let mut data = synthetic_data(37, 0.0, 5.55, 0.10625, 0.4);
+        let channels = data.header.fft_point as usize / 2;
+        let bandpass: Vec<_> = (0..channels)
+            .map(|i| C32::from_polar(1.0 + i as f32 * 0.02, i as f32 * 0.05))
+            .collect();
+        for row in data.visibility.chunks_exact_mut(channels) {
+            for (sample, gain) in row.iter_mut().zip(&bandpass) {
+                *sample *= gain;
+            }
+            row[6..=7].fill(C32::new(1e4, -1e4));
+        }
+        let options = LibraryOptions {
+            delay_window: Some([5.6, 5.4]),
+            rate_window: Some([0.108, 0.104]),
+            bandpass: Some(bandpass),
+            rfi_channel_ranges: vec![(6, 7)],
+            iter: 6,
+            cpu: 1,
+            ..LibraryOptions::default()
+        };
+        let result = delay_search(&data, &options).unwrap().analysis;
+        assert!(
+            (result.residual_delay - 5.55).abs() < 2e-5,
+            "delay={}",
+            result.residual_delay
+        );
+        assert!(
+            (result.residual_rate - 0.10625).abs() < 2e-7,
+            "rate={}",
+            result.residual_rate
+        );
+        let excluded = LibraryOptions {
+            delay_rate_mask: Some([5.4, 5.6, 0.104, 0.108]),
+            ..options
+        };
+        assert!(delay_search(&data, &excluded).is_err());
+    }
+
+    #[test]
+    fn manual_taylor_correction_is_applied_once_in_all_analysis_paths() {
+        let mut data = synthetic_data(13, 0.0, 0.0, 0.0, 0.4);
+        data.effective_integ_time = 0.5;
+        let reference = data.clone();
+        let correction = PhaseCorrection {
+            delay_samples: 0.25,
+            rate_hz: 0.01,
+            acceleration_hz_per_s: -0.001,
+            jerk_hz_per_s2: 0.002,
+            snap_hz_per_s3: -0.00012,
+            start_time_offset_sec: 5.125,
+        };
+        let fft = data.header.fft_point as usize;
+        for (row, values) in data.visibility.chunks_exact_mut(fft / 2).enumerate() {
+            let time = f64::from(correction.start_time_offset_sec)
+                + row as f64 * f64::from(data.effective_integ_time);
+            let cycles = f64::from(correction.rate_hz) * time
+                + f64::from(correction.acceleration_hz_per_s) * time.powi(2) / 2.0
+                + f64::from(correction.jerk_hz_per_s2) * time.powi(3) / 6.0
+                + f64::from(correction.snap_hz_per_s3) * time.powi(4) / 24.0;
+            for (channel, sample) in values.iter_mut().enumerate() {
+                let fraction = channel as f64 / fft as f64;
+                let rf_ratio = 1.0
+                    + fraction * data.header.sampling_speed as f64
+                        / data.header.observing_frequency;
+                let angle =
+                    2.0 * PI * (cycles * rf_ratio + f64::from(correction.delay_samples) * fraction);
+                *sample *= C32::new(angle.cos() as f32, angle.sin() as f32);
+            }
+        }
+        for mode in [None, Some(SearchMode::Peak)] {
+            let options = LibraryOptions {
+                search_mode: mode,
+                cpu: 1,
+                ..LibraryOptions::default()
+            };
+            let corrected = LibraryOptions {
+                correction,
+                ..options.clone()
+            };
+            let expected = fringe_search(&reference, &options).unwrap();
+            let actual = fringe_search(&data, &corrected).unwrap();
+            assert_eq!(actual.analysis.length_f32, 6.5);
+            assert_eq!(actual.analysis.corrected_delay, correction.delay_samples);
+            assert_eq!(actual.analysis.corrected_rate, correction.rate_hz);
+            assert_eq!(actual.analysis.corrected_jerk, correction.jerk_hz_per_s2);
+            assert_eq!(actual.analysis.corrected_snap, correction.snap_hz_per_s3);
+            assert_eq!(actual.delay_rate_plane.dim(), (16, fft));
+            for (a, b) in actual
+                .delay_rate_plane
+                .iter()
+                .zip(&expected.delay_rate_plane)
+            {
+                assert!((*a - *b).norm() < 2.0e-3, "{mode:?}: {a} versus {b}");
+            }
+            let expected = frequency_spectrum(&reference, &options).unwrap();
+            let actual = frequency_spectrum(&data, &corrected).unwrap();
+            for (a, b) in actual.spectrum.iter().zip(&expected.spectrum) {
+                assert!((*a - *b).norm() < 3.0e-3, "{mode:?}: {a} versus {b}");
+            }
         }
     }
 
@@ -584,14 +901,14 @@ mod tests {
             cpu: 1,
             ..LibraryOptions::default()
         };
-        let args = args_from_options(&options, false);
+        let args = args_from_options(&options, options.search_mode, false);
         for rate in rates {
             let data = synthetic_data(length, 100.0, delay, rate, 0.4);
             let mut visibility = data.visibility.clone();
-            let current_length = pad_rows_to_power_of_two(
-                &mut visibility,
-                length as i32,
-                data.header.fft_point as usize / 2,
+            let current_length = length.next_power_of_two() as i32;
+            visibility.resize(
+                current_length as usize * (data.header.fft_point as usize / 2),
+                C32::default(),
             );
             let result = search::run_peak_search(
                 &visibility,

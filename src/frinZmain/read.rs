@@ -1,4 +1,3 @@
-use byteorder::ReadBytesExt;
 use chrono::{DateTime, TimeZone, Utc};
 use num_complex::Complex;
 use std::io::{self, Cursor, Error, ErrorKind, Read};
@@ -138,30 +137,68 @@ pub fn normalize_effective_integration_time(value: f32) -> f32 {
     value
 }
 
+pub(crate) fn sector_size(header: &CorHeader) -> usize {
+    SECTOR_HEADER_SIZE as usize + header.fft_point as usize * 4
+}
+
+/// Byte range for complete, header-declared sectors [first, end).
+pub(crate) fn sector_byte_range(
+    header: &CorHeader,
+    file_len: usize,
+    first: usize,
+    end: usize,
+) -> io::Result<std::ops::Range<usize>> {
+    let available = available_cor_sectors(header, file_len)? as usize;
+    if first > end || end > available {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "sector is unavailable",
+        ));
+    }
+    let stride = sector_size(header);
+    let offset = FILE_HEADER_SIZE as usize;
+    Ok(offset + first * stride..offset + end * stride)
+}
+
+pub(crate) fn sector_epoch(sector: &[u8]) -> io::Result<DateTime<Utc>> {
+    let seconds = i32::from_le_bytes(sector[..4].try_into().unwrap());
+    let nanos = u32::from_le_bytes(sector[4..8].try_into().unwrap());
+    Utc.timestamp_opt(i64::from(seconds), nanos)
+        .single()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "invalid sector timestamp"))
+}
+
+fn sector_integration_time(sector: &[u8]) -> f32 {
+    let offset = EFFECTIVE_INTEG_TIME_OFFSET as usize;
+    normalize_effective_integration_time(f32::from_le_bytes(
+        sector[offset..offset + 4].try_into().unwrap(),
+    ))
+}
+
 /// Read timing metadata without decoding the sector's complex spectrum.
 pub fn read_sector_metadata(
     cursor: &mut Cursor<&[u8]>,
     header: &CorHeader,
     sector: i32,
 ) -> io::Result<(DateTime<Utc>, f32)> {
-    let available = available_cor_sectors(header, cursor.get_ref().len())?;
-    if sector < 0 || sector >= available.min(header.number_of_sector) {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "sector is unavailable",
-        ));
-    }
-    let sector_size = SECTOR_HEADER_SIZE + header.fft_point as u64 * 4;
-    let offset = FILE_HEADER_SIZE + sector as u64 * sector_size;
-    cursor.set_position(offset);
-    let seconds = cursor.read_i32::<byteorder::LittleEndian>()?;
-    let time = Utc
-        .timestamp_opt(seconds as i64, 0)
-        .single()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "invalid sector timestamp"))?;
-    cursor.set_position(offset + EFFECTIVE_INTEG_TIME_OFFSET);
-    let integration = cursor.read_f32::<byteorder::LittleEndian>()?;
-    Ok((time, normalize_effective_integration_time(integration)))
+    let index = usize::try_from(sector)
+        .map_err(|_| Error::new(ErrorKind::UnexpectedEof, "sector is unavailable"))?;
+    let range = sector_byte_range(header, cursor.get_ref().len(), index, index + 1)?;
+    cursor.set_position(range.start as u64 + EFFECTIVE_INTEG_TIME_OFFSET + 4);
+    let sector = &cursor.get_ref()[range];
+    Ok((sector_epoch(sector)?, sector_integration_time(sector)))
+}
+
+pub(crate) fn sector_epochs<'a>(
+    bytes: &'a [u8],
+    header: &CorHeader,
+    first: usize,
+    end: usize,
+) -> io::Result<impl ExactSizeIterator<Item = io::Result<DateTime<Utc>>> + 'a> {
+    let range = sector_byte_range(header, bytes.len(), first, end)?;
+    Ok(bytes[range]
+        .chunks_exact(sector_size(header))
+        .map(sector_epoch))
 }
 
 /// Read each sector's start time relative to the first sector of the file.
@@ -173,32 +210,18 @@ pub(crate) fn read_sector_time_offsets(
     first_sector: usize,
     sectors: usize,
 ) -> io::Result<Vec<f64>> {
-    let available = available_cor_sectors(header, bytes.len())? as usize;
     let end_sector = first_sector
         .checked_add(sectors)
-        .filter(|&end| end <= available)
         .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "sector is unavailable"))?;
+    let epochs = sector_epochs(bytes, header, first_sector, end_sector)?;
     if sectors == 0 {
         return Ok(Vec::new());
     }
 
-    let sector_size = SECTOR_HEADER_SIZE as usize + header.fft_point as usize * 4;
-    let mut cursor = Cursor::new(bytes);
-    cursor.set_position(FILE_HEADER_SIZE);
-    let epoch_seconds = cursor.read_i32::<byteorder::LittleEndian>()? as i64;
-    let epoch_nanoseconds = cursor.read_u32::<byteorder::LittleEndian>()? as i64;
-
-    let mut offsets = Vec::with_capacity(sectors);
-    for sector in first_sector..end_sector {
-        cursor.set_position(FILE_HEADER_SIZE + (sector * sector_size) as u64);
-        let seconds = cursor.read_i32::<byteorder::LittleEndian>()? as i64;
-        let nanoseconds = cursor.read_u32::<byteorder::LittleEndian>()? as i64;
-        offsets.push(
-            (seconds - epoch_seconds) as f64
-                + (nanoseconds - epoch_nanoseconds) as f64 / 1_000_000_000.0,
-        );
-    }
-    Ok(offsets)
+    let epoch = sector_epoch(&bytes[FILE_HEADER_SIZE as usize..])?;
+    epochs
+        .map(|time| time.map(|time| crate::utils::seconds_between(time, epoch)))
+        .collect()
 }
 
 pub fn read_visibility_data(
@@ -223,8 +246,6 @@ pub fn read_visibility_data(
     } else {
         header
     };
-    let sector_size = (8 + header.fft_point / 4) * 16;
-
     let (actual_length_start, length_end) =
         calculate_sector_range(range_header, length, skip, loop_index, is_cumulate);
 
@@ -238,55 +259,35 @@ pub fn read_visibility_data(
     let num_sectors_to_read = (length_end - actual_length_start) as usize;
     let fft_point_half = (header.fft_point / 2) as usize;
     let mut complex_vec = Vec::with_capacity(num_sectors_to_read * fft_point_half);
-    let mut obs_time = Utc
-        .timestamp_opt(0, 0)
-        .single()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Failed to create initial timestamp"))?;
-    let mut effective_integ_time = 0.0;
-
+    let stride = sector_size(header);
+    let start = FILE_HEADER_SIZE as usize + actual_length_start as usize * stride;
+    let end = start + num_sectors_to_read * stride;
+    cursor.set_position(end as u64);
+    let bytes = cursor.get_ref();
+    let obs_time = sector_epoch(&bytes[start..])?;
+    let effective_integ_time = sector_integration_time(&bytes[end - stride..end]);
     let mut non_finite_samples = 0usize;
 
-    for i in 0..num_sectors_to_read {
-        let sector_start_pos =
-            FILE_HEADER_SIZE + (actual_length_start as u64 + i as u64) * sector_size as u64;
-        cursor.set_position(sector_start_pos);
-
-        let correlation_time_sec = cursor.read_i32::<byteorder::LittleEndian>()?;
-        if i == 0 {
-            obs_time = Utc
-                .timestamp_opt(correlation_time_sec as i64, 0)
-                .single()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidData,
-                        format!("Invalid timestamp seconds: {}", correlation_time_sec),
-                    )
-                })?;
-        }
-
-        cursor.set_position(sector_start_pos + EFFECTIVE_INTEG_TIME_OFFSET);
-        effective_integ_time = cursor.read_f32::<byteorder::LittleEndian>()?;
-        cursor.set_position(sector_start_pos + SECTOR_HEADER_SIZE);
-
+    for (i, sector) in bytes[start..end].chunks_exact(stride).enumerate() {
         let current_pp = actual_length_start as u32 + i as u32;
         let is_pp_flagged = pp_flag_ranges
             .iter()
             .any(|(start, end)| current_pp >= *start && current_pp <= *end);
 
-        for _ in 0..fft_point_half {
-            let real = cursor.read_f32::<byteorder::LittleEndian>()?;
-            let imag = cursor.read_f32::<byteorder::LittleEndian>()?;
+        if is_pp_flagged {
+            complex_vec.resize(complex_vec.len() + fft_point_half, C32::default());
+            continue;
+        }
+        for sample in sector[SECTOR_HEADER_SIZE as usize..].chunks_exact(8) {
+            let real = f32::from_le_bytes(sample[..4].try_into().unwrap());
+            let imag = f32::from_le_bytes(sample[4..].try_into().unwrap());
             let mut sample = C32::new(real, imag);
             if !sample.re.is_finite() || !sample.im.is_finite() {
                 non_finite_samples += 1;
                 sample = C32::new(0.0, 0.0);
             }
 
-            if is_pp_flagged {
-                complex_vec.push(C32::new(0.0, 0.0));
-            } else {
-                complex_vec.push(sample);
-            }
+            complex_vec.push(sample);
         }
     }
 
@@ -298,8 +299,6 @@ pub fn read_visibility_data(
             actual_length_start + num_sectors_to_read as i32 - 1
         );
     }
-
-    effective_integ_time = normalize_effective_integration_time(effective_integ_time);
 
     Ok((complex_vec, obs_time, effective_integ_time))
 }

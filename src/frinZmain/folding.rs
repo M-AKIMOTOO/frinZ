@@ -1,11 +1,7 @@
 // Folding kernels retain explicit timing and phase parameters.
 #![allow(clippy::too_many_arguments)]
-use astro::ecliptic;
-use astro::planet::{self, Planet};
-use astro::time;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use nalgebra::{Matrix3, Vector3};
-use num_complex::Complex;
+use num_complex::{Complex, Complex64};
 use plotters::prelude::*;
 use std::error::Error;
 use std::f64::consts::PI;
@@ -14,20 +10,22 @@ use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use crate::args::Args;
-use crate::bandpass::read_bandpass_file;
-use crate::header::parse_header;
+use crate::bandpass::{bandpass_gains, read_bandpass_file};
+use crate::fft::apply_phase_correction_in_place_at_times;
+use crate::header::{available_cor_sectors, parse_header};
 use crate::input_support::open_input_data;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::png_compress::{compress_png_with_mode, CompressQuality};
-use crate::read::read_visibility_data;
-use crate::rfi::parse_rfi_ranges;
-use crate::utils::parse_flag_time;
+use crate::read::{read_sector_metadata, read_visibility_data};
+use crate::rfi::{flagged_channels, parse_rfi_ranges};
+use crate::utils::{parse_flag_time, seconds_between};
+
+mod barycentric;
+use barycentric::BarycentricRoemer;
 
 type C32 = Complex<f32>;
 
 const BP_EPSILON: f32 = 1e-9;
-const C_KM_S: f64 = 299_792.458;
-const AU_KM: f64 = 149_597_870.7;
 
 #[derive(Debug, Clone)]
 struct OrbitalEphemeris {
@@ -444,58 +442,6 @@ fn parse_folding_args(tokens: &[String]) -> Result<FoldingConfig, Box<dyn Error>
     })
 }
 
-fn apply_row_phase_correction(
-    row: &mut [C32],
-    rate_hz: f32,
-    delay_samples: f32,
-    acel_hz: f32,
-    effective_integ_time: f32,
-    sampling_speed_hz: i32,
-    fft_point: i32,
-    sector_index: usize,
-) {
-    if row.is_empty()
-        || (rate_hz == 0.0 && delay_samples == 0.0 && acel_hz == 0.0)
-        || sampling_speed_hz <= 0
-        || fft_point < 2
-        || effective_integ_time <= 0.0
-    {
-        return;
-    }
-
-    // Keep phase convention consistent with fft::apply_phase_correction.
-    let t_sec = sector_index as f64 * effective_integ_time as f64;
-    let rate_phase = -2.0 * PI * rate_hz as f64 * t_sec;
-    let acel_phase = -PI * acel_hz as f64 * t_sec * t_sec;
-    let rate_factor =
-        Complex::<f64>::new(0.0, rate_phase).exp() * Complex::<f64>::new(0.0, acel_phase).exp();
-
-    let delay_sec = delay_samples as f64 / sampling_speed_hz as f64;
-    let freq_res_hz = sampling_speed_hz as f64 / fft_point as f64;
-
-    for (chan_idx, sample) in row.iter_mut().enumerate() {
-        let f_hz = chan_idx as f64 * freq_res_hz;
-        let delay_phase = -2.0 * PI * delay_sec * f_hz;
-        let delay_factor = Complex::<f64>::new(0.0, delay_phase).exp();
-        let corrected =
-            Complex::<f64>::new(sample.re as f64, sample.im as f64) * rate_factor * delay_factor;
-        *sample = C32::new(corrected.re as f32, corrected.im as f32);
-    }
-}
-
-fn rfi_mask(channel_count: usize, rfi_ranges: &[(usize, usize)]) -> Vec<bool> {
-    let mut mask = vec![false; channel_count];
-    for &(start, end) in rfi_ranges {
-        let mut idx = start.min(channel_count.saturating_sub(1));
-        let end_idx = end.min(channel_count.saturating_sub(1));
-        while idx <= end_idx {
-            mask[idx] = true;
-            idx += 1;
-        }
-    }
-    mask
-}
-
 fn pick_on_bins(profile: &[FoldBin], on_duty: f64) -> Vec<bool> {
     let bins = profile.len();
     let mut on_mask = vec![false; bins];
@@ -626,76 +572,6 @@ fn plot_folding_profile(
     Ok(())
 }
 
-fn unix_to_julian_day(unix_sec: f64) -> f64 {
-    unix_sec / 86400.0 + 2_440_587.5
-}
-
-fn source_unit_vector(ra_rad: f64, dec_rad: f64) -> Vector3<f64> {
-    Vector3::new(
-        dec_rad.cos() * ra_rad.cos(),
-        dec_rad.cos() * ra_rad.sin(),
-        dec_rad.sin(),
-    )
-}
-
-fn earth_heliocentric_equatorial_km(jd: f64) -> Vector3<f64> {
-    let (lon, lat, radius_au) = planet::heliocent_coords(&Planet::Earth, jd);
-    let r_km = radius_au * AU_KM;
-    let cos_lat = lat.cos();
-    let pos_ecl = Vector3::new(
-        r_km * cos_lat * lon.cos(),
-        r_km * cos_lat * lon.sin(),
-        r_km * lat.sin(),
-    );
-
-    let eps = ecliptic::mn_oblq_IAU(jd);
-    let rot_ecl_to_eq = Matrix3::new(
-        1.0,
-        0.0,
-        0.0,
-        0.0,
-        eps.cos(),
-        -eps.sin(),
-        0.0,
-        eps.sin(),
-        eps.cos(),
-    );
-    rot_ecl_to_eq * pos_ecl
-}
-
-fn ecef_to_equatorial_km(ecef_km: &Vector3<f64>, jd: f64) -> Vector3<f64> {
-    let gmst = time::mn_sidr(jd);
-    let rot = Matrix3::new(
-        gmst.cos(),
-        -gmst.sin(),
-        0.0,
-        gmst.sin(),
-        gmst.cos(),
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    );
-    rot * ecef_km
-}
-
-fn barycentric_delay_sec(
-    obs_unix_sec: f64,
-    observer_ecef_m: [f64; 3],
-    src_hat: &Vector3<f64>,
-) -> f64 {
-    let jd = unix_to_julian_day(obs_unix_sec);
-    let earth_helio_eq = earth_heliocentric_equatorial_km(jd);
-    let observer_ecef_km = Vector3::new(
-        observer_ecef_m[0] / 1000.0,
-        observer_ecef_m[1] / 1000.0,
-        observer_ecef_m[2] / 1000.0,
-    );
-    let observer_eq_km = ecef_to_equatorial_km(&observer_ecef_km, jd);
-    let r_obs = earth_helio_eq + observer_eq_km;
-    r_obs.dot(src_hat) / C_KM_S
-}
-
 fn solve_kepler_e(mean_anomaly: f64, ecc: f64) -> f64 {
     if ecc < 1e-12 {
         return mean_anomaly;
@@ -772,14 +648,14 @@ pub fn run_folding_analysis(
     if fft_half < 2 {
         return Err("Error: invalid FFT size in header.".into());
     }
-    let total_sectors = header.number_of_sector.max(0) as usize;
+    let total_sectors = available_cor_sectors(&header, input_data.as_slice().len())? as usize;
     if total_sectors == 0 {
         return Err("Error: no sectors in input file.".into());
     }
 
     cursor.set_position(0);
-    let (_, first_sector_obs_time, effective_integ_time) =
-        read_visibility_data(&mut cursor, &header, 1, 0, 0, false, pp_flag_ranges)?;
+    let (first_sector_obs_time, effective_integ_time) =
+        read_sector_metadata(&mut cursor, &header, 0)?;
     if !effective_integ_time.is_finite() || effective_integ_time <= 0.0 {
         return Err("Error: invalid effective integration time.".into());
     }
@@ -789,7 +665,16 @@ pub fn run_folding_analysis(
     let bw_mhz = header.sampling_speed as f32 / 2.0 / 1_000_000.0;
     let rbw_mhz = bw_mhz / header.fft_point as f32 * 2.0;
     let rfi_ranges = parse_rfi_ranges(&args.rfi, rbw_mhz)?;
-    let rfi_mask = rfi_mask(fft_half, &rfi_ranges);
+    let mut rfi_mask = flagged_channels(fft_half, &rfi_ranges);
+    if let Some(mask) = args.rfi_npz_mask.as_deref() {
+        for (marked, extra) in rfi_mask.iter_mut().zip(mask.frequency_channel_mask(
+            fft_half,
+            header.sampling_speed,
+            header.fft_point,
+        )) {
+            *marked |= extra;
+        }
+    }
 
     let bandpass_data = if let Some(bp_path) = &args.bandpass {
         let bp = read_bandpass_file(bp_path)?;
@@ -806,9 +691,11 @@ pub fn run_folding_analysis(
     } else {
         None
     };
-    let bandpass_mean = bandpass_data.as_ref().map(|bp| {
-        let sum: C32 = bp.iter().copied().sum();
-        sum / bp.len() as f32
+    let gains = bandpass_data.as_ref().map(|bp| {
+        for (flagged, value) in rfi_mask.iter_mut().zip(bp) {
+            *flagged |= value.norm_sqr() <= BP_EPSILON * BP_EPSILON;
+        }
+        bandpass_gains(bp).collect::<Vec<_>>()
     });
 
     let skip_sec = args.skip.max(0) as f64;
@@ -839,38 +726,48 @@ pub fn run_folding_analysis(
         .spin
         .source_dec_override_rad
         .unwrap_or(header.source_position_dec);
-    let src_hat = source_unit_vector(source_ra_rad, source_dec_rad);
     let observer_mid_ecef_m = [
         0.5 * (header.station1_position[0] + header.station2_position[0]),
         0.5 * (header.station1_position[1] + header.station2_position[1]),
         0.5 * (header.station1_position[2] + header.station2_position[2]),
     ];
 
-    let mut bin_sum = vec![Complex::<f64>::new(0.0, 0.0); cfg.bins];
+    let mut barycentric = cfg
+        .spin
+        .use_barycentric
+        .then(|| BarycentricRoemer::new(observer_mid_ecef_m, source_ra_rad, source_dec_rad));
+    let mut bin_sum = vec![Complex64::default(); cfg.bins];
     let mut bin_weight = vec![0usize; cfg.bins];
     let mut used_samples: usize = 0;
     let mut skipped_time_flag: usize = 0;
+    let mut skipped_pp_flag: usize = 0;
     let mut skipped_empty: usize = 0;
     let mut first_obs_time: Option<DateTime<Utc>> = None;
     let mut last_obs_time: Option<DateTime<Utc>> = None;
-    let mut phase_epoch_unix_sec = cfg.spin.epoch_unix_sec;
+    let mut phase_epoch_offset_s = cfg
+        .spin
+        .epoch_unix_sec
+        .map(|epoch| epoch - first_sector_unix);
+    let mut exposure_s = 0.0;
     let mut bary_delay_minmax: Option<(f64, f64)> = None;
     let mut orbital_delay_minmax: Option<(f64, f64)> = None;
+    let has_phase_correction = args.rate_correct != 0.0
+        || args.delay_correct != 0.0
+        || args.acel_correct != 0.0
+        || args.jerk_correct != 0.0
+        || args.snap_correct != 0.0;
 
     cursor.set_position(0);
     for sector_idx in start_sector..end_sector {
-        let (mut row, obs_time, _) = match read_visibility_data(
-            &mut cursor,
-            &header,
-            1,
-            0,
-            sector_idx as i32,
-            false,
-            pp_flag_ranges,
-        ) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
+        if pp_flag_ranges
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&(sector_idx as u32)))
+        {
+            skipped_pp_flag += 1;
+            continue;
+        }
+        let (mut row, obs_time, integration) =
+            read_visibility_data(&mut cursor, &header, 1, 0, sector_idx as i32, false, &[])?;
 
         if time_flag_ranges
             .iter()
@@ -884,32 +781,35 @@ pub fn run_folding_analysis(
             continue;
         }
 
-        apply_row_phase_correction(
-            &mut row,
-            args.rate_correct,
-            args.delay_correct,
-            args.acel_correct,
-            effective_integ_time,
-            header.sampling_speed,
-            header.fft_point,
-            sector_idx,
-        );
+        let epoch_offset_s = seconds_between(obs_time, first_sector_obs_time);
+        if has_phase_correction {
+            apply_phase_correction_in_place_at_times(
+                &mut row,
+                fft_half,
+                args.rate_correct,
+                args.delay_correct,
+                args.acel_correct,
+                args.jerk_correct,
+                args.snap_correct,
+                header.sampling_speed as u32,
+                header.fft_point as u32,
+                &[epoch_offset_s],
+                header.observing_frequency,
+                0.0,
+            );
+        }
 
-        let mut coherent_sum = C32::new(0.0, 0.0);
+        let mut coherent_sum = Complex64::default();
         let mut coherent_count = 0usize;
         for chan in 1..fft_half {
             if rfi_mask[chan] {
                 continue;
             }
-            let mut sample = row[chan];
-            if let (Some(bp), Some(bp_mean)) = (&bandpass_data, bandpass_mean) {
-                let bp_val = bp[chan];
-                if bp_val.norm() > BP_EPSILON {
-                    sample = (sample / bp_val) * bp_mean;
-                } else {
-                    continue;
-                }
-            }
+            let c = row[chan];
+            let sample = Complex64::new(c.re.into(), c.im.into())
+                * gains
+                    .as_ref()
+                    .map_or(Complex64::new(1.0, 0.0), |values| values[chan]);
             if sample.re.is_finite() && sample.im.is_finite() {
                 coherent_sum += sample;
                 coherent_count += 1;
@@ -926,39 +826,34 @@ pub fn run_folding_analysis(
         }
         last_obs_time = Some(obs_time);
 
-        let vis = coherent_sum / coherent_count as f32;
-        // Use sector index + effective integration to preserve sub-second timing.
-        // .cor sector headers typically store integer seconds, which is too coarse for pulsar folding.
-        let mut corrected_time_unix = first_sector_unix
-            + sector_idx as f64 * effective_integ_time as f64
-            + 0.5 * effective_integ_time as f64;
+        let vis = coherent_sum / coherent_count as f64;
+        let half_integration = 0.5 * f64::from(integration);
+        let mut corrected_offset = epoch_offset_s + half_integration;
 
-        if cfg.spin.use_barycentric {
-            let bary_delay =
-                barycentric_delay_sec(corrected_time_unix, observer_mid_ecef_m, &src_hat);
-            corrected_time_unix += bary_delay;
+        if let Some(model) = &mut barycentric {
+            let bary_delay = model.delay(obs_time, half_integration)?;
+            corrected_offset += bary_delay;
             update_minmax(&mut bary_delay_minmax, bary_delay);
         }
 
         if cfg.spin.use_orbital {
             if let Some(orbital) = &cfg.spin.orbital {
-                let orbital_delay = orbital_delay_sec(corrected_time_unix, orbital);
-                corrected_time_unix -= orbital_delay;
+                let orbital_delay =
+                    orbital_delay_sec(first_sector_unix + corrected_offset, orbital);
+                corrected_offset -= orbital_delay;
                 update_minmax(&mut orbital_delay_minmax, orbital_delay);
             }
         }
 
-        if phase_epoch_unix_sec.is_none() {
-            phase_epoch_unix_sec = Some(corrected_time_unix);
-        }
-        let phase_epoch = phase_epoch_unix_sec.unwrap_or(corrected_time_unix);
-        let phase = (spin_phase_cycles(corrected_time_unix, &cfg.spin, phase_epoch) + cfg.phase0)
+        let phase_epoch = *phase_epoch_offset_s.get_or_insert(corrected_offset);
+        let phase = (spin_phase_cycles(corrected_offset, &cfg.spin, phase_epoch) + cfg.phase0)
             .rem_euclid(1.0);
         let bin_idx = ((phase * cfg.bins as f64).floor() as usize).min(cfg.bins - 1);
 
-        bin_sum[bin_idx] += Complex::<f64>::new(vis.re as f64, vis.im as f64);
+        bin_sum[bin_idx] += vis;
         bin_weight[bin_idx] += 1;
         used_samples += 1;
+        exposure_s += f64::from(integration);
     }
 
     if used_samples == 0 {
@@ -1160,6 +1055,7 @@ pub fn run_folding_analysis(
         end_sector.saturating_sub(start_sector)
     )?;
     writeln!(summary_file, "used samples          : {}", used_samples)?;
+    writeln!(summary_file, "skipped by pp flag    : {}", skipped_pp_flag)?;
     writeln!(
         summary_file,
         "skipped by time flag  : {}",
@@ -1172,7 +1068,8 @@ pub fn run_folding_analysis(
     if let Some(t) = last_obs_time {
         writeln!(summary_file, "last epoch (UTC)      : {}", t)?;
     }
-    if let Some(tref) = phase_epoch_unix_sec {
+    if let Some(offset) = phase_epoch_offset_s {
+        let tref = first_sector_unix + offset;
         let sec = tref.floor() as i64;
         let mut nsec = ((tref - sec as f64) * 1e9).round() as i64;
         let mut sec_adj = sec;
@@ -1181,14 +1078,15 @@ pub fn run_folding_analysis(
             sec_adj += 1;
         }
         if let Some(dt) = Utc.timestamp_opt(sec_adj, nsec as u32).single() {
-            writeln!(summary_file, "phase epoch (UTC)     : {}", dt)?;
+            let frame = if cfg.spin.use_barycentric {
+                "UTC + geometric correction"
+            } else {
+                "UTC"
+            };
+            writeln!(summary_file, "phase epoch ({frame}) : {}", dt)?;
         }
     }
-    writeln!(
-        summary_file,
-        "effective folded span [s] : {:.3}",
-        used_samples as f64 * effective_integ_time as f64
-    )?;
+    writeln!(summary_file, "folded exposure [s]   : {:.6}", exposure_s)?;
     writeln!(summary_file, "peak bin              : {}", peak_idx)?;
     writeln!(
         summary_file,

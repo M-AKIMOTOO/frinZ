@@ -3,8 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use astro::coords;
-use astro::time;
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use nav_types::{ECEF, WGS84};
 use ndarray::prelude::*;
 use num_complex::Complex;
@@ -15,6 +14,8 @@ use crate::output::insert_product_before_processing_suffixes;
 use crate::plot;
 
 const C: f64 = 299792458.0; // Speed of light in m/s
+const SECONDS_PER_DAY: i64 = 86_400;
+const J2000_UNIX_SECONDS: i64 = 946_728_000;
 
 type C32 = Complex<f32>;
 
@@ -102,39 +103,13 @@ pub fn radec2azalt(
     obs_ra: f32,
     obs_dec: f32,
 ) -> (f32, f32, f32) {
-    let obs_year = time.year() as i16;
-    let obs_month = time.month() as u8;
-    let obs_day = time.day() as u8;
-    let obs_hour = time.hour() as u8;
-    let obs_minute = time.minute() as u8;
-    let obs_second = time.second() as f64; // + (time.nanosecond() as f64 / 1_000_000_000.0);
-
-    let decimal_day_calc = obs_day as f64
-        + obs_hour as f64 / 24.0
-        + obs_minute as f64 / 60.0 / 24.0
-        + obs_second / 24.0 / 60.0 / 60.0;
-
-    let date = time::Date {
-        year: obs_year,
-        month: obs_month,
-        decimal_day: decimal_day_calc,
-        cal_type: time::CalType::Gregorian,
-    };
-
-    let ecef_position = ECEF::new(
-        ant_position[0] as f64,
-        ant_position[1] as f64,
-        ant_position[2] as f64,
-    );
-    let wgs84_position: WGS84<f64> = ecef_position.into();
+    let [x, y, z] = ant_position.map(f64::from);
+    let wgs84_position: WGS84<f64> = ECEF::new(x, y, z).into();
     let longitude_radian = wgs84_position.longitude_radians();
     let latitude_radian = wgs84_position.latitude_radians();
     let height_meter = wgs84_position.altitude();
 
-    let julian_day = time::julian_day(&date);
-    let mean_sidereal = time::mn_sidr(julian_day);
-    let hour_angle =
-        coords::hr_angl_frm_observer_long(mean_sidereal, -longitude_radian, obs_ra as f64);
+    let hour_angle = greenwich_sidereal_angle(time) + longitude_radian - f64::from(obs_ra);
 
     let source_az =
         coords::az_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f32 + 180.0;
@@ -144,28 +119,36 @@ pub fn radec2azalt(
     (source_az, source_el, height_meter as f32)
 }
 
+pub(crate) fn seconds_between(time: DateTime<Utc>, epoch: DateTime<Utc>) -> f64 {
+    (time.timestamp() - epoch.timestamp()) as f64
+        + (f64::from(time.timestamp_subsec_nanos()) - f64::from(epoch.timestamp_subsec_nanos()))
+            * 1e-9
+}
+
 pub fn mjd_cal(time: DateTime<Utc>) -> f64 {
-    let obs_year = time.year() as i16;
-    let obs_month = time.month() as u8;
-    let obs_day = time.day() as u8;
-    let obs_hour = time.hour() as u8;
-    let obs_minute = time.minute() as u8;
-    let obs_second = time.second() as f64; // + (time.nanosecond() as f64 / 1_000_000_000.0);
+    let seconds = time.timestamp();
+    let day = 40_587 + seconds.div_euclid(SECONDS_PER_DAY);
+    day as f64
+        + (seconds.rem_euclid(SECONDS_PER_DAY) as f64
+            + f64::from(time.timestamp_subsec_nanos()) * 1e-9)
+            / SECONDS_PER_DAY as f64
+}
 
-    let decimal_day_calc = obs_day as f64
-        + obs_hour as f64 / 24.0
-        + obs_minute as f64 / 60.0 / 24.0
-        + obs_second / 24.0 / 60.0 / 60.0;
-
-    let date = time::Date {
-        year: obs_year,
-        month: obs_month,
-        decimal_day: decimal_day_calc,
-        cal_type: time::CalType::Gregorian,
-    };
-
-    let julian_day = time::julian_day(&date);
-    julian_day - 2400000.5
+/// Mean sidereal angle with UTC as the approximation to UT1. Separating the
+/// whole days keeps subsecond epochs out of a large absolute Julian date.
+pub(crate) fn greenwich_sidereal_angle(time: DateTime<Utc>) -> f64 {
+    let seconds = time.timestamp() - J2000_UNIX_SECONDS;
+    let days = seconds.div_euclid(SECONDS_PER_DAY) as f64;
+    let fraction = (seconds.rem_euclid(SECONDS_PER_DAY) as f64
+        + f64::from(time.timestamp_subsec_nanos()) * 1e-9)
+        / SECONDS_PER_DAY as f64;
+    let centuries = (days + fraction) / 36_525.0;
+    (280.46061837
+        + 0.98564736629 * days
+        + 360.98564736629 * fraction
+        + centuries * centuries * (0.000387933 - centuries / 38_710_000.0))
+        .rem_euclid(360.0)
+        .to_radians()
 }
 
 pub fn unwrap_phase_with_rate(phases: &[f32], times_sec: &[f32], rates_hz: &[f32]) -> Vec<f32> {
@@ -320,8 +303,60 @@ pub fn write_allan_deviation_outputs(
     Ok(())
 }
 
-// Earth's rotation rate in radians per second (sidereal)
-const EARTH_ROTATION_RATE: f64 = 7.2921150e-5;
+// Linear term of the mean sidereal angle in radians per second.
+const EARTH_ROTATION_RATE: f64 = 360.98564736629 * std::f64::consts::PI / (180.0 * 86_400.0);
+
+pub(crate) struct UvwProjection {
+    baseline: [f64; 3],
+    v_offset: f64,
+    ra: f64,
+    sin_dec: f64,
+    cos_dec: f64,
+}
+
+impl UvwProjection {
+    pub(crate) fn new(
+        ant1_pos: [f64; 3],
+        ant2_pos: [f64; 3],
+        ra: f64,
+        dec: f64,
+        include_vertical: bool,
+    ) -> Self {
+        let [x, y, mut z] = std::array::from_fn(|i| ant2_pos[i] - ant1_pos[i]);
+        let mut v_offset = 0.0;
+        if !include_vertical {
+            let [ax, ay, az] = ant1_pos;
+            let station: WGS84<f64> = ECEF::new(ax, ay, az).into();
+            v_offset = z * station.latitude_radians().cos();
+            z = 0.0;
+        }
+        let (sin_dec, cos_dec) = dec.sin_cos();
+        Self {
+            baseline: [x, y, z],
+            v_offset,
+            ra,
+            sin_dec,
+            cos_dec,
+        }
+    }
+
+    pub(crate) fn project(&self, sidereal_angle: f64) -> (f64, f64, f64, f64, f64) {
+        // The ECEF baseline is Greenwich-referenced. H increases as Earth rotates.
+        let (sin_h, cos_h) = (sidereal_angle - self.ra).sin_cos();
+        let [x, y, z] = self.baseline;
+        let u = x * sin_h + y * cos_h;
+        let equatorial = x * cos_h - y * sin_h;
+        let v = -equatorial * self.sin_dec + z * self.cos_dec + self.v_offset;
+        let w = equatorial * self.cos_dec + z * self.sin_dec;
+        (
+            u,
+            v,
+            w,
+            equatorial * EARTH_ROTATION_RATE,
+            u * self.sin_dec * EARTH_ROTATION_RATE,
+        )
+    }
+}
 
 /// Calculates (u, v, w) coordinates and their time derivatives.
 ///
@@ -342,56 +377,14 @@ pub fn uvw_cal(
     obs_dec_rad: f64,
     include_vertical: bool,
 ) -> (f64, f64, f64, f64, f64) {
-    let (b_x, b_y, mut b_z) = (
-        ant2_pos[0] - ant1_pos[0],
-        ant2_pos[1] - ant1_pos[1],
-        ant2_pos[2] - ant1_pos[2],
-    );
-
-    // The baseline components above are ECEF (Earth-fixed, Greenwich-referenced) XYZ coordinates.
-    // Only latitude is needed for the optional planar correction; using the station
-    // longitude here would mix an ECEF baseline with a local hour angle.
-    let ecef_position = ECEF::new(ant1_pos[0], ant1_pos[1], ant1_pos[2]);
-    let wgs84_position: WGS84<f64> = ecef_position.into();
-    let latitude_rad = wgs84_position.latitude_radians();
-
-    let v_offset = if !include_vertical {
-        let offset = b_z * latitude_rad.cos();
-        b_z = 0.0;
-        offset
-    } else {
-        0.0
-    };
-    // Calculate Hour Angle (H)
-    let date = time::Date {
-        year: time.year() as i16,
-        month: time.month() as u8,
-        decimal_day: time.day() as f64
-            + (time.hour() as f64 / 24.0)
-            + (time.minute() as f64 / 1440.0)
-            + (time.second() as f64 / 86400.0),
-        cal_type: time::CalType::Gregorian,
-    };
-    let julian_day = time::julian_day(&date);
-    let mean_sidereal = time::mn_sidr(julian_day);
-    let hour_angle = coords::hr_angl_frm_observer_long(mean_sidereal, 0.0, obs_ra_rad);
-    let east_positive_hour_angle = -hour_angle;
-
-    let sin_h = east_positive_hour_angle.sin();
-    let cos_h = east_positive_hour_angle.cos();
-    let sin_d = obs_dec_rad.sin();
-    let cos_d = obs_dec_rad.cos();
-
-    // UVW calculation
-    let u = b_x * sin_h + b_y * cos_h;
-    let v = -b_x * cos_h * sin_d + b_y * sin_h * sin_d + b_z * cos_d + v_offset;
-    let w = b_x * cos_h * cos_d - b_y * sin_h * cos_d + b_z * sin_d;
-
-    // Time derivatives
-    let du_dt = (b_x * cos_h - b_y * sin_h) * EARTH_ROTATION_RATE;
-    let dv_dt = (-b_x * -sin_h * sin_d + b_y * cos_h * sin_d) * EARTH_ROTATION_RATE;
-
-    (u, v, w, du_dt, dv_dt)
+    UvwProjection::new(
+        ant1_pos,
+        ant2_pos,
+        obs_ra_rad,
+        obs_dec_rad,
+        include_vertical,
+    )
+    .project(greenwich_sidereal_angle(time))
 }
 
 /// Converts rate (Hz) and delay (samples) to sky coordinates (l, m).
@@ -441,7 +434,32 @@ pub fn rate_delay_to_lm(
 
 #[cfg(test)]
 mod tests {
-    use super::unwrap_phase_with_rate;
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn uvw_matches_the_ecef_sky_basis_and_time_derivative() {
+        let epoch =
+            Utc.with_ymd_and_hms(2026, 1, 19, 2, 34, 0).unwrap() + Duration::milliseconds(127);
+        let ra = 2.1;
+        let dec = 0.8_f64;
+        let baseline = [112_392.0, -427_271.0, 182_582.5];
+        let angle = ra - greenwich_sidereal_angle(epoch);
+        let (sin, cos) = angle.sin_cos();
+        let (sin_dec, cos_dec) = dec.sin_cos();
+        let dot = |axis: [f64; 3]| baseline.iter().zip(axis).map(|(a, b)| a * b).sum::<f64>();
+        let model = UvwProjection::new([0.0; 3], baseline, ra, dec, true);
+        let (u, v, w, du, dv) = model.project(greenwich_sidereal_angle(epoch));
+        assert!((u - dot([-sin, cos, 0.0])).abs() < 1e-9);
+        assert!((v - dot([-cos * sin_dec, -sin * sin_dec, cos_dec])).abs() < 1e-9);
+        assert!((w - dot([cos * cos_dec, sin * cos_dec, sin_dec])).abs() < 1e-9);
+        let (u0, v0, _, _, _) =
+            model.project(greenwich_sidereal_angle(epoch - Duration::milliseconds(25)));
+        let (u1, v1, _, _, _) =
+            model.project(greenwich_sidereal_angle(epoch + Duration::milliseconds(25)));
+        assert!(((u1 - u0) / 0.05 - du).abs() < 5e-6);
+        assert!(((v1 - v0) / 0.05 - dv).abs() < 5e-6);
+    }
 
     #[test]
     fn rate_assisted_unwrap_recovers_multiple_turns_between_samples() {

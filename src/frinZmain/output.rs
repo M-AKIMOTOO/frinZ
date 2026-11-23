@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::analysis::AnalysisResults;
 use crate::header::CorHeader;
+use crate::search::GroupDelayEstimate;
 
 type C32 = Complex<f32>;
 
@@ -210,6 +211,56 @@ pub fn insert_product_before_processing_suffixes(base: &str, product: &str) -> S
     output
 }
 
+pub(crate) const GROUP_DELAY_COLUMNS: [&str; 7] = [
+    "GroupDelay",
+    "SigmaDelay",
+    "SNRq",
+    "B_rms",
+    "Ambiguity",
+    "Nvis",
+    "Fit",
+];
+pub(crate) const GROUP_DELAY_UNITS: [&str; 7] = ["[s]", "[ps]", "-", "[MHz]", "[ns]", "-", "-"];
+
+pub(crate) fn group_delay_fields(fit: &Result<GroupDelayEstimate, &'static str>) -> String {
+    match fit {
+        Ok(f) => format!(
+            "{:+.15e}\t{:.7e}\t{:.7e}\t{:.7e}\t{:.7e}\t{}\t{}",
+            f.delay_seconds,
+            f.sigma_seconds.unwrap_or(f64::NAN) * 1e12,
+            f.snr_quadrature.unwrap_or(f64::NAN),
+            f.bandwidth_rms_hz * 1e-6,
+            f.ambiguity_seconds * 1e9,
+            f.visibilities,
+            if f.sigma_seconds.is_none() {
+                "no_noise_dof"
+            } else if f.rate_fitted {
+                "ok"
+            } else {
+                "delay_only"
+            }
+        ),
+        Err(status) => format!("NaN\tNaN\tNaN\tNaN\tNaN\tNaN\t{status}"),
+    }
+}
+
+fn display_delay_rate(results: &AnalysisResults) -> (String, String) {
+    match &results.group_delay {
+        Some(Ok(f)) => (
+            format!(
+                "{:+.15e}",
+                f64::from(results.corrected_delay) + f.delay_samples
+            ),
+            format!("{:+.15e}", f64::from(results.corrected_rate) + f.rate_hz),
+        ),
+        Some(Err(_)) => ("NaN".into(), "NaN".into()),
+        None => (
+            format!("{:+.8e}", results.corrected_delay + results.residual_delay),
+            format!("{:+.8e}", results.corrected_rate + results.residual_rate),
+        ),
+    }
+}
+
 pub fn format_delay_output(
     results: &AnalysisResults,
     label: &[&str],
@@ -221,10 +272,9 @@ pub fn format_delay_output(
     let display_length = format_output_length(results.length_f32);
     let noise_level = format_noise_level_percent(results.delay_noise);
     let label_segment = label.get(3).copied().unwrap_or("");
-    // Nine significant digits let the printed f32 correction round-trip when
-    // copied back into --delay/--rate.
+    let (delay, rate) = display_delay_rate(results);
     format!(
-        " {}   {:<5}  {:<10} {:<8} {:>14.8e} {:>7.1} {:>+10.3}  {:>10}  {:>+15.8e}   {:>+15.8e}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
+        " {}   {:<5}  {:<10} {:<8} {:>14.8e} {:>7.1} {:>+10.3}  {:>10}  {:>15}   {:>15}   {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>12.5}   {:<15} {:<5} {:<5}",
         results.yyyydddhhmmss1,
         label_segment,
         results.source_name,
@@ -233,8 +283,8 @@ pub fn format_delay_output(
         results.delay_snr,
         results.delay_phase,
         noise_level,
-        results.corrected_delay + results.residual_delay,
-        results.corrected_rate + results.residual_rate,
+        delay,
+        rate,
         results.ant1_az,
         results.ant1_el,
         results.ant1_hgt,
@@ -314,7 +364,12 @@ fn sanitize_tsv_field(value: &str) -> String {
         .collect()
 }
 
-fn format_tsv_header(station1_name: &str, station2_name: &str, frequency_mode: bool) -> String {
+fn format_tsv_header(
+    station1_name: &str,
+    station2_name: &str,
+    frequency_mode: bool,
+    group_delay: bool,
+) -> String {
     let station1_label = format!("{}-azel", station1_name.trim());
     let station2_label = format!("{}-azel", station2_name.trim());
     let mut columns = vec![
@@ -345,15 +400,23 @@ fn format_tsv_header(station1_name: &str, station2_name: &str, frequency_mode: b
         "az[deg]", "el[deg]", "hgt[m]", "az[deg]", "el[deg]", "hgt[m]", "-", "[MHz]", "[T/F]",
         "[T/F]", "[MHz]",
     ]);
+    if group_delay {
+        columns.extend(GROUP_DELAY_COLUMNS);
+        units.extend(GROUP_DELAY_UNITS);
+    }
     format!("{}\n{}\n", columns.join("\t"), units.join("\t"))
 }
 
 pub fn format_delay_tsv_header(station1_name: &str, station2_name: &str) -> String {
-    format_tsv_header(station1_name, station2_name, false)
+    format_tsv_header(station1_name, station2_name, false, false)
+}
+
+pub(crate) fn format_group_delay_tsv_header(station1_name: &str, station2_name: &str) -> String {
+    format_tsv_header(station1_name, station2_name, false, true)
 }
 
 pub fn format_freq_tsv_header(station1_name: &str, station2_name: &str) -> String {
-    format_tsv_header(station1_name, station2_name, true)
+    format_tsv_header(station1_name, station2_name, true, false)
 }
 
 pub fn format_delay_tsv_row(
@@ -365,7 +428,8 @@ pub fn format_delay_tsv_row(
     obsfreq_mhz: i64,
 ) -> String {
     let label_segment = label.get(3).copied().unwrap_or("");
-    vec![
+    let (delay, rate) = display_delay_rate(results);
+    let mut fields = vec![
         format_tsv_epoch(&results.yyyydddhhmmss1),
         sanitize_tsv_field(label_segment),
         sanitize_tsv_field(&results.source_name),
@@ -374,8 +438,8 @@ pub fn format_delay_tsv_row(
         format!("{:.1}", results.delay_snr),
         format!("{:.3}", results.delay_phase),
         format_noise_level_percent(results.delay_noise),
-        format!("{:+.8e}", results.corrected_delay + results.residual_delay),
-        format!("{:+.8e}", results.corrected_rate + results.residual_rate),
+        delay,
+        rate,
         format!("{:.3}", results.ant1_az),
         format!("{:.3}", results.ant1_el),
         format!("{:.3}", results.ant1_hgt),
@@ -387,8 +451,11 @@ pub fn format_delay_tsv_row(
         if bandpass_applied { "True" } else { "False" }.to_string(),
         if norm_acf_applied { "True" } else { "False" }.to_string(),
         obsfreq_mhz.to_string(),
-    ]
-    .join("\t")
+    ];
+    if let Some(fit) = &results.group_delay {
+        fields.push(group_delay_fields(fit));
+    }
+    fields.join("\t")
 }
 
 pub fn format_freq_tsv_row(

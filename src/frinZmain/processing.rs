@@ -1,5 +1,6 @@
 // Pipeline entry points retain explicit stage inputs to keep correction order visible.
 #![allow(clippy::too_many_arguments)]
+use std::borrow::Cow;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor};
@@ -20,7 +21,7 @@ use crate::analysis::analyze_results;
 use crate::args::Args;
 use crate::bandpass::{apply_bandpass_correction, plot_bandpass_spectrum, read_bandpass_file};
 use crate::contamination::{
-    apply_contamination_subtract, write_contamination_handoff, ContaminationPhaseCorrectionInput,
+    write_contamination_handoff, ContaminationPhaseCorrectionInput, ContaminationWindow,
 };
 use crate::fft::{
     apply_phase_correction_in_place_at_frequency, apply_phase_correction_in_place_at_times,
@@ -33,20 +34,26 @@ use crate::norm_acf::NormAcfContext;
 use crate::npy_output::{npz_sidecar_path, NamedNpz, NpyMeta};
 use crate::output::{
     format_delay_output, format_delay_tsv_header, format_delay_tsv_row, format_freq_output,
-    format_freq_tsv_header, format_freq_tsv_row, generate_output_names,
-    insert_product_before_processing_suffixes, output_header_info,
+    format_freq_tsv_header, format_freq_tsv_row, format_group_delay_tsv_header,
+    generate_output_names, group_delay_fields, insert_product_before_processing_suffixes,
+    output_header_info, GROUP_DELAY_COLUMNS, GROUP_DELAY_UNITS,
 };
 use crate::plot::{
     delay_plane, frequency_plane, plot_dynamic_spectrum_freq, plot_dynamic_spectrum_lag,
 };
-use crate::read::{calculate_sector_range, read_sector_time_offsets, read_visibility_data};
+use crate::read::{
+    calculate_sector_range, read_sector_metadata, read_sector_time_offsets, read_visibility_data,
+    sector_epochs,
+};
 use crate::rfi::{detect_histogram_rfi, has_histogram_mode, parse_rfi_ranges, HistogramRfiResult};
 use crate::search;
 use crate::spike34m::{
     apply_spike_interval_residual_correction, detect_auto_spikes, read_all_spectra, SpikePeak,
 };
 use crate::stfft;
-use crate::utils::{delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg};
+use crate::utils::{
+    delay_rate_mask_bounds, in_delay_rate_mask, parse_flag_time, safe_arg, seconds_between,
+};
 type C32 = Complex<f32>;
 
 pub fn frinz_output_dir(input_path: &Path, in_beam: bool) -> PathBuf {
@@ -259,6 +266,7 @@ pub struct ProcessResult {
     pub add_plot_noise: Vec<f32>,
     pub add_plot_res_delay: Vec<f32>,
     pub add_plot_res_rate: Vec<f32>,
+    pub(crate) group_delay_fits: Vec<Result<search::GroupDelayEstimate, &'static str>>,
     #[allow(dead_code)]
     pub add_plot_complex: Vec<Complex<f32>>,
 }
@@ -379,21 +387,30 @@ pub fn process_cor_file(
         spectrum_output_path = Some(path);
     }
 
-    // --- Read .cor and apply the compact table to a private copy-on-write mapping. ---
-    let input_data = if let Some(model_path) = &args.contamination_subtract {
-        let mut data = open_input_data_copy_on_write(input_path)?;
-        let bytes = data
-            .as_mut_slice()
-            .ok_or("contamination correction requires mutable copy-on-write input")?;
-        apply_contamination_subtract(bytes, input_path, model_path, args.bandpass.as_deref())?;
-        data
+    let mut bandpass_data = args
+        .bandpass
+        .as_deref()
+        .map(read_bandpass_file)
+        .transpose()?;
+    let mut input_data = if contamination_mode {
+        open_input_data_copy_on_write(input_path)?
     } else {
         open_input_data(input_path)?
     };
+    let header = parse_header(&mut Cursor::new(input_data.as_slice()))?;
+    if let Some(model_path) = &args.contamination_subtract {
+        let bytes = input_data
+            .as_mut_slice()
+            .ok_or("expected copy-on-write input")?;
+        crate::contamination::subtract_model(
+            bytes,
+            &header,
+            input_path,
+            model_path,
+            bandpass_data.as_deref(),
+        )?;
+    }
     let mut cursor = Cursor::new(input_data.as_slice());
-
-    // --- Parse Header ---
-    let header = parse_header(&mut cursor)?;
     let declared_pp = header.number_of_sector;
     let available_pp = available_cor_sectors(&header, input_data.as_slice().len())?;
     if available_pp <= 0 {
@@ -460,18 +477,24 @@ pub fn process_cor_file(
     // RFI ranges are reflected in output tables; no additional banner needed.
 
     // --- Bandpass Handling ---
-    let mut bandpass_data = if let Some(bp_path) = &args.bandpass {
-        Some(read_bandpass_file(bp_path)?)
-    } else {
-        None
-    };
+    let mut native_bandpass = Vec::new();
     if effective_fft_point != original_fft_point {
         let original_half = (original_fft_point / 2) as usize;
         let target_half = (effective_fft_point / 2) as usize;
         if let Some(bp) = bandpass_data.as_mut() {
             if bp.len() == original_half {
                 let rebinned = rebin_complex_rows(bp, 1, original_half, target_half);
-                *bp = rebinned;
+                if args.contamination.is_some() {
+                    native_bandpass = std::mem::replace(bp, rebinned);
+                } else {
+                    *bp = rebinned;
+                }
+            } else if bp.len() == target_half && args.contamination.is_some() {
+                let group = original_half / target_half;
+                native_bandpass = bp
+                    .iter()
+                    .flat_map(|&value| std::iter::repeat_n(value, group))
+                    .collect();
             } else if bp.len() != target_half {
                 eprintln!(
                     "#WARN: バンドパスデータのチャンネル数 ({}) が FFT リビン後のチャンネル数 ({}) と一致しません。補正をスキップします。",
@@ -535,10 +558,7 @@ pub fn process_cor_file(
     }
 
     // --- Loop and Processing Setup ---
-    cursor.set_position(0);
-    let (_, file_start_time, effective_integ_time) =
-        read_visibility_data(&mut cursor, &header, 1, 0, 0, false, pp_flag_ranges)?;
-    cursor.set_position(256);
+    let (file_start_time, effective_integ_time) = read_sector_metadata(&mut cursor, &header, 0)?;
 
     let pp = available_pp;
     let mut length = if args.length == 0 { pp } else { args.length };
@@ -570,6 +590,7 @@ pub fn process_cor_file(
     }
 
     let mut delay_tsv = String::new();
+    let mut first_delay_header = true;
     let mut freq_tsv = String::new();
     let mut cumulate_len: Vec<f32> = Vec::new();
     let mut cumulate_snr: Vec<f32> = Vec::new();
@@ -582,9 +603,17 @@ pub fn process_cor_file(
     let mut add_plot_times: Vec<DateTime<Utc>> = Vec::new();
     let mut add_plot_res_delay: Vec<f32> = Vec::new();
     let mut add_plot_res_rate: Vec<f32> = Vec::new();
+    let mut group_delay_fits = Vec::new();
     let mut add_plot_complex: Vec<Complex<f32>> = Vec::new();
 
-    let mut prev_deep_solution: Option<(f32, f32)> = None;
+    let primary_search_mode = args.primary_search_mode();
+    // Contiguous native channels are averaged around their midpoint. Their
+    // fractional offset matters to both the phase intercept and wideband rate.
+    let channel_origin_bins = if primary_search_mode == Some("group-delay") {
+        0.5 * (1.0 - f64::from(effective_fft_point) / f64::from(original_fft_point))
+    } else {
+        0.0
+    };
     let mut first_output_basename: Option<String> = None;
 
     for l1 in 0..loop_count {
@@ -595,7 +624,7 @@ pub fn process_cor_file(
         };
         let read_skip = stfft::window_start(args.skip, l1, stfft_plan);
         let read_loop_index = stfft::read_loop_index(l1, stfft_plan);
-        let (mut complex_vec, current_obs_time, effective_integ_time) = match read_visibility_data(
+        let (complex_vec, current_obs_time, effective_integ_time) = match read_visibility_data(
             &mut cursor,
             &header,
             requested_length,
@@ -631,13 +660,31 @@ pub fn process_cor_file(
             break;
         }
 
+        let is_flagged = time_flag_ranges
+            .iter()
+            .any(|(start, end)| current_obs_time >= *start && current_obs_time < *end);
+
+        if is_flagged {
+            println!(
+                "#INFO: Skipping data at {} due to --flagging time range.",
+                current_obs_time.format("%Y-%m-%d %H:%M:%S")
+            );
+            continue;
+        }
+
         let physical_length = actual_length;
         // Preserve exactly what was read from .cor.  The contamination
         // handoff must describe the frame into which frinZ later subtracts;
         // normalization, rebinning and fringe corrections below are analysis
         // operations and must not alter this copy.
-        let raw_contamination_visibility =
-            args.contamination.is_some().then(|| complex_vec.clone());
+        let raw_contamination_visibility;
+        let mut complex_vec = if args.contamination.is_some() {
+            raw_contamination_visibility = Some(complex_vec);
+            Cow::Borrowed(raw_contamination_visibility.as_deref().unwrap())
+        } else {
+            raw_contamination_visibility = None;
+            Cow::Owned(complex_vec)
+        };
         // Every reported fringe value is referenced to the first sample of
         // this --length window.  Its timestamp must therefore be the window
         // start, not the integration midpoint.
@@ -645,7 +692,7 @@ pub fn process_cor_file(
 
         if let Some(norm_ctx) = &norm_acf_context {
             norm_ctx.normalize_cross_visibility(
-                &mut complex_vec,
+                complex_vec.to_mut(),
                 current_obs_time,
                 effective_integ_time,
                 requested_length,
@@ -658,12 +705,12 @@ pub fn process_cor_file(
 
         if effective_fft_point != header.fft_point {
             let target_fft_half = (effective_fft_point / 2) as usize;
-            complex_vec = rebin_complex_rows(
+            complex_vec = Cow::Owned(rebin_complex_rows(
                 &complex_vec,
                 actual_length as usize,
                 original_fft_half,
                 target_fft_half,
-            );
+            ));
         }
 
         let fft_point_half_used = (effective_fft_point / 2) as usize;
@@ -689,8 +736,8 @@ pub fn process_cor_file(
             || manual_acel_correct != 0.0
             || args.jerk_correct != 0.0
             || args.snap_correct != 0.0
-            || args.primary_search_mode().is_some();
-        let sector_time_offsets = if needs_recorded_times {
+            || primary_search_mode.is_some();
+        let first_sector = || {
             let (first_sector, _) = calculate_sector_range(
                 &header,
                 requested_length,
@@ -698,25 +745,35 @@ pub fn process_cor_file(
                 read_loop_index,
                 args.cumulate != 0,
             );
+            first_sector as usize
+        };
+        let recorded_epochs = if args.contamination.is_some() {
+            let first = first_sector();
+            sector_epochs(
+                input_data.as_slice(),
+                &header,
+                first,
+                first + actual_length as usize,
+            )?
+            .collect::<std::io::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let sector_time_offsets = if needs_recorded_times && !recorded_epochs.is_empty() {
+            recorded_epochs
+                .iter()
+                .map(|&epoch| seconds_between(epoch, file_start_time))
+                .collect()
+        } else if needs_recorded_times {
             read_sector_time_offsets(
                 input_data.as_slice(),
                 &header,
-                first_sector as usize,
+                first_sector(),
                 actual_length as usize,
             )?
         } else {
             Vec::new()
         };
-        let phase_epoch = sector_time_offsets.first().copied().unwrap_or(0.0);
-        let search_phase_times: Vec<f64> = if args.primary_search_mode().is_some() {
-            sector_time_offsets
-                .iter()
-                .map(|time| time - phase_epoch)
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         if manual_delay_correct != 0.0
             || manual_rate_correct != 0.0
             || manual_acel_correct != 0.0
@@ -724,7 +781,7 @@ pub fn process_cor_file(
             || args.snap_correct != 0.0
         {
             apply_phase_correction_in_place_at_times(
-                &mut complex_vec,
+                complex_vec.to_mut(),
                 fft_point_half_used,
                 manual_rate_correct,
                 manual_delay_correct,
@@ -735,6 +792,7 @@ pub fn process_cor_file(
                 effective_fft_point as u32,
                 &sector_time_offsets,
                 processing_header.observing_frequency,
+                channel_origin_bins,
             );
         }
 
@@ -746,8 +804,6 @@ pub fn process_cor_file(
         let mut spike34_applied_delay = 0.0f32;
         let mut spike34_applied_rate = 0.0f32;
         if let Some(spikes) = &spike34m_peaks {
-            let search_vec = complex_vec.clone();
-            let search_length = actual_length;
             let mut fullband_args = args.clone();
             fullband_args.spike34m = None;
             fullband_args.search = vec!["peak".to_string()];
@@ -764,9 +820,9 @@ pub fn process_cor_file(
             fullband_args.snap_correct = 0.0;
             fullband_args.rate_padding = 1;
             let fullband = search::run_peak_search(
-                &search_vec,
+                &complex_vec,
                 &processing_header,
-                search_length,
+                actual_length,
                 physical_length,
                 effective_integ_time,
                 &current_obs_time,
@@ -787,7 +843,7 @@ pub fn process_cor_file(
             spike34_applied_delay = fullband_delay;
             spike34_applied_rate = fullband_rate;
             apply_phase_correction_in_place_at_frequency(
-                &mut complex_vec,
+                complex_vec.to_mut(),
                 fft_point_half_used,
                 fullband_rate,
                 fullband_delay,
@@ -810,24 +866,13 @@ pub fn process_cor_file(
                 effective_integ_time,
                 spikes,
             );
-            complex_vec = corrected_spectra.into_iter().flatten().collect();
+            complex_vec = Cow::Owned(corrected_spectra.into_iter().flatten().collect());
         }
 
         let current_length = actual_length;
 
-        let is_flagged = time_flag_ranges
-            .iter()
-            .any(|(start, end)| current_obs_time >= *start && current_obs_time < *end);
-
-        if is_flagged {
-            println!(
-                "#INFO: Skipping data at {} due to --flagging time range.",
-                current_obs_time.format("%Y-%m-%d %H:%M:%S")
-            );
-            continue;
-        }
-
         let mut loop_args = args.clone();
+        loop_args.channel_origin_bins = channel_origin_bins;
         loop_args.delay_correct = 0.0;
         loop_args.rate_correct = 0.0;
         loop_args.acel_correct = 0.0;
@@ -835,100 +880,43 @@ pub fn process_cor_file(
         loop_args.snap_correct = 0.0;
         loop_args.rate_padding = 1;
 
-        let primary_search_mode = args.primary_search_mode();
-
         let (
             mut analysis_results,
             mut freq_rate_array,
             mut delay_rate_2d_data_comp,
             _pre_bandpass_results,
         ) = match primary_search_mode {
-            Some("peak") | Some("deep") | Some("coherent") => {
-                // Unified fringe search path:
-                //   peak = fast AxisThenLocal search + final local polish
-                //   deep = full-grid hierarchical search
-                //
-                // Do not feed the previous solution into rate_correct/delay_correct.
-                // It is only used as the next search seed inside run_*_search().
-                // STFFT windows are independent; do not seed from an overlapping window.
-                let search_seed = if stfft_plan.is_some() {
-                    None
-                } else {
-                    prev_deep_solution
-                };
+            Some(mode @ ("peak" | "deep" | "deep2" | "coherent" | "group-delay")) => {
+                // Diagnostic plot padding is applied separately, after measuring the fringe.
                 let mut search_args = loop_args.clone();
-                // Plot profiles are derived from the separate padded plot
-                // plane below; search measurements remain on native rows.
                 search_args.plot = false;
-                let mut search_result = if primary_search_mode == Some("deep") {
-                    search::run_deep_search_with_phase_times(
-                        &complex_vec,
-                        &processing_header,
-                        current_length,
-                        physical_length,
-                        effective_integ_time,
-                        &current_obs_time,
-                        &file_start_time,
-                        &rfi_ranges,
-                        &bandpass_data,
-                        &search_args,
-                        pp,
-                        search_args.cpu,
-                        search_seed,
-                        &search_phase_times,
-                    )?
-                } else if primary_search_mode == Some("coherent") {
-                    search::run_coherent_search_with_phase_times(
-                        &complex_vec,
-                        &processing_header,
-                        current_length,
-                        physical_length,
-                        effective_integ_time,
-                        &current_obs_time,
-                        &file_start_time,
-                        &rfi_ranges,
-                        &bandpass_data,
-                        &search_args,
-                        pp,
-                        search_args.cpu,
-                        search_seed,
-                        &search_phase_times,
-                    )?
-                } else {
-                    search::run_peak_search_with_phase_times(
-                        &complex_vec,
-                        &processing_header,
-                        current_length,
-                        physical_length,
-                        effective_integ_time,
-                        &current_obs_time,
-                        &file_start_time,
-                        &rfi_ranges,
-                        &bandpass_data,
-                        &search_args,
-                        pp,
-                        search_args.cpu,
-                        search_seed,
-                        &search_phase_times,
-                    )?
+                let search = match mode {
+                    "deep" => search::run_deep_search_with_phase_times,
+                    "coherent" => search::run_coherent_search_with_phase_times,
+                    _ => search::run_peak_search_with_phase_times,
                 };
-                search_result.analysis_results.residual_delay -= loop_args.delay_correct;
-                search_result.analysis_results.residual_rate -= loop_args.rate_correct;
-                let result_tuple = (
-                    search_result.analysis_results,
-                    search_result.freq_rate_array,
-                    search_result.delay_rate_2d_data,
-                    search_result.pre_bandpass_analysis_results,
-                );
-
-                if stfft_plan.is_none() {
-                    prev_deep_solution = Some((
-                        result_tuple.0.residual_delay + loop_args.delay_correct,
-                        result_tuple.0.residual_rate + loop_args.rate_correct,
-                    ));
-                }
-
-                result_tuple
+                let result = search(
+                    &complex_vec,
+                    &processing_header,
+                    current_length,
+                    physical_length,
+                    effective_integ_time,
+                    &current_obs_time,
+                    &file_start_time,
+                    &rfi_ranges,
+                    &bandpass_data,
+                    &search_args,
+                    pp,
+                    search_args.cpu,
+                    None,
+                    &sector_time_offsets,
+                )?;
+                (
+                    result.analysis_results,
+                    result.freq_rate_array,
+                    result.delay_rate_2d_data,
+                    result.pre_bandpass_analysis_results,
+                )
             }
             _ => {
                 // No search or other modes not handled here
@@ -1081,6 +1069,7 @@ pub fn process_cor_file(
                 primary_search_mode,
             );
             refreshed.residual_delay = old_residual_delay;
+            refreshed.group_delay = analysis_results.group_delay;
             refreshed.residual_rate = old_residual_rate;
             refreshed.corrected_delay = old_corrected_delay;
             refreshed.corrected_rate = old_corrected_rate;
@@ -1120,7 +1109,36 @@ pub fn process_cor_file(
                 0.0
             };
             let (mut plot_freq_rate_array, plot_padding_length) =
-                if plot_delay_correction != 0.0 || plot_rate_correction != 0.0 {
+                if let Some(Ok(fit)) = analysis_results.group_delay {
+                    let mut corrected = complex_vec.to_vec();
+                    let epoch = sector_time_offsets[0];
+                    let times: Vec<_> = sector_time_offsets
+                        .iter()
+                        .map(|time| time - epoch)
+                        .collect();
+                    apply_phase_correction_in_place_at_times(
+                        &mut corrected,
+                        fft_point_half_used,
+                        fit.rate_hz,
+                        fit.delay_samples,
+                        0.0,
+                        0.0,
+                        0.0,
+                        header.sampling_speed as u32,
+                        effective_fft_point as u32,
+                        &times,
+                        header.observing_frequency,
+                        channel_origin_bins,
+                    );
+                    process_fft(
+                        &corrected,
+                        physical_length,
+                        effective_fft_point,
+                        header.sampling_speed,
+                        &rfi_ranges,
+                        plot_args.rate_padding,
+                    )
+                } else if plot_delay_correction != 0.0 || plot_rate_correction != 0.0 {
                     process_fft_with_phase_correction_at_frequency(
                         &complex_vec,
                         physical_length,
@@ -1360,56 +1378,60 @@ pub fn process_cor_file(
 
         if let Some(histogram) = &histogram_result {
             let rfi_dir = frinz_dir.join("rfi");
-            let (hist_png, hist_tsv, hist_npz) =
+            let (hist_png, hist_tsv, hist_npz, hist_delay_rate_png) =
                 crate::rfi::write_histogram_products(&rfi_dir, &base_filename, histogram)?;
             println!("# RFI histogram PNG written to {:?}", hist_png);
             println!("# RFI histogram TSV written to {:?}", hist_tsv);
             println!("# RFI histogram NPZ written to {:?}", hist_npz);
+            println!(
+                "# RFI histogram delay-rate marginals PNG written to {:?}",
+                hist_delay_rate_png
+            );
             println!("# RFI histogram detail PNGs written under {:?}", rfi_dir);
             println!("#RFI histogram: rayleigh-count={}, bins={}, sigma={:.6e}, threshold={:.6e}, frequency-threshold={:.6e}, fit-cells={}, histogram-cells={}, delay-RFI cells={}, celestial cells={}, frequency-RFI cells={}", histogram.rayleigh_count, histogram.histogram_bins, histogram.sigma, histogram.threshold, histogram.frequency_threshold, histogram.valid_count, histogram.hist_valid_count, histogram.candidate_count, histogram.celestial_count, histogram.frequency_mask.iter().filter(|value| **value).count());
         }
 
-        if args.contamination.is_some() {
-            let manual_start_time_offset_sec = current_obs_time
-                .signed_duration_since(file_start_time)
-                .num_milliseconds() as f32
-                / 1000.0;
-            let search_start_time_offset_sec = 0.0;
+        if let Some(raw_visibility) = raw_contamination_visibility.as_deref() {
+            let (search_delay_sample, search_rate_hz) = if primary_search_mode.is_some() {
+                analysis_results.fitted_delay_rate()?
+            } else {
+                (0.0, 0.0)
+            };
             let correction = ContaminationPhaseCorrectionInput {
                 manual_delay_sample: manual_delay_correct,
                 manual_rate_hz: manual_rate_correct,
                 manual_acel_hz_per_s: manual_acel_correct,
                 manual_jerk_hz_per_s2: args.jerk_correct,
                 manual_snap_hz_per_s3: args.snap_correct,
-                manual_start_time_offset_s: manual_start_time_offset_sec,
-                search_delay_sample: analysis_results.residual_delay,
-                search_rate_hz: analysis_results.residual_rate,
-                search_start_time_offset_s: search_start_time_offset_sec,
+                manual_start_time_offset_s: seconds_between(current_obs_time, file_start_time),
+                search_delay_sample,
+                search_rate_hz,
+                search_start_time_offset_s: 0.0,
                 target_frame_rotation_deg: 0.0,
             };
             write_contamination_handoff(
                 input_path,
                 args,
-                &processing_header,
+                &header,
                 &frinz_dir,
                 &base_filename,
-                current_obs_time,
-                effective_integ_time,
-                physical_length,
-                analysis_results.delay_peak_complex,
-                analysis_results.residual_delay,
-                analysis_results.residual_rate,
-                analysis_results.delay_snr,
-                analysis_results.delay_noise,
+                ContaminationWindow {
+                    epochs: &recorded_epochs,
+                    first_sector: first_sector(),
+                    multiple_windows: loop_count > 1,
+                    effective_integ_time,
+                    raw_visibility,
+                    native_bandpass: if native_bandpass.is_empty() {
+                        bandpass_data.as_deref().unwrap_or_default()
+                    } else {
+                        &native_bandpass
+                    },
+                    bandpass_applied: bandpass_active,
+                },
+                &analysis_results,
                 correction,
-                bandpass_data.as_deref().filter(|values| !values.is_empty()),
-                raw_contamination_visibility
-                    .as_deref()
-                    .ok_or("contamination visibility copy is unavailable")?,
             )?;
         }
-
-        drop(raw_contamination_visibility);
 
         if args.spectrum {
             if let Some(path) = &spectrum_output_path {
@@ -1595,7 +1617,7 @@ pub fn process_cor_file(
         }
 
         if !args.frequency {
-            let delay_output_line = format!(
+            let mut delay_output_line = format!(
                 "{} {:>6}",
                 format_delay_output(
                     &output_analysis_results,
@@ -1607,10 +1629,16 @@ pub fn process_cor_file(
                 ),
                 obsfreq_mhz,
             );
-            if l1 == 0 {
+            let group_delay = output_analysis_results.group_delay.as_ref();
+            if let Some(fit) = group_delay {
+                group_delay_fits.push(*fit);
+                delay_output_line.push('\t');
+                delay_output_line.push_str(&group_delay_fields(fit));
+            }
+            if first_delay_header {
                 let station1_label = format!("{}-azel", header.station1_name.trim());
                 let station2_label = format!("{}-azel", header.station2_name.trim());
-                let columns = format!(
+                let mut columns = format!(
                     "# {:<17}   {:<5}  {:<10} {:<8} {:>14} {:>7} {:>10}  {:>10}  {:>15}   {:>15}   {:^26} {:^26} {:>12}   {:<15} {:<5} {:<5} {:>6}",
                     "Epoch",
                     "Label",
@@ -1630,7 +1658,7 @@ pub fn process_cor_file(
                     "ACF",
                     "obsfreq",
                 );
-                let units = format!(
+                let mut units = format!(
                     "# {:<17}   {:<5}  {:<10} {:>8} {:>14} {:>7} {:>10}  {:>10}  {:>15}   {:>15}   {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12}   {:<15} {:<5} {:<5} {:>6}",
                     "",
                     "",
@@ -1654,17 +1682,25 @@ pub fn process_cor_file(
                     "[T/F]",
                     "[MHz]",
                 );
+                if group_delay.is_some() {
+                    columns.push_str(&format!("\t{}", GROUP_DELAY_COLUMNS.join("\t")));
+                    units.push_str(&format!("\t{}", GROUP_DELAY_UNITS.join("\t")));
+                }
                 let border = format!("#{}", "*".repeat(columns.len().saturating_sub(1)));
                 let header_str = format!("{border}\n{columns}\n{units}\n{border}");
                 if !suppress_output {
                     println!("{}", header_str);
                 }
                 if args.output {
-                    delay_tsv.push_str(&format_delay_tsv_header(
-                        &header.station1_name,
-                        &header.station2_name,
-                    ));
+                    let format_header = if group_delay.is_some() {
+                        format_group_delay_tsv_header
+                    } else {
+                        format_delay_tsv_header
+                    };
+                    delay_tsv
+                        .push_str(&format_header(&header.station1_name, &header.station2_name));
                 }
+                first_delay_header = false;
             }
             if !suppress_output {
                 println!("{}", delay_output_line);
@@ -1706,29 +1742,6 @@ pub fn process_cor_file(
                 add_plot_noise.push(analysis_results.delay_noise * 100.0);
                 add_plot_res_delay.push(analysis_results.residual_delay);
                 add_plot_res_rate.push(analysis_results.residual_rate);
-            }
-
-            if l1 == loop_count - 1 && args.output {
-                if let Some(path) = &output_path {
-                    let length_label = if args.length == 0 {
-                        "0".to_string()
-                    } else {
-                        args.length.to_string()
-                    };
-                    let out_dir = if args.in_beam {
-                        path.clone()
-                    } else {
-                        path.join(format!("time_domain/len{}s", length_label))
-                    };
-                    fs::create_dir_all(&out_dir)?;
-                    let output_basename = first_output_basename.as_ref().unwrap_or(&base_filename);
-                    let output_stem = insert_product_before_processing_suffixes(
-                        output_basename,
-                        "delay_rate_search",
-                    );
-                    let output_file_path = out_dir.join(format!("{output_stem}.tsv"));
-                    fs::write(output_file_path, &delay_tsv)?;
-                }
             }
         } else {
             let freq_output_line = format!(
@@ -2475,6 +2488,23 @@ pub fn process_cor_file(
         }
     }
 
+    if !delay_tsv.is_empty() {
+        if let (Some(path), Some(base)) = (&output_path, &first_output_basename) {
+            let out_dir = if args.in_beam {
+                path.clone()
+            } else {
+                path.join(format!("time_domain/len{}s", args.length))
+            };
+            fs::create_dir_all(&out_dir)?;
+            let product = if primary_search_mode == Some("group-delay") {
+                "group_delay"
+            } else {
+                "delay_rate_search"
+            };
+            let stem = insert_product_before_processing_suffixes(base, product);
+            fs::write(out_dir.join(format!("{stem}.tsv")), delay_tsv)?;
+        }
+    }
     Ok(ProcessResult {
         header: processing_header,
         label,
@@ -2492,6 +2522,7 @@ pub fn process_cor_file(
         add_plot_noise,
         add_plot_res_delay,
         add_plot_res_rate,
+        group_delay_fits,
         add_plot_complex,
     })
 }
@@ -2641,8 +2672,10 @@ pub(crate) fn run_analysis_pipeline(
         }
     }
 
-    let skip_delay_rate_ifft =
-        base_args.frequency && base_args.drange.is_empty() && !has_histogram_mode(&base_args.rfi);
+    let skip_delay_rate_ifft = base_args.frequency
+        && base_args.drange.is_empty()
+        && base_args.contamination.is_none()
+        && !has_histogram_mode(&base_args.rfi);
 
     let pre_bandpass_analysis_results = if keep_pre_bandpass_results && bandpass_data.is_some() {
         let mut pre_bandpass_delay_rate_2d_data_comp = if skip_delay_rate_ifft {

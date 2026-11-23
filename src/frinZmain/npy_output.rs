@@ -122,19 +122,54 @@ pub fn write_real_2d(
 #[allow(dead_code)]
 pub struct NamedNpz {
     writer: Option<ZipWriter<BufWriter<File>>>,
+    temp_path: Option<tempfile::TempPath>,
     error: Option<io::Error>,
+    compression_level: i64,
 }
 #[allow(dead_code)]
 impl NamedNpz {
     pub fn new(meta: NpyMeta<'_>) -> Self {
-        let mut output = match tempfile::tempfile() {
-            Ok(file) => Self {
+        Self::from_file(meta, tempfile::tempfile().map(|file| (file, None)), 9)
+    }
+
+    /// Write beside the result and publish it only after finishing the ZIP.
+    /// Use fast lossless DEFLATE for large floating-point data.
+    pub(crate) fn for_output(meta: NpyMeta<'_>, path: &Path) -> Self {
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".frinz-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        let file = builder.tempfile_in(parent).map(|file| {
+            let (file, path) = file.into_parts();
+            (file, Some(path))
+        });
+        Self::from_file(meta, file, 1)
+    }
+
+    fn from_file(
+        meta: NpyMeta<'_>,
+        file: io::Result<(File, Option<tempfile::TempPath>)>,
+        compression_level: i64,
+    ) -> Self {
+        let mut output = match file {
+            Ok((file, temp_path)) => Self {
                 writer: Some(ZipWriter::new(BufWriter::with_capacity(64 * 1024, file))),
+                temp_path,
                 error: None,
+                compression_level,
             },
             Err(error) => Self {
                 writer: None,
+                temp_path: None,
                 error: Some(error),
+                compression_level,
             },
         };
         output.add_u8_1d("flag", meta.flag.as_bytes());
@@ -169,7 +204,10 @@ impl NamedNpz {
                 io::Error::new(io::ErrorKind::InvalidInput, "NPY entry size overflow")
             })?;
             let writer = self.writer.as_mut().expect("NPZ writer initialized");
-            writer.start_file(format!("{name}.npy"), npz_options(entry_size))?;
+            writer.start_file(
+                format!("{name}.npy"),
+                npz_options(entry_size, self.compression_level),
+            )?;
             writer.write_all(&header)?;
             let mut buffer = [0u8; 64 * 1024];
             let mut used = 0;
@@ -203,21 +241,35 @@ impl NamedNpz {
         result
     }
     pub fn add_f64_1d(&mut self, name: &str, values: &[f64]) {
+        self.add_f64_series(name, values.iter().copied());
+    }
+    pub(crate) fn add_f64_series(
+        &mut self,
+        name: &str,
+        values: impl ExactSizeIterator<Item = f64>,
+    ) {
         let _ = self.add_array(
             name,
             "<f8",
             &[values.len()],
             8,
-            values.iter().flat_map(|value| value.to_le_bytes()),
+            values.flat_map(f64::to_le_bytes),
         );
     }
     pub fn add_f32_1d(&mut self, name: &str, values: &[f32]) {
+        self.add_f32_series(name, values.iter().copied());
+    }
+    pub(crate) fn add_f32_series(
+        &mut self,
+        name: &str,
+        values: impl ExactSizeIterator<Item = f32>,
+    ) {
         let _ = self.add_array(
             name,
             "<f4",
             &[values.len()],
             4,
-            values.iter().flat_map(|value| value.to_le_bytes()),
+            values.flat_map(f32::to_le_bytes),
         );
     }
     pub fn add_u8_1d(&mut self, name: &str, values: &[u8]) {
@@ -285,17 +337,22 @@ impl NamedNpz {
             .expect("NPZ writer initialized")
             .finish()?;
         source.flush()?;
+        if let Some(temp_path) = self.temp_path.take() {
+            drop(source);
+            temp_path.persist(path).map_err(|error| error.error)?;
+            return Ok(());
+        }
         source.seek(SeekFrom::Start(0))?;
         let mut destination = BufWriter::with_capacity(64 * 1024, File::create(path)?);
         io::copy(source.get_mut(), &mut destination)?;
         destination.flush()
     }
 }
-fn npz_options(entry_size: usize) -> SimpleFileOptions {
+fn npz_options(entry_size: usize, compression_level: i64) -> SimpleFileOptions {
     SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         // Reserve ZIP64 before compression can push a near-limit entry past 4 GiB.
-        .compression_level(Some(9))
+        .compression_level(Some(compression_level))
         .large_file(entry_size >= u32::MAX as usize / 2)
 }
 
